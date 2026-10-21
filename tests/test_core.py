@@ -187,6 +187,20 @@ class EngineTests(unittest.TestCase):
         fs, _ = self.analyze("Use the ADMIN$ and IPC$ shares. It costs 5$.")
         self.assertEqual([f.text for f in fs], [], "well-known shares and prices are not machine accounts")
 
+    def test_lowercase_and_appliance_hosts(self):
+        fs, _ = self.analyze("i have host223, ws54, srv01, sql03 and dc02a behind fortigate40d, "
+                             "FGT-60F, asa5506 and synology918")
+        d = self.by_text(fs)
+        for raw in ("host223", "ws54", "srv01", "sql03", "dc02a", "fortigate40d", "FGT-60F", "asa5506",
+                    "synology918"):
+            self.assertIn(raw, d, raw)
+            self.assertEqual(d[raw].entity, "HOSTNAME", raw)
+
+    def test_product_names_are_not_hosts(self):
+        fs, _ = self.analyze("We bought a FortiGate 40D and run SQL Server 2019 and sql2019 on Windows 11. "
+                             "Use node 18, web3 tools, Server 2022, pc1 and ws2.")
+        self.assertEqual([f.text for f in fs if f.entity == "HOSTNAME"], [])
+
     def test_benign_text_untouched(self):
         text = ("Upgrade Windows 10 to Windows Server 2019 and Python 3.12. Open port 443. Event ID 4624. "
                 "Chapter 3 explains it. We use mongo-db and the file-server role.")
@@ -251,7 +265,7 @@ class BundledRulesTests(unittest.TestCase):
         self.assertEqual(self.engine.ruleset.errors, [])
         fs = self.engine.analyze(text, [], ps.SessionVault())
         d = {f.text: f.entity for f in fs}
-        for raw in ("DC01", "File-SRV", "dmizrahi$"):
+        for raw in ("DC01", "File-SRV", "host223", "ws54", "fortigate40d", "dmizrahi$"):
             self.assertEqual(d.get(raw), "HOSTNAME", raw)
 
     def test_local_rule_overrides_bundled(self):

@@ -588,6 +588,24 @@ recognizers:
         regex: '\b[A-Za-z][A-Za-z0-9]{1,30}(?:[-_][A-Za-z0-9]+)*[-_](?:SRV|SVR|DC|FS|SQL|DB|EXCH|NAS|HV|ESX)\d{0,4}\b'
     context: [server, host, hostname, machine, from, on, to]
 
+  - name: HostNumberedAnyCase
+    entity: HOSTNAME
+    description: Role prefix + 2-3 digits in any case - host223, ws54, srv01, dc02a (4 digits skipped so sql2019 stays a version)
+    score: 0.8
+    patterns:
+      - name: prefix_2_3_digits
+        regex: '(?<![\w.-])(?:host|server|srv|svr|dc|ws|pc|lt|vm|sql|db|fs|nas|fw|rtr|esx|hv|vdi|rds|exch|web|app)\d{2,3}[a-z]?(?![\w-])'
+    context: [server, host, hostname, machine, computer, endpoint, device]
+
+  - name: NetworkAppliances
+    entity: HOSTNAME
+    description: Vendor + model appliance host names - fortigate40d, FGT-60F, asa5506, synology918 (no space, so "FortiGate 40D" prose is skipped)
+    score: 0.8
+    patterns:
+      - name: vendor_model
+        regex: '(?<![\w.-])(?:forti(?:gate|wifi|switch|ap|analyzer|manager|mail|web)|fgt|fwf|paloalto|sonicwall|checkpoint|juniper|srx|asa|mikrotik|meraki|synology|qnap|unifi|aruba|netgear|cisco)[-_]?\d{2,5}[a-z]{0,3}(?![\w-])'
+    context: [firewall, appliance, device, router, switch, nas, gateway, host]
+
   - name: InternalDomains
     entity: DOMAIN
     description: Customer / internal DNS domains from a wordlist
