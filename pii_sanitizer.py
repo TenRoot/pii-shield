@@ -36,6 +36,7 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import sys
@@ -236,7 +237,7 @@ class RuleError(Exception):
     pass
 
 
-# ---- validators usable from YAML: `validator: luhn | israeli_id | ipv4 | private_ipv4`
+# ---- validators usable from YAML: `validator: luhn | israeli_id | ipv4 | private_ipv4 | high_entropy | not_well_known`
 def _v_luhn(text: str) -> bool:
     digits = [int(c) for c in text if c.isdigit()]
     if len(digits) < 12:
@@ -275,12 +276,92 @@ def _v_private_ipv4(text: str) -> bool:
     return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or a == 127 or (a == 169 and b == 254)
 
 
-VALIDATORS: Dict[str, Callable[[str], bool]] = {
+def _shannon_entropy(text: str) -> float:
+    if not text:
+        return 0.0
+    counts = defaultdict(int)
+    for c in text:
+        counts[c] += 1
+    n = len(text)
+    return -sum(k / n * math.log2(k / n) for k in counts.values())
+
+
+def _v_high_entropy(text: str) -> bool:
+    """Random-looking hex (32+) or base64 (40+) blob. Base64 also needs a letter and a digit or + /."""
+    if re.fullmatch(r"[A-Fa-f0-9]{32,}", text):
+        return _shannon_entropy(text) > 3.5
+    if re.fullmatch(r"[A-Za-z0-9+/]{40,}={0,2}", text):
+        return (_shannon_entropy(text) > 3.5 and bool(re.search(r"[A-Za-z]", text))
+                and bool(re.search(r"[0-9+/]", text)))
+    return False
+
+
+# Built-in accounts, groups, profile folders and SIDs that identify no person or company.
+WELL_KNOWN_NAMES = {
+    "root", "system", "daemon", "nobody", "www-data", "nginx", "apache", "sshd", "syslog", "local",
+    "network", "anonymous", "local service", "network service", "nt authority", "builtin",
+    "public", "default", "default user", "all users", "shared", ".", "..",
+    "users", "computers", "configuration", "schema", "domain users", "domain admins",
+    "domain computers", "enterprise admins", "administrators",
+}
+_WELL_KNOWN_SID_RE = re.compile(r"S-1-(?:[0-4]-\d+|5-\d{1,2}|5-32-\d+|5-80-[\d-]+|15-[\d-]+|16-\d+)", re.I)
+
+
+def _v_not_well_known(text: str) -> Optional[bool]:
+    """False for a well-known account or SID, else None (the pattern score stays)."""
+    value = text.strip()
+    if value.casefold() in WELL_KNOWN_NAMES or _WELL_KNOWN_SID_RE.fullmatch(value):
+        return False
+    return None
+
+
+# A validator returns True (score 1.0), False (drop the match) or None (keep the pattern score).
+VALIDATORS: Dict[str, Callable[[str], Optional[bool]]] = {
     "luhn": _v_luhn,
     "israeli_id": _v_israeli_id,
     "ipv4": _v_ipv4,
     "private_ipv4": _v_private_ipv4,
+    "high_entropy": _v_high_entropy,
+    "not_well_known": _v_not_well_known,
 }
+
+# A pattern with a (?P<value>...) group masks only that group, e.g. password=(?P<value>\S+).
+VALUE_GROUP = "value"
+
+
+def value_span(m) -> Tuple[int, int]:
+    """Span to mask for a regex match: the 'value' group if the pattern has one, else the whole match.
+    (-1, -1) when the group did not take part in the match."""
+    if VALUE_GROUP in m.re.groupindex:
+        return m.span(VALUE_GROUP)
+    return m.span()
+
+
+JSON_KEY_RE = re.compile(r"^[A-Za-z0-9_.\- $@]{1,64}$")
+
+
+def _json_key_regex(key: str) -> str:
+    """Key matcher that ignores case and the separators - _ . and space: userName = user_name = USER-NAME."""
+    chars = re.sub(r"[-_. ]", "", key).lower()
+    return r"[-_. ]?".join(re.escape(c) for c in chars)
+
+
+def json_key_patterns(keys: Sequence[str], contains: Sequence[str]) -> List[Tuple[str, str]]:
+    """(name, regex) pairs that mask the value of a JSON or Python-dict field by its key name.
+    Strings need 2+ characters and numbers 3+ digits; booleans, null, "" and "-" are never masked."""
+    alts = sorted({_json_key_regex(k) for k in keys if _json_key_regex(k)}, key=len, reverse=True)
+    frags = sorted({_json_key_regex(k) for k in contains if _json_key_regex(k)}, key=len, reverse=True)
+    parts = list(alts)
+    if frags:
+        parts.insert(0, r"[\w.\- $@]*?(?:" + "|".join(frags) + r")[\w.\- $@]*")
+    key = "(?:" + "|".join(parts) + ")"
+    return [
+        ("json_string", r'"' + key + r'"\s*:\s*"(?!-?")(?P<value>(?:[^"\\\n]|\\.){2,})"'),
+        ("json_escaped", r'\\"' + key + r'\\"\s*:\s*\\"(?!-?\\")(?P<value>[^"\\\n]{2,})\\"'),
+        ("dict_string", r"'" + key + r"'\s*:\s*'(?!-?')(?P<value>[^'\\\n]{2,})'"),
+        ("json_number", r"""["']""" + key + r"""["']\s*:\s*(?P<value>-?\d{3,}(?:\.\d+)?)(?![\w.])"""),
+    ]
+
 
 
 @dataclass
@@ -302,6 +383,8 @@ class RuleDef:
     validator: Optional[str] = None
     description: str = ""
     source_file: str = ""
+    json_keys: List[str] = field(default_factory=list)          # mask JSON / dict values by key name
+    json_key_contains: List[str] = field(default_factory=list)
 
     @property
     def flags(self) -> int:
@@ -447,8 +530,17 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
                 problems.append(f"{where}: {exc}")
         rd.deny_list = sorted(set(deny), key=lambda s: (-len(s), s))
 
+        rd.json_keys = [str(k).strip() for k in _as_list(r.get("json_keys")) if str(k).strip()]
+        rd.json_key_contains = [str(k).strip() for k in _as_list(r.get("json_key_contains")) if str(k).strip()]
+        bad_keys = [k for k in rd.json_keys + rd.json_key_contains if not JSON_KEY_RE.match(k)]
+        if bad_keys:
+            problems.append(f"{where}: invalid JSON key names {bad_keys} (letters, digits, - _ . $ @ and space)")
+        elif rd.json_keys or rd.json_key_contains:
+            for pname, rx in json_key_patterns(rd.json_keys, rd.json_key_contains):
+                rd.patterns.append(PatternDef(f"{name}_{pname}", rx, score))
+
         if not rd.patterns and not rd.deny_list:
-            problems.append(f"{where}: needs at least one of 'patterns', 'deny_list', 'wordlist'")
+            problems.append(f"{where}: needs at least one of 'patterns', 'deny_list', 'wordlist', 'json_keys'")
         rules.append(rd)
 
     if problems:
@@ -1059,7 +1151,10 @@ class SessionVault:
 # 5. Detection engine (Presidio + spaCy, hot-reloadable)
 # ===========================================================================
 try:
-    from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerRegistry
+    import regex as _regex  # Presidio's regex engine (supports a match timeout)
+    from presidio_analyzer import (AnalyzerEngine, EntityRecognizer, Pattern, PatternRecognizer,
+                                   RecognizerRegistry, RecognizerResult)
+    from presidio_analyzer.pattern_recognizer import REGEX_TIMEOUT_SECONDS
     from presidio_analyzer.nlp_engine import NlpEngineProvider
     PRESIDIO_OK = True
     PRESIDIO_ERR = ""
@@ -1144,6 +1239,37 @@ if PRESIDIO_OK:
 
         def validate_result(self, pattern_text: str) -> Optional[bool]:
             return self._validator(pattern_text) if self._validator else None
+
+        def analyze(self, text, entities, nlp_artifacts=None, regex_flags=None):
+            """Presidio's pattern loop, except that a (?P<value>...) group limits the span and the
+            validator to that group (password=Sup3r -> only Sup3r is masked)."""
+            flags = regex_flags or self.global_regex_flags
+            results = []
+            for pattern in self.patterns:
+                if not pattern.compiled_regex or pattern.compiled_with_flags != flags:
+                    pattern.compiled_with_flags = flags
+                    pattern.compiled_regex = _regex.compile(pattern.regex, flags=flags)
+                try:
+                    matches = list(pattern.compiled_regex.finditer(text, timeout=REGEX_TIMEOUT_SECONDS))
+                except TimeoutError:
+                    log.warning("rule %s: pattern %s timed out and was skipped", self.name, pattern.name)
+                    continue
+                for m in matches:
+                    start, end = value_span(m)
+                    if end <= start:
+                        continue
+                    valid = self.validate_result(text[start:end])
+                    if valid is False:
+                        continue
+                    score = EntityRecognizer.MAX_SCORE if valid else pattern.score
+                    explanation = self.build_regex_explanation(self.name, pattern.name, pattern.regex,
+                                                               score, valid, flags)
+                    results.append(RecognizerResult(
+                        entity_type=self.supported_entities[0], start=start, end=end, score=score,
+                        analysis_explanation=explanation,
+                        recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name,
+                                              RecognizerResult.RECOGNIZER_IDENTIFIER_KEY: self.id}))
+            return EntityRecognizer.remove_duplicates(results)
 
 
 class DetectionEngine:
@@ -1263,8 +1389,13 @@ class DetectionEngine:
                                            r")(?:(?=\W)|$)", r.flags), r.score))
             for rx, score in regexes:
                 for m in rx.finditer(text):
-                    if m.end() > m.start() and (not vfn or vfn(m.group(0))):
-                        out.append(Finding(m.start(), m.end(), m.group(0), r.entity, score, "custom", r.name))
+                    start, end = value_span(m)
+                    if end <= start:
+                        continue
+                    valid = vfn(text[start:end]) if vfn else None
+                    if valid is not False:
+                        out.append(Finding(start, end, text[start:end], r.entity, 1.0 if valid else score,
+                                           "custom", r.name))
         return out
 
     def analyze(self, text: str, manual_rules: Sequence[ManualRule], vault: SessionVault,
@@ -1297,8 +1428,9 @@ class DetectionEngine:
             for i, m in enumerate(rx.finditer(text)):
                 if i > 5000:
                     break
-                if m.end() > m.start():
-                    found.append(Finding(m.start(), m.end(), m.group(0), mr.entity, 1.0, "manual",
+                start, end = value_span(m)
+                if end > start:
+                    found.append(Finding(start, end, text[start:end], mr.entity, 1.0, "manual",
                                          f"manual:{mr.rid}"))
 
         # allow-list (never applies to manual rules)
@@ -1920,8 +2052,9 @@ def merge_manual_rule(text: str, findings: List[Finding], rule: ManualRule,
     for i, m in enumerate(rx.finditer(text)):
         if i >= limit:
             break
-        if m.end() > m.start():
-            new.append(Finding(m.start(), m.end(), m.group(0), rule.entity, 1.0, "manual", f"manual:{rule.rid}"))
+        start, end = value_span(m)
+        if end > start:
+            new.append(Finding(start, end, text[start:end], rule.entity, 1.0, "manual", f"manual:{rule.rid}"))
     if not new:
         return findings, 0
     kept = [f for f in findings if not any(f.start < n.end and n.start < f.end for n in new)]
