@@ -143,9 +143,53 @@ recognizers:
     wordlist: wordlists/customers.txt   # one value per line, relative to this file
 ```
 
-A rule needs at least one of `patterns`, `deny_list` or `wordlist`. Other fields are
-`context`, `case_sensitive`, `validator` (`luhn`, `israeli_id`, `ipv4`, `private_ipv4`) and
-`enabled`. The header of `github-repo-template/rules/rules.yaml` gives the full schema.
+A rule needs at least one of `patterns`, `deny_list`, `wordlist`, `json_keys` or
+`json_key_contains`. Other fields are `context`, `case_sensitive`, `validator` and `enabled`.
+The header of `github-repo-template/rules/rules.yaml` gives the full schema.
+
+**Mask only the value.** If a pattern has a group named `value`, PII Shield masks only that
+group. The rest of the match stays in the text, so the LLM can still read it:
+
+```yaml
+    patterns:
+      - {name: kv, regex: 'password\s*=\s*(?P<value>\S+)'}   # password=<SECRET_1>
+```
+
+Manual rules of the type `regex` also accept a `value` group.
+
+**Mask JSON fields by key name.** `json_keys` masks the value of each listed key in JSON, in
+escaped JSON and in Python dicts. `json_key_contains` masks the value of every key that contains
+one of the listed texts. Key matching ignores case and the separators `-`, `_`, `.` and space,
+so `userName`, `user_name` and `USER-NAME` are the same key. PII Shield masks strings of 2 or
+more characters and numbers of 3 or more digits. It never masks `true`, `false`, `null`, `""`
+or `"-"`.
+
+```yaml
+  - name: JsonUserFields
+    entity: USERNAME
+    json_keys: [userName, samAccountName, owner]
+    json_key_contains: [principalname]
+```
+
+**Validators.** A validator checks each match:
+
+| Validator | Keeps a match when |
+|---|---|
+| `luhn` | the digits pass the Luhn checksum (card numbers) |
+| `israeli_id` | the digits pass the Teudat Zehut checksum |
+| `ipv4` | the value is a valid IPv4 address |
+| `private_ipv4` | the value is a private, loopback or link-local IPv4 address |
+| `high_entropy` | the value is a random-looking hex (32+) or base64 (40+) string |
+| `not_well_known` | the value is not a built-in name such as `root`, `SYSTEM`, `Public` or `S-1-5-18` |
+
+The bundled rules in `secrets.yaml`, `identity.yaml`, `hosts.yaml` and `json_fields.yaml` find
+API tokens, credentials in URLs and command lines, session cookies, Windows SIDs, LDAP and
+cloud user names, user names in home paths, and host names in syslog lines. Many of their
+patterns come from [logtotal-sanitizer](https://github.com/socprime/logtotal-sanitizer) by
+SOC Prime (Apache-2.0). See `NOTICE`.
+
+`HighEntropyBlobs` in `secrets.yaml` is off by default because it also masks file hashes. To
+turn it on, copy the rule to `rules/local/` and remove `enabled: false`.
 
 If a rule file has an error, PII Shield skips only that file. The other files still load.
 

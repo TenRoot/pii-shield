@@ -58,9 +58,9 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(d[text].entity, ent, text)
         self.assertNotIn("localhost", d, "allow-list must suppress localhost")
         self.assertNotIn("5d41402abc4b2a76b9719d911017c592", d, "plain MD5 must not be flagged")
-        self.assertTrue(any(f.text.startswith("password=") for f in fs))
+        self.assertEqual(d["Sup3rS3cret!"].entity, "SECRET", "only the value after password= is masked")
         self.assertTrue(any("054-123-4567" in f.text for f in fs))
-        self.assertTrue(any(f.text.startswith("C:\\Users\\jsmith") for f in fs))
+        self.assertEqual(d["jsmith"].entity, "USERNAME", "only the user name in C:\\Users\\jsmith is masked")
 
     def test_consistent_tokens_and_case_insensitive(self):
         fs, _ = self.analyze(SAMPLE)
@@ -207,6 +207,112 @@ class EngineTests(unittest.TestCase):
         fs, _ = self.analyze(text)
         self.assertEqual([f.text for f in fs], [])
 
+    # Log lines adapted from the socprime/logtotal-sanitizer test suite (Apache-2.0)
+    LOG_CASES = [
+        ("Authorization: Bearer abcDEF1234567890xyzQWERTY", "abcDEF1234567890xyzQWERTY", "SECRET"),
+        ("curl https://admin:Sup3rS3cret@git.acme.com/repo", "admin:Sup3rS3cret", "SECRET"),
+        ("mysql --password=Winter2026! -h db", "Winter2026!", "SECRET"),
+        ("Set-Cookie: JSESSIONID=8F3A9C2B1D4E5F60718293A4; Path=/", "8F3A9C2B1D4E5F60718293A4", "SECRET"),
+        ("key sk-proj-abcdEFGH1234ijklMNOP5678 leaked", "sk-proj-abcdEFGH1234ijklMNOP5678", "SECRET"),
+        ("key AIzaSyA1234567890abcdefghijklmnopqrstuv leaked", "AIzaSyA1234567890abcdefghijklmnopqrstuv", "SECRET"),
+        ("token npm_abcdefghijklmnopqrstuvwxyz0123456789AB", "npm_abcdefghijklmnopqrstuvwxyz0123456789AB", "SECRET"),
+        ("Oct 12 10:01:02 webgw01 sshd[311]: Failed password for invalid user jsmith from 203.0.113.9",
+         "webgw01", "HOSTNAME"),
+        ("Oct 12 10:01:02 webgw01 sshd[311]: Failed password for invalid user jsmith from 203.0.113.9",
+         "jsmith", "USERNAME"),
+        ("Oct 12 10:01:02 mailhub sudo:   kcohen : TTY=pts/0 ; COMMAND=/bin/ls", "kcohen", "USERNAME"),
+        ("2024-11-15T09:19:41.123Z srv-app-07 sshd[4970]: session opened", "srv-app-07", "HOSTNAME"),
+        ("probe srv-app-07 before failover", "srv-app-07", "HOSTNAME"),
+        ("logon by S-1-5-21-3623811015-3361044348-30300820-1013", "S-1-5-21-3623811015-3361044348-30300820-1013", "SID"),
+        ("arn:aws:iam::123456789012:user/dlevi", "dlevi", "USERNAME"),
+        ("subject system:serviceaccount:prod:billing-api", "billing-api", "USERNAME"),
+        ("uid=dlevi,ou=People,dc=acme,dc=local", "dlevi", "USERNAME"),
+        ("host=fileshare.acme.com user=dlevi", "fileshare.acme.com", "HOSTNAME"),
+        ("host=fileshare.acme.com user=dlevi", "dlevi", "USERNAME"),
+        ("WIN-4F7K2LQ9PZ1 and DESKTOP-8HD2KQ1 joined", "WIN-4F7K2LQ9PZ1", "HOSTNAME"),
+        ("WIN-4F7K2LQ9PZ1 and DESKTOP-8HD2KQ1 joined", "DESKTOP-8HD2KQ1", "HOSTNAME"),
+        ("kerberos HTTP/intranet01.acme.com@ACME.LOCAL", "intranet01.acme.com", "HOSTNAME"),
+        ("path=/home/alice/app.log", "alice", "USERNAME"),
+        ('"CurrentDirectory": "C:\\\\Users\\\\xodih\\\\AppData\\\\Local"', "xodih", "USERNAME"),
+    ]
+
+    def test_log_lines(self):
+        for text, value, entity in self.LOG_CASES:
+            with self.subTest(text=text, value=value):
+                d = self.by_text(self.analyze(text)[0])
+                self.assertIn(value, d)
+                self.assertEqual(d[value].entity, entity)
+
+    def test_value_group_masks_only_value(self):
+        text = "Authorization: Bearer abcDEF1234567890xyzQWERTY and password=Sup3rS3cret!"
+        fs, v = self.analyze(text)
+        out, _ = ps.sanitize(text, fs, v)
+        self.assertRegex(out, r"^Authorization: Bearer <SECRET_\d+> and password=<SECRET_\d+>$")
+        self.assertEqual(v.restore(out)[0], text)
+
+    def test_json_fields(self):
+        text = ('{"hostName": "BRANCH7", "user_name": "dlevi", "apiKey": "x9Fq2LmZ", "enabled": true, '
+                '"note": "", "owner": "-", "uid": 0, "employeeId": 48213, "firstName": "Dana"}')
+        fs, v = self.analyze(text)
+        d = self.by_text(fs)
+        expect = {"BRANCH7": "HOSTNAME", "dlevi": "USERNAME", "x9Fq2LmZ": "SECRET", "48213": "USERNAME",
+                  "Dana": "PERSON"}
+        for value, entity in expect.items():
+            self.assertEqual(d[value].entity, entity, value)
+        self.assertNotIn("0", d, "numbers under 3 digits are kept")
+        out, _ = ps.sanitize(text, fs, v)
+        self.assertIn('"enabled": true', out)
+        self.assertIn('"hostName": "<HOSTNAME_', out)
+        for text in ("{'user_name': 'maria', 'Password': 'hunter2pass'}",
+                     'INFO body="{\\"password\\":\\"hunter2pass\\",\\"user\\":\\"maria\\"}"'):
+            d = self.by_text(self.analyze(text)[0])
+            self.assertEqual(d["maria"].entity, "USERNAME", text)
+            self.assertEqual(d["hunter2pass"].entity, "SECRET", text)
+
+    def test_log_lines_benign(self):
+        """No rule match on log and prose text that only looks like the new patterns (spaCy is ignored)."""
+        for text in ("Nov 15 09:19:41 kernel: CPU0: temperature above threshold",
+                     "2026-10-12 10:01:02 INFO main: started",
+                     "We use Bearer authentication and Basic authentication for the API.",
+                     "GET /users/12345 returned 404; uses actions/checkout@v4",
+                     "I bought this for user experience. Host: please check the server.",
+                     "Accepted publickey for root from 203.0.113.9 as S-1-5-18 in C:\\Users\\Public\\x",
+                     "cn=Users,dc=acme owner=root user=SYSTEM"):
+            with self.subTest(text=text):
+                fs, _ = self.analyze(text)
+                self.assertEqual([f.text for f in fs if f.source == "custom" and f.entity != "DOMAIN"], [])
+
+    def test_lite_mode_value_group(self):
+        text = "Oct 12 10:01:02 webgw01 sshd[1]: Accepted password for root from 10.1.1.1 password=Sup3rS3cret!"
+        found = {(f.text, f.entity) for f in self.engine._lite_detect(text, self.engine.ruleset)}
+        self.assertIn(("Sup3rS3cret!", "SECRET"), found)
+        self.assertIn(("webgw01", "HOSTNAME"), found)
+        self.assertNotIn("root", {t for t, _ in found}, "not_well_known must drop root in lite mode too")
+
+    def test_manual_rule_value_group(self):
+        rule = ps.ManualRule("regex", r"case=(?P<value>\d+)", "CASE_ID")
+        fs, _ = self.analyze("see case=48213 now", [rule])
+        self.assertEqual([(f.text, f.entity) for f in fs if f.source == "manual"], [("48213", "CASE_ID")])
+
+    def test_high_entropy_rule_is_opt_in(self):
+        blob = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A0NQ=="
+        self.assertNotIn(blob, self.by_text(self.analyze(f"blob {blob} end")[0]))
+        f = self.engine.rules_root / "local" / "entropy.yaml"
+        f.write_text("recognizers:\n  - name: HighEntropyBlobs\n    entity: SECRET\n    validator: high_entropy\n"
+                     "    patterns: ['(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])']\n", "utf-8")
+        try:
+            self.assertEqual(self.engine.reload_rules().errors, [])
+            self.assertEqual(self.by_text(self.analyze(f"blob {blob} end")[0])[blob].entity, "SECRET")
+        finally:
+            f.unlink()
+            self.engine.reload_rules()
+
+    def test_bad_json_key_is_rejected(self):
+        doc = {"recognizers": [{"name": "J", "entity": "X", "json_keys": ["ok", "bad\"key"]}]}
+        with self.assertRaises(ps.RuleError) as cm:
+            ps.parse_rule_document(doc, self.engine.rules_root / "j.yaml", self.engine.rules_root)
+        self.assertIn("invalid JSON key names", str(cm.exception))
+
     def test_validators(self):
         self.assertTrue(ps._v_israeli_id("123456782"))
         self.assertFalse(ps._v_israeli_id("123456789"))
@@ -215,6 +321,13 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(ps._v_private_ipv4("172.20.1.1"))
         self.assertFalse(ps._v_private_ipv4("172.32.1.1"))
         self.assertFalse(ps._v_ipv4("10.0.0.300"))
+        self.assertTrue(ps._v_high_entropy("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"))
+        self.assertFalse(ps._v_high_entropy("0" * 40), "a repeated character is not random")
+        self.assertFalse(ps._v_high_entropy("short"))
+        self.assertIsNone(ps._v_not_well_known("dlevi"))
+        for name in ("root", "SYSTEM", "Public", "S-1-5-18", "S-1-5-32-544", "S-1-1-0"):
+            self.assertFalse(ps._v_not_well_known(name), name)
+        self.assertIsNone(ps._v_not_well_known("S-1-5-21-1-2-3-500"), "a domain SID is sensitive")
 
     def test_wildcards(self):
         import re
