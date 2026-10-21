@@ -1,7 +1,7 @@
 {
-  "version": "1.4.0",
+  "version": "1.4.1",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "1e9d302f5aa6f723a1a8aa11bdbd79339fbbf04042551a0071c327ad1bbfe709",
-  "notes": "Portable Windows build (PII-Shield.exe, no Python needed); the Windows build updates itself from the verified release zip; Presidio hint fits the Windows build; --self-test and --log-file options",
+  "sha256": "58aeea1d7991ccea934ce6ef2d1f5999f25d1150ba90c87b58f7997a765cc83a",
+  "notes": "Rules sync from TenRoot/pii-shield by default (no token needed); app updates found through version.json at the repo root",
   "published": "2026-10-21"
 }
