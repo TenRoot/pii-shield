@@ -1,0 +1,9 @@
+{
+  "version": "1.4.1",
+  "script_path": "pii_sanitizer.py",
+  "sha256": "58aeea1d7991ccea934ce6ef2d1f5999f25d1150ba90c87b58f7997a765cc83a",
+  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.4.1/PII-Shield-1.4.1-win64.zip",
+  "windows_zip_sha256": "bcf50e65af34c985fcc923130cc4c570f8af2e71077223a80d609833c26820bb",
+  "notes": "Rules sync from TenRoot/pii-shield by default (no token needed); app updates found through version.json at the repo root",
+  "published": "2026-10-21"
+}
