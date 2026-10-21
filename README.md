@@ -36,6 +36,15 @@ a model by itself. If `en_core_web_lg` is not installed, PII Shield uses the fir
 model from this list: `en_core_web_trf`, `en_core_web_md`, `en_core_web_sm`. If no model is
 installed, PII Shield runs in regex-only mode with no name detection.
 
+spaCy reads log lines as prose, so it tags field names and values such as `arn` or
+`COMMAND=/bin/ls` as PERSON or ORGANIZATION. To stop this, set **Settings > Detection > Turn
+off spaCy NER when the input looks like log lines** (`engine.skip_ner_on_logs` in
+`config.json`). The option is off by default. When it is on and 60% or more of the non-blank
+lines look like log lines, PII Shield drops all spaCy findings for that input. A line looks like
+a log line when it starts with a timestamp, a syslog priority or a log level, holds a JSON
+object, or has two or more `key=value` pairs. The rules still run, so user names and host names
+in log fields are still masked. Prose input keeps spaCy NER.
+
 `keyring` is optional. With `keyring`, PII Shield stores the GitHub token in the OS
 credential store. Without `keyring`, PII Shield stores the token in plain text in
 `config.json`.

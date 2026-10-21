@@ -179,11 +179,11 @@ recognizers:
 
   - name: CredentialAssignment
     entity: SECRET
-    description: key=value credentials in configs and logs. Only the value is masked - password=<SECRET_1>
+    description: key=value credentials in configs and logs. Only the value is masked - password=<SECRET_1>. A pwd value that starts with / is a working directory (sudo PWD=/home/x), so it is skipped.
     score: 0.85
     patterns:
       - name: kv_secret
-        regex: '(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|private[_-]?key|signing[_-]?key|token)["'']?\s*[:=]\s*["'']?(?P<value>[^\s"'',;}]{6,})'
+        regex: '(?:password|passwd|pwd(?!["'']?\s*[:=]\s*["'']?/)|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|private[_-]?key|signing[_-]?key|token)["'']?\s*[:=]\s*["'']?(?P<value>[^\s"'',;}]{6,})'
 
   - name: NTLMHashPair
     entity: SECRET

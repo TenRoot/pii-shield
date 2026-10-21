@@ -282,6 +282,71 @@ class EngineTests(unittest.TestCase):
                 fs, _ = self.analyze(text)
                 self.assertEqual([f.text for f in fs if f.source == "custom" and f.entity != "DOMAIN"], [])
 
+    LOG_TEXT = (
+        "Oct 12 10:01:02 mailhub sudo:   kcohen : TTY=pts/0 ; PWD=/tmp ; USER=root ; COMMAND=/bin/ls\n"
+        "2024-11-15T09:19:42Z eventName=GetObject arn arn:aws:s3:::acme-backups/db.sql "
+        "principal=arn:aws:iam::123456789012:user/dlevi\n"
+        '{"userIdentity": {"arn": "arn:aws:iam::123456789012:user/dlevi"}, "eventName": "ConsoleLogin"}\n'
+        "Nov 15 09:19:41 web01 CRON[1234]: (root) CMD (command -v debian-sa1 > /dev/null && debian-sa1 1 1)\n"
+    )
+
+    def test_looks_like_log(self):
+        for text in (self.LOG_TEXT,
+                     "Oct 12 10:01:02 webgw01 sshd[311]: Failed password for jsmith from 203.0.113.9",
+                     "<34>2024-11-15T09:19:41Z host app: started",
+                     "[ERROR] connection refused\n[INFO] retrying",
+                     '203.0.113.9 - - [10/Oct/2024:13:55:36 +0000] "GET / HTTP/1.1" 200 512',
+                     "1731662381 src=10.1.1.1 dst=10.2.2.2",
+                     "user=dlevi host=fs01 action=logon"):
+            with self.subTest(text=text):
+                self.assertTrue(ps.looks_like_log(text))
+        for text in (SAMPLE, "", "   \n", "Hi John,\nplease reset the password for Dana Levi.\nThanks",
+                     "Oct 12 10:01:02 web01 sshd[1]: started\nThe log above shows that John Smith\n"
+                     "logged in from the Berlin office before\nthe outage."):
+            with self.subTest(text=text):
+                self.assertFalse(ps.looks_like_log(text))
+
+    def test_skip_ner_on_logs(self):
+        if self.engine.mode != "presidio+spacy":
+            self.skipTest("needs a spaCy model")
+        ecfg = self.cfg["engine"]
+        self.assertFalse(ecfg["skip_ner_on_logs"], "off by default")
+
+        def ner(text):
+            return {f.text for f in self.analyze(text)[0] if f.recognizer in ps.NER_RECOGNIZERS}
+        self.assertTrue(ner(self.LOG_TEXT), "spaCy tags log fields when the option is off")
+        self.assertFalse(self.engine.last_ner_skipped)
+        ecfg["skip_ner_on_logs"] = True
+        try:
+            fs, _ = self.analyze(self.LOG_TEXT)
+            self.assertTrue(self.engine.last_ner_skipped)
+            d = self.by_text(fs)
+            self.assertEqual({t for t, f in d.items() if f.recognizer in ps.NER_RECOGNIZERS}, set())
+            for value in ("arn", "PWD=/tmp", "COMMAND=/bin/ls", "-v debian-sa1"):
+                self.assertNotIn(value, d)
+            for value, entity in (("kcohen", "USERNAME"), ("mailhub", "HOSTNAME"), ("dlevi", "USERNAME")):
+                self.assertEqual(d[value].entity, entity, value)
+            # prose keeps NER
+            self.assertEqual(self.by_text(self.analyze(SAMPLE)[0])["John Smith"].entity, "PERSON")
+            self.assertFalse(self.engine.last_ner_skipped)
+        finally:
+            ecfg["skip_ner_on_logs"] = False
+
+    def test_user_kv_skips_arn(self):
+        fs, _ = self.analyze("principal=arn:aws:iam::123456789012:role/Backup owner=dlevi")
+        d = self.by_text(fs)
+        self.assertNotIn("arn", d)
+        self.assertEqual(d["dlevi"].entity, "USERNAME")
+
+    def test_pwd_path_is_not_secret(self):
+        text = "sudo: kcohen : TTY=pts/0 ; PWD=/home/kcohen ; USER=root ; COMMAND=/bin/ls"
+        for fs in (self.analyze(text)[0], self.engine._lite_detect(text, self.engine.ruleset)):
+            self.assertEqual([f.text for f in fs if f.entity == "SECRET"], [])
+        for text, value in (("pwd=Winter2026!", "Winter2026!"), ("db_pwd: 'Winter2026!'", "Winter2026!"),
+                            ("password=/Winter2026!", "/Winter2026!")):
+            with self.subTest(text=text):
+                self.assertEqual(self.by_text(self.analyze(text)[0])[value].entity, "SECRET")
+
     def test_lite_mode_value_group(self):
         text = "Oct 12 10:01:02 webgw01 sshd[1]: Accepted password for root from 10.1.1.1 password=Sup3rS3cret!"
         found = {(f.text, f.entity) for f in self.engine._lite_detect(text, self.engine.ruleset)}

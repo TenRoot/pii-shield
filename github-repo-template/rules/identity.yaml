@@ -34,14 +34,14 @@ recognizers:
 
   - name: LogUserFields
     entity: USERNAME
-    description: User names in sshd, PAM and sudo lines and in user=value pairs. System accounts such as root are skipped.
+    description: User names in sshd, PAM and sudo lines and in user=value pairs. System accounts such as root and ARN values (principal=arn:aws:...) are skipped.
     score: 0.85
     validator: not_well_known
     patterns:
       - {name: sshd_login,   regex: '\b(?:Accepted|Failed) \w+ for (?:invalid user |illegal user )?(?P<value>[A-Za-z0-9._-]+) from\b'}
       - {name: sshd_invalid, regex: '\b(?:Invalid|Illegal) user (?P<value>[A-Za-z0-9._-]+) from\b'}
       - {name: sudo,         regex: '\bsudo:\s+(?P<value>[A-Za-z0-9._-]+)(?=\s+:)'}
-      - {name: user_kv,      regex: '\b(?:user|username|user_name|ruser|suser|duser|logname|login|account|owner|actor|principal|requester|created_?by|modified_?by|assignee|operator)\s*=\s*["'']?(?P<value>[\w.@+-]*[A-Za-z][\w.@+-]*)'}
+      - {name: user_kv,      regex: '\b(?:user|username|user_name|ruser|suser|duser|logname|login|account|owner|actor|principal|requester|created_?by|modified_?by|assignee|operator)\s*=\s*["'']?(?!arn:)(?P<value>[\w.@+-]*[A-Za-z][\w.@+-]*)'}
 
   - name: HomeDirectoryUser
     entity: USERNAME
