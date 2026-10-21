@@ -1,0 +1,215 @@
+# =============================================================================
+# PII Shield - shared custom recognizers (hosted on GitHub, pulled on demand)
+# =============================================================================
+# Schema (version 1)
+#   allow_list:   [values that must NEVER be masked - matched case-insensitively]
+#   recognizers:
+#     - name:            unique rule name (later files / local rules override same name)
+#       entity:          UPPER_SNAKE_CASE entity -> token prefix, e.g. HOSTNAME -> <HOSTNAME_1>
+#       patterns:        list of {name, regex, score}  (Python 're' syntax)
+#       deny_list:       list of literal values (whole-word match)
+#       wordlist:        path(s) to .txt files, one value per line, relative to this file
+#       context:         words that boost the score when found near a match (Presidio)
+#       score:           0-1, default for patterns and the score for deny_list/wordlist hits
+#       case_sensitive:  default false
+#       validator:       optional: luhn | israeli_id | ipv4 | private_ipv4
+#       enabled:         default true
+#   A rule needs at least one of: patterns, deny_list, wordlist.
+#   Validate before pushing:  python pii_sanitizer.py --validate-rules rules/
+# =============================================================================
+version: 1
+
+allow_list:
+  - localhost
+  - 127.0.0.1
+  - 0.0.0.0
+  - example.com
+  - Microsoft
+  - Windows
+  - PowerShell
+  - CrowdStrike
+  - Teudat
+  - Python
+  - Zehut
+
+recognizers:
+
+  # ---------------------------------------------------------------- network
+  - name: InternalIPv4
+    entity: INTERNAL_IP
+    description: RFC1918 / loopback / link-local IPv4, optional CIDR suffix
+    validator: private_ipv4
+    score: 0.9
+    patterns:
+      - name: rfc1918
+        regex: '(?<![\d.])(?:10|127|169\.254|172\.(?:1[6-9]|2\d|3[01])|192\.168)(?:\.\d{1,3}){1,3}(?:/\d{1,2})?(?![\d.])'
+
+  - name: InternalFQDN
+    entity: HOSTNAME
+    description: host.sub.domain in internal-only DNS suffixes (3+ labels = a host)
+    score: 0.9
+    patterns:
+      - name: internal_host_fqdn
+        regex: '\b[a-z0-9][a-z0-9-]{0,62}(?:\.[a-z0-9-]{1,63})+\.(?:local|corp|lan|internal|intra|ad|home\.arpa)\b'
+
+  - name: InternalADDomain
+    entity: DOMAIN
+    description: bare internal AD/DNS domain, e.g. acme.local, contoso.corp
+    score: 0.9
+    patterns:
+      - name: internal_domain
+        regex: '\b[a-z0-9][a-z0-9-]{0,62}\.(?:local|corp|lan|internal|intra|ad)\b'
+
+  - name: HostNamingConvention
+    entity: HOSTNAME
+    description: Role-prefixed host names - SRV-APP01, DC-02, DC01, FS1, SQL03 (adjust prefixes to your estate)
+    score: 0.85
+    case_sensitive: true
+    patterns:
+      - name: prefix_separator
+        regex: '\b(?:SRV|DC|WS|LT|PC|SQL|FS|EXCH|APP|WEB|VDI|RDS|ADFS|CA|ESX|HV|NAS|FW|SW|RTR|AP)[-_][A-Z0-9]{2,}(?:[-_][A-Z0-9]+)*\b'
+      - name: prefix_digits
+        regex: '\b(?:SRV|DC|WS|LT|PC|SQL|FS|EXCH|VDI|RDS|ADFS|ESX|HV|NAS|FW|RTR)\d{1,4}[A-Z]?\b'
+    context: [server, host, hostname, machine, computer, endpoint, device]
+
+  - name: HostRoleSuffix
+    entity: HOSTNAME
+    description: Role-suffixed host names - File-SRV, HR-DC, Backup-SQL01 (role must be UPPERCASE to avoid prose like file-server)
+    score: 0.85
+    case_sensitive: true
+    patterns:
+      - name: role_suffix
+        regex: '\b[A-Za-z][A-Za-z0-9]{1,30}(?:[-_][A-Za-z0-9]+)*[-_](?:SRV|SVR|DC|FS|SQL|DB|EXCH|NAS|HV|ESX)\d{0,4}\b'
+    context: [server, host, hostname, machine, from, on, to]
+
+  - name: InternalDomains
+    entity: DOMAIN
+    description: Customer / internal DNS domains from a wordlist
+    score: 0.95
+    wordlist: wordlists/internal_domains.txt
+
+  # ---------------------------------------------------------------- identity
+  - name: ADDownLevelLogon
+    entity: USERNAME
+    description: DOMAIN\user (down-level logon name)
+    score: 0.9
+    patterns:
+      - name: domain_backslash_user
+        regex: '(?<![\\:/\w.$-])[A-Za-z][A-Za-z0-9-]{1,14}\\[A-Za-z0-9._$-]{2,64}\b(?!\\)'
+
+  - name: MachineAccount
+    entity: HOSTNAME
+    description: AD computer account names - dmizrahi$, WS54$ (skips the ADMIN$, IPC$, PRINT$ shares)
+    score: 0.85
+    patterns:
+      - name: computer_account
+        regex: '(?<![\w$\\-])(?!(?:ADMIN|IPC|PRINT)\$)[A-Za-z][A-Za-z0-9._-]{2,19}\$(?![\w$])'
+
+  - name: KnownUsernames
+    entity: USERNAME
+    score: 0.9
+    wordlist: wordlists/usernames.txt
+
+  - name: WindowsProfilePath
+    entity: USER_PATH
+    description: C:\Users\<name>\... paths leak usernames
+    score: 0.85
+    patterns:
+      - name: user_profile
+        regex: '\b[A-Za-z]:\\Users\\(?!Public\b|Default\b|All Users\b)[^\\\s"''<>|]+'
+
+  - name: UNCPath
+    entity: UNC_PATH
+    score: 0.85
+    patterns:
+      - name: unc
+        regex: '\\\\[A-Za-z0-9._$-]+\\[^\s"''<>|]+'
+
+  - name: CustomerNames
+    entity: CUSTOMER
+    score: 0.95
+    wordlist: wordlists/customers.txt
+
+  # ---------------------------------------------------------------- cloud / EDR identifiers
+  - name: AzureGuidInContext
+    entity: TENANT_ID
+    description: GUIDs only flagged when tenant/subscription/client context is nearby (base score below threshold)
+    score: 0.3
+    patterns:
+      - name: guid
+        regex: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+    context: [tenant, tenantid, subscription, client, clientid, application, appid, directory, object]
+
+  - name: CrowdStrikeCID
+    entity: CS_CID
+    description: Falcon Customer ID with checksum suffix
+    score: 0.9
+    patterns:
+      - name: cid
+        regex: '\b[0-9a-fA-F]{32}-[0-9a-fA-F]{2}\b'
+    context: [cid, customer, falcon, crowdstrike, ccid]
+
+  # ---------------------------------------------------------------- secrets
+  - name: CloudAndDevTokens
+    entity: SECRET
+    score: 0.95
+    case_sensitive: true
+    patterns:
+      - {name: aws_access_key, regex: '\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'}
+      - {name: github_token,   regex: '\bgh[pousr]_[A-Za-z0-9]{36,}\b'}
+      - {name: github_pat,     regex: '\bgithub_pat_[A-Za-z0-9_]{22,}\b'}
+      - {name: slack_token,    regex: '\bxox[abposr]-[A-Za-z0-9-]{10,}\b'}
+      - {name: jwt,            regex: '\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'}
+      - {name: azure_conn_key, regex: '(?:AccountKey|SharedAccessKey)=[A-Za-z0-9+/=]{20,}'}
+      - {name: private_key,    regex: '-----BEGIN (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY-----'}
+
+  - name: CredentialAssignment
+    entity: SECRET
+    description: key=value credentials in configs/logs (the whole "password=..." span is masked)
+    score: 0.85
+    patterns:
+      - name: kv_secret
+        regex: '(?:password|passwd|pwd|secret|api[_-]?key|client[_-]?secret|token)\s*[:=]\s*["'']?[^\s"'',;]{6,}'
+
+  - name: NTLMHashPair
+    entity: SECRET
+    score: 0.9
+    patterns:
+      - name: lm_nt
+        regex: '\b[a-fA-F0-9]{32}:[a-fA-F0-9]{32}\b'
+
+  # ---------------------------------------------------------------- addresses / organizations
+  - name: StreetAddressInContext
+    entity: STREET_ADDRESS
+    description: "Street + number (Rothschild 1, Herzl St 12) - base score below threshold, flagged only near address words"
+    score: 0.3
+    patterns:
+      - name: street_number
+        regex: '\b[A-Z][a-z]{2,}(?:\s[A-Z][a-z]+){0,2}(?:\s(?:St|Street|Rd|Road|Ave|Avenue|Blvd|Lane|Ln|Way))?\.?\s\d{1,4}[A-Za-z]?\b'
+      - name: hebrew_street
+        regex: '(?:רחוב|רח''|שד''|שדרות)\s[\u0590-\u05FF"''\s]{2,30}\s\d{1,4}'
+    context: [live, lives, living, address, street, road, located, apartment, residence, רחוב, כתובת, גר, גרה]
+
+  - name: OrganizationNames
+    entity: ORGANIZATION
+    description: Our own company and partner names (spaCy ORG detection also available in Settings)
+    score: 0.95
+    wordlist: wordlists/organizations.txt
+
+  # ---------------------------------------------------------------- Israel
+  - name: IsraeliID
+    entity: IL_ID
+    description: Teudat Zehut - 9 digits, checksum validated
+    validator: israeli_id
+    score: 0.6
+    patterns:
+      - name: tz
+        regex: '(?<!\d)\d{9}(?!\d)'
+    context: [id, "t.z", teudat, zehut, ת.ז, תעודת, זהות]
+
+  - name: IsraeliPhone
+    entity: PHONE_NUMBER
+    score: 0.75
+    patterns:
+      - name: il_phone
+        regex: '(?<![\d+])(?:\+972[-\s]?|0)(?:5\d|[23489]|7\d)[-\s]?\d{3}[-\s]?\d{4}(?!\d)'

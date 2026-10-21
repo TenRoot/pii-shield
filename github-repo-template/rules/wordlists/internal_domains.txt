@@ -1,0 +1,4 @@
+# One domain per line. Lines starting with # are comments.
+example-corp.com
+contoso.local
+fabrikam.internal

@@ -1,0 +1,3 @@
+# Company / organization names to always mask (whole-word, case-insensitive)
+Tenroot Cybersecurity
+Tenroot

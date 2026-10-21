@@ -1,0 +1,7 @@
+{
+  "version": "1.1.0",
+  "script_path": "app/pii_sanitizer.py",
+  "sha256": "3528f856857865f4683c6e7c2b498926b16a33ec3b2835e9d121c7647b26c6ba",
+  "notes": "Bundled rules active out of the box; DC01/File-SRV/AD-domain/street-address/org detection; ORG NER on by default",
+  "published": "2026-10-21"
+}

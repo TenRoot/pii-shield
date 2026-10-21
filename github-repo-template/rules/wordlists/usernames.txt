@@ -1,0 +1,4 @@
+# Service / admin account names that must never reach an LLM
+svc_backup
+svc_sql
+adm-jdoe

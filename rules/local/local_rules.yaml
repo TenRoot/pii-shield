@@ -1,0 +1,11 @@
+# Local-only rules (never overwritten by GitHub sync - sync writes to rules/remote/).
+# A rule here with the same name as a remote rule overrides it.
+version: 1
+allow_list: []
+recognizers:
+  - name: MyLabHosts
+    entity: HOSTNAME
+    enabled: false          # flip to true and edit
+    score: 0.9
+    patterns:
+      - {name: lab, regex: '\blab-[a-z0-9-]+\b'}

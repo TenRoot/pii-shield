@@ -1,0 +1,4 @@
+# Customer / project code names (whole-word, case-insensitive)
+Contoso
+Fabrikam
+Project Nightjar

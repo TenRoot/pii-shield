@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "recognizers": [
+    {
+      "name": "TicketIDs",
+      "entity": "TICKET_ID",
+      "description": "Internal ticketing references (JSON format example)",
+      "score": 0.8,
+      "patterns": [
+        {"name": "jira", "regex": "\\b(?:SEC|IR|SOC)-\\d{3,6}\\b"}
+      ]
+    },
+    {
+      "name": "OnPremMailboxes",
+      "entity": "EMAIL_ADDRESS",
+      "deny_list": ["helpdesk@example-corp.com"],
+      "score": 1.0
+    }
+  ]
+}

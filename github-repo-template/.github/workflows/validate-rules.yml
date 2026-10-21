@@ -1,0 +1,25 @@
+name: Validate PII Shield rules
+on:
+  pull_request:
+    paths: ["rules/**", "app/**"]
+  push:
+    branches: [main]
+    paths: ["rules/**", "app/**"]
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml presidio-analyzer
+      - name: Validate rule syntax and Presidio compatibility
+        run: python app/pii_sanitizer.py --validate-rules rules
+      - name: Verify version.json hash matches the published script
+        shell: pwsh
+        run: |
+          $v = Get-Content app/version.json -Raw | ConvertFrom-Json
+          $h = (Get-FileHash $v.script_path -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $v.sha256) { throw "version.json sha256 ($($v.sha256)) != $($v.script_path) ($h)" }
+          Write-Host "version.json OK: v$($v.version) $h"
