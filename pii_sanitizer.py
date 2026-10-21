@@ -1679,6 +1679,17 @@ def auto_sync_rules(config: AppConfig, token: str, engine: Optional[DetectionEng
     return GitHubSync(config, token, engine, rules_root).pull()
 
 
+def auto_check_app_update(config: AppConfig, token: str) -> Optional[Dict]:
+    """Startup app-version check against version.json in the rules repo. Returns None, with no
+    network traffic, when check_app_updates is off, offline mode is on, or no repo is set;
+    also None when the repo has no version.json. Installing stays a separate, confirmed step."""
+    g = config["github"]
+    if (not g.get("check_app_updates", True) or config["behavior"].get("offline_mode")
+            or not (g.get("repo_url") or "").strip()):
+        return None
+    return GitHubSync(config, token).check_app_version()
+
+
 def check_package_updates(config: AppConfig, packages: Sequence[str] = PRESIDIO_PACKAGES,
                           index_url: str = PYPI_URL) -> Optional[List[Dict]]:
     """Ask PyPI for the newest release of each package. Reports only - never installs anything.
@@ -2484,7 +2495,8 @@ if QT_OK:
             self._run(self.engine.initialize, done, progress=True)
 
         def _startup_updates(self):
-            """Once per app start, after the engine is ready: pull rules and check Presidio in the background.
+            """Once per app start, after the engine is ready: pull rules, check for a newer app version,
+            and check Presidio, all in the background.
             Failures only go to the log - a missing network must not interrupt work."""
             if self._startup_checked:
                 return
@@ -2504,6 +2516,29 @@ if QT_OK:
                     log.info("Startup rules sync: already up to date")
             self._run(auto_sync_rules, synced, self.config, self.secrets.get(), self.engine,
                       error=lambda m: log.warning("Startup rules sync failed: %s", m))
+
+            def app_checked(info):
+                if not info:
+                    return
+                if not info.get("newer"):
+                    log.info("Application is current (v%s; remote v%s)", __version__, info["version"])
+                    return
+                log.warning("New application version available: v%s (you have v%s). %s",
+                            info["version"], __version__, info.get("notes", ""))
+                self.statusBar().showMessage(f"PII Shield {info['version']} is available - see Log")
+                ans = QtWidgets.QMessageBox.question(
+                    self, "Application update",
+                    f"Version {info['version']} is available (installed: {__version__}).\n\n"
+                    f"{info.get('notes', '')}\n\nDownload and install it now? The current script is backed up "
+                    "first, and the download is verified against the SHA-256 published in version.json.")
+                if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+                self._run(lambda: GitHubSync(self.config, self.secrets.get()).download_app_update(info),
+                          lambda p: (log.info("Installed update to %s. Restart the app to use it.", Path(p).name),
+                                     QtWidgets.QMessageBox.information(self, "Update installed",
+                                                                       "Update installed. Please restart PII Shield.")))
+            self._run(auto_check_app_update, app_checked, self.config, self.secrets.get(),
+                      error=lambda m: log.warning("Startup app update check failed: %s", m))
 
             def checked(res):
                 if res is None:

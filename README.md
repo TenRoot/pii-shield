@@ -5,9 +5,10 @@ It replaces each sensitive value with a token, for example `<HOSTNAME_1>`. When 
 replies, PII Shield puts the original values back.
 
 All processing is local. PII Shield uses Microsoft Presidio and a local spaCy model. The app
-makes only two kinds of network requests: the GitHub rules sync and a Presidio version check
-on PyPI. Both run at startup, and you can also start the rules sync manually. PII Shield never
-sends prompt text. Offline mode turns off all network access.
+makes only two kinds of network requests: GitHub requests (the rules sync and the app version
+check) and a Presidio version check on PyPI. All of them run at startup, and you can also
+start the rules sync manually. PII Shield never sends prompt text. Offline mode turns off all
+network access.
 
 ## Features
 
@@ -142,16 +143,22 @@ fails, the sync changes nothing.
 
 ### Updates at startup
 
-After the engine loads, PII Shield runs two checks in the background:
+After the engine loads, PII Shield runs three checks in the background:
 
 - **Rules sync.** If a rules repo is set, PII Shield pulls the rules with the same checks as a
   manual sync. If the pull fails, the app keeps the current rules and writes the error to the
   **Log** tab.
+- **App version check.** If a rules repo is set, PII Shield reads `app/version.json` from it.
+  If that file lists a newer version, PII Shield asks if you want to install it. The download
+  must match the SHA-256 in `version.json`, and PII Shield backs up the current script first.
+  Restart the app to use the new version.
 - **Presidio check.** PII Shield asks PyPI for the latest `presidio-analyzer` and
   `presidio-anonymizer` versions. If a newer version exists, the status bar and the **Log** tab
   show the `pip install -U` command to run. PII Shield never installs packages itself.
 
-To turn off either check, open **Settings → Behavior**. Offline mode turns off both.
+To turn off the rules sync or the Presidio check, open **Settings → Behavior**. To turn off the
+app version check, clear **Also check for a new application version** in the **Update Rules**
+dialog. Offline mode turns off all three.
 
 Validate rules before you push them:
 

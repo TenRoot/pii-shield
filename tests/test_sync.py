@@ -298,6 +298,38 @@ class SyncTests(unittest.TestCase):
                 self.assertEqual(len(MockGitHub.requests_seen), seen, "a skipped sync must not touch the network")
                 self.assertFalse((self.rules / "remote").exists())
 
+    def set_remote_app(self, version):
+        script = f'__version__ = "{version}"\n'.encode()
+        MockGitHub.repo_files["app/pii_sanitizer.py"] = script
+        MockGitHub.repo_files["app/version.json"] = json.dumps(
+            {"version": version, "script_path": "app/pii_sanitizer.py",
+             "sha256": hashlib.sha256(script).hexdigest(), "notes": "test"}).encode()
+
+    def test_startup_app_check(self):
+        self.set_remote_app("999.0.0")
+        info = ps.auto_check_app_update(self.cfg, TOKEN)
+        self.assertTrue(info["newer"])
+        self.assertEqual(info["version"], "999.0.0")
+        self.set_remote_app(ps.__version__)
+        self.assertFalse(ps.auto_check_app_update(self.cfg, TOKEN)["newer"])
+
+    def test_startup_app_check_without_version_file(self):
+        del MockGitHub.repo_files["app/version.json"]
+        self.assertIsNone(ps.auto_check_app_update(self.cfg, TOKEN))
+
+    def test_startup_app_check_skipped(self):
+        self.set_remote_app("999.0.0")
+        cases = {"disabled": ("github", {"check_app_updates": False}),
+                 "offline": ("behavior", {"offline_mode": True}),
+                 "no repo": ("github", {"repo_url": ""})}
+        for name, (section, change) in cases.items():
+            with self.subTest(name):
+                cfg = self.new_config(f"{name}.json")
+                cfg[section].update(change)
+                seen = len(MockGitHub.requests_seen)
+                self.assertIsNone(ps.auto_check_app_update(cfg, TOKEN))
+                self.assertEqual(len(MockGitHub.requests_seen), seen, "a skipped check must not touch the network")
+
     def test_concurrent_pull_refused(self):
         with ps.SYNC_LOCK:
             with self.assertRaisesRegex(ps.SyncError, "already running"):
