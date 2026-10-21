@@ -73,12 +73,7 @@ with the SHA-256 of `pii_sanitizer.py`. The workflow stops if they do not match.
 ## Running the app
 
 ```bash
-python pii_sanitizer.py                          # start the GUI
-python pii_sanitizer.py --validate-rules DIR     # validate a rules folder and exit
-python pii_sanitizer.py --version
-python pii_sanitizer.py --debug                  # verbose logging
-python pii_sanitizer.py --self-test              # load the engine, analyze a sample, exit
-python pii_sanitizer.py --log-file FILE          # write console output to FILE
+python pii_sanitizer.py
 ```
 
 The GUI has five tabs:
