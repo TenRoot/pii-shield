@@ -1,7 +1,7 @@
 {
-  "version": "1.5.0",
+  "version": "1.5.1",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "d0eb370941ae8e6d49258c31feecd4fe9190af8443934663319a2a4ffd3dc88e",
-  "notes": "Value-only masking (password=<SECRET_1>), JSON fields masked by key name, new rules for API tokens, SIDs, log user names and syslog hosts (adapted from socprime/logtotal-sanitizer)",
+  "sha256": "94cd160fb0172a4868aaaa150af87b09bd0b23ec825e5a6cf5d01d1c306f185f",
+  "notes": "Option to skip spaCy NER on log input (Settings > Detection); user_kv no longer reads principal=arn:... as a user; pwd=/path is no longer masked as a secret",
   "published": "2026-10-21"
 }
