@@ -165,19 +165,3 @@ Validate rules before you push them:
 ```bash
 python pii_sanitizer.py --validate-rules github-repo-template/rules
 ```
-
-## Running the tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-The suite has two files:
-
-- `tests/test_core.py` — detection, tokens, restore, rule reload and the offline guard. These
-  tests use the rules in `github-repo-template/rules/`.
-- `tests/test_sync.py` — GitHub sync, startup updates and the Presidio check, against local
-  mock GitHub and PyPI servers over HTTPS. These tests need the `openssl` command.
-
-Run the tests with the Python from your virtual environment, because the tests import
-Presidio and spaCy.
