@@ -100,13 +100,16 @@ DEFAULT_BUILTIN_ENTITIES = [
     "IBAN_CODE", "URL", "LOCATION", "ORGANIZATION", "US_SSN", "CRYPTO", "MAC_ADDRESS",
 ]
 
+# The shared rules: github-repo-template/rules in the public PII Shield repo (no token needed).
+DEFAULT_RULES_REPO = "https://api.github.com/repos/TenRoot/pii-shield/contents/github-repo-template/rules"
+
 DEFAULT_CONFIG: Dict = {
     "github": {
-        "repo_url": "",               # e.g. https://api.github.com/repos/org/repo/contents/rules
+        "repo_url": DEFAULT_RULES_REPO,  # GitHub contents API URL of the rules folder
         "branch": "main",
         "check_app_updates": True,
         "auto_sync_on_startup": True,  # pull rules in the background when the app starts
-        "version_path": "app/version.json",  # path in the repo (repo root relative)
+        "version_path": "version.json",  # repo-root path; the release workflow keeps it on main
         "ca_bundle": "",              # optional corporate CA bundle for TLS inspection proxies
         "timeout": 20,
         "token_in_config": "",        # only used when the OS keyring is unavailable
@@ -152,6 +155,11 @@ class AppConfig:
         if self.path.exists():
             try:
                 self.data = _deep_merge(DEFAULT_CONFIG, json.loads(self.path.read_text("utf-8")))
+                g = self.data["github"]
+                if not (g.get("repo_url") or "").strip():   # saved empty by <= 1.4.0
+                    g["repo_url"] = DEFAULT_RULES_REPO
+                if g["repo_url"] == DEFAULT_RULES_REPO and g.get("version_path") == "app/version.json":
+                    g["version_path"] = "version.json"   # old default; this repo keeps it at the root
             except Exception as exc:  # corrupt config -> keep defaults, keep a copy
                 log.error("config.json unreadable (%s); using defaults", exc)
                 shutil.copy2(self.path, self.path.with_suffix(".json.bad"))
@@ -2064,7 +2072,7 @@ if QT_OK:
             pat_row.addWidget(show)
             self.check_app = QtWidgets.QCheckBox("Also check for a new application version")
             self.check_app.setChecked(bool(g.get("check_app_updates", True)))
-            self.version_path = QtWidgets.QLineEdit(g.get("version_path", "app/version.json"))
+            self.version_path = QtWidgets.QLineEdit(g.get("version_path", "version.json"))
             self.ca = QtWidgets.QLineEdit(g.get("ca_bundle", ""))
             self.ca.setPlaceholderText("optional - PEM bundle for corporate TLS inspection")
             ca_btn = QtWidgets.QToolButton()

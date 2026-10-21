@@ -204,7 +204,7 @@ class SyncTests(unittest.TestCase):
     def new_config(self, name="config.json"):
         cfg = ps.AppConfig(self.root / name)
         cfg["github"].update(repo_url=f"https://localhost:{self.port}/api/v3/repos/acme/rules-repo/contents/rules",
-                             branch="main", ca_bundle=str(self.cert))
+                             branch="main", ca_bundle=str(self.cert), version_path="app/version.json")
         return cfg
 
     def client(self, token=TOKEN):

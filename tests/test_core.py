@@ -301,6 +301,26 @@ class FrozenAndCliTests(unittest.TestCase):
             with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", str(exe)):
                 self.assertEqual(ps.default_app_dir(), Path("/data/pii"))
 
+    def test_default_rules_repo(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            want = "https://api.github.com/repos/TenRoot/pii-shield/contents/github-repo-template/rules"
+            self.assertEqual(ps.AppConfig(tmp / "new.json")["github"]["repo_url"], want)
+            (tmp / "empty.json").write_text('{"github": {"repo_url": ""}}', "utf-8")
+            self.assertEqual(ps.AppConfig(tmp / "empty.json")["github"]["repo_url"], want,
+                             "an empty URL saved by an older version falls back to the default")
+            (tmp / "own.json").write_text('{"github": {"repo_url": "https://ghe.corp/api/v3/repos/o/r/contents/x", '
+                                          '"version_path": "app/version.json"}}', "utf-8")
+            own = ps.AppConfig(tmp / "own.json")["github"]
+            self.assertEqual(own["repo_url"], "https://ghe.corp/api/v3/repos/o/r/contents/x")
+            self.assertEqual(own["version_path"], "app/version.json", "a separate rules repo keeps its layout")
+            # the release workflow keeps version.json at the root of the PII Shield repo
+            self.assertEqual(ps.AppConfig(tmp / "new.json")["github"]["version_path"], "version.json")
+            (tmp / "old.json").write_text('{"github": {"repo_url": "", "version_path": "app/version.json"}}', "utf-8")
+            self.assertEqual(ps.AppConfig(tmp / "old.json")["github"]["version_path"], "version.json")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_presidio_hint(self):
         newer = [{"package": "presidio-analyzer", "installed": "2.2.364", "latest": "2.3.0"}]
         hint = ps.presidio_update_hint(newer, frozen=False)

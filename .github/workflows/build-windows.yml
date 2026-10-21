@@ -74,18 +74,20 @@ jobs:
           Write-Host "updater script parses: $script"
 
       - name: Package zip, checksum and version.json
+        id: pkg
         run: |
           $v = '${{ steps.ver.outputs.version }}'
           $zip = "PII-Shield-$v-win64.zip"
-          7z a -tzip -mx=5 $zip .\dist\PII-Shield | Out-Null
+          New-Item -ItemType Directory -Force out | Out-Null
           $stamped = Get-Content github-repo-template\app\version.json -Raw | ConvertFrom-Json
           $scriptSha = (Get-FileHash pii_sanitizer.py -Algorithm SHA256).Hash.ToLower()
           if ($stamped.version -ne $v -or $stamped.sha256 -ne $scriptSha) {
             throw "github-repo-template/app/version.json is not stamped for v$v ($scriptSha)"
           }
-          $zipSha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$zipSha  $zip" | Set-Content "$zip.sha256" -Encoding ascii
-          [ordered]@{
+          7z a -tzip -mx=5 "out\$zip" .\dist\PII-Shield | Out-Null
+          $zipSha = (Get-FileHash "out\$zip" -Algorithm SHA256).Hash.ToLower()
+          "$zipSha  $zip" | Set-Content "out\$zip.sha256" -Encoding ascii
+          $info = [ordered]@{
             version            = $v
             script_path        = 'app/pii_sanitizer.py'
             sha256             = $scriptSha
@@ -93,18 +95,19 @@ jobs:
             windows_zip_sha256 = $zipSha
             notes              = $stamped.notes
             published          = (Get-Date).ToString('yyyy-MM-dd')
-          } | ConvertTo-Json | Set-Content version.json -Encoding utf8
-          Get-Content version.json
+          }
+          # release asset: for a separate rules repo (app/pii_sanitizer.py + app/version.json)
+          $info | ConvertTo-Json | Set-Content out\version.json -Encoding utf8
+          # this repo's root version.json, read by installs with the default settings
+          $info.script_path = 'pii_sanitizer.py'
+          $info | ConvertTo-Json | Set-Content out\root-version.json -Encoding utf8
+          Get-Content out\root-version.json
           "zip=$zip" >> $env:GITHUB_OUTPUT
-        id: pkg
 
       - uses: actions/upload-artifact@v4
         with:
           name: PII-Shield-${{ steps.ver.outputs.version }}-win64
-          path: |
-            ${{ steps.pkg.outputs.zip }}
-            ${{ steps.pkg.outputs.zip }}.sha256
-            version.json
+          path: out/
           retention-days: 14
 
       - name: Publish GitHub Release
@@ -120,8 +123,24 @@ jobs:
           1. Download ``$zip`` and unzip it to a folder you can write to (not Program Files).
           2. Run ``PII-Shield\PII-Shield.exe``. Settings and rules are stored next to the exe.
 
-          ``$zip.sha256`` holds the SHA-256 of the zip. ``version.json`` is the file to publish as
-          ``app/version.json`` in your rules repo so existing installs can update themselves.
+          ``$zip.sha256`` holds the SHA-256 of the zip. Installs with the default settings find this
+          release through ``version.json`` at the root of this repo. If you use your own rules repo,
+          publish the attached ``version.json`` there as ``app/version.json``.
           The exe is not code-signed, so Windows SmartScreen may warn on first start.
           "@
-          gh release create "v$v" $zip "$zip.sha256" version.json --title "PII Shield $v" --notes $notes
+          gh release create "v$v" "out\$zip" "out\$zip.sha256" out\version.json --title "PII Shield $v" --notes $notes
+
+      - name: Point installs at the new release (version.json on main)
+        if: github.ref_type == 'tag'
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout -B main origin/main
+          Copy-Item out\root-version.json version.json -Force
+          git add version.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) { Write-Host "version.json already current"; exit 0 }
+          git commit -m "version.json: PII Shield $v"
+          git push origin main

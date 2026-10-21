@@ -60,13 +60,15 @@ The exe has no console. To see the output of a command-line option, add `--log-f
 
 To update the Windows build, the app downloads the new release zip and checks its SHA-256. It
 then closes, replaces `PII-Shield.exe` and `_internal\`, and starts again. Your settings and
-rules stay. For this to work, `app/version.json` in the rules repo must contain
-`windows_zip_url` and `windows_zip_sha256`. Each release includes a `version.json` with these
-fields, ready to copy.
+rules stay.
 
 To build the zip, push a `v<version>` tag. The workflow in `.github/workflows/build-windows.yml`
 runs the tests, builds with `packaging/pii_shield.spec`, smoke-tests the exe and publishes the
-release.
+release. It then commits `version.json` at the root of this repo. That file names the new
+version, the zip URL and both SHA-256 values, so every install finds the update.
+
+Before you push the tag, set `__version__` and stamp `github-repo-template/app/version.json`
+with the SHA-256 of `pii_sanitizer.py`. The workflow stops if they do not match.
 
 ## Running the app
 
@@ -154,18 +156,23 @@ If a rule file has an error, PII Shield skips only that file. The other files st
 
 ### Shared rules on GitHub
 
-`github-repo-template/` is a starter for the shared rules repo:
+By default, PII Shield syncs the rules from `github-repo-template/rules` in this public repo
+(`TenRoot/pii-shield`, branch `main`) and reads `version.json` from the repo root. No token is
+needed. Without a token, GitHub allows 60 API requests per hour per IP address, and one sync
+uses about 8.
+
+To use your own rules repo, start from `github-repo-template/`:
 
 | Path | Purpose |
 |---|---|
 | `rules/` | Rule files and wordlists. The app syncs this folder into `rules/remote/`. |
-| `app/version.json` | Latest app version and the SHA-256 of the script, for update checks. |
+| `app/version.json` | Latest app version and the SHA-256 of the script, for update checks. Each release has a ready `version.json` with the Windows zip fields. |
 | `Publish-AppVersion.ps1` | Writes `app/version.json` from `app/pii_sanitizer.py`. |
 | `.github/workflows/validate-rules.yml` | CI. Validates the rules and checks the hash in `version.json`. |
 
-To connect the app, click **Update Rules** on the toolbar. Enter the contents API URL of the
-rules folder, for example `https://api.github.com/repos/org/repo/contents/rules`, the branch
-and a token. Then click **Check & Pull Updates**.
+To connect the app to your own repo, click **Update Rules** on the toolbar. Enter the contents
+API URL of the rules folder, for example `https://api.github.com/repos/org/repo/contents/rules`,
+the branch, the version path `app/version.json` and a token. Then click **Check & Pull Updates**.
 
 The sync downloads only `.yaml`, `.yml`, `.json`, `.txt`, `.lst` and `.csv` files. It checks
 the git blob SHA of each file and validates all rules in a staging folder. If any check
@@ -175,13 +182,13 @@ fails, the sync changes nothing.
 
 After the engine loads, PII Shield runs three checks in the background:
 
-- **Rules sync.** If a rules repo is set, PII Shield pulls the rules with the same checks as a
+- **Rules sync.** PII Shield pulls the rules with the same checks as a
   manual sync. If the pull fails, the app keeps the current rules and writes the error to the
   **Log** tab.
-- **App version check.** If a rules repo is set, PII Shield reads `app/version.json` from it.
-  If that file lists a newer version, PII Shield asks if you want to install it. The download
-  must match the SHA-256 in `version.json`, and PII Shield backs up the current script first.
-  Restart the app to use the new version.
+- **App version check.** PII Shield reads `version.json` from the rules repo. If that file
+  lists a newer version, PII Shield asks if you want to install it. The download must match the
+  SHA-256 in `version.json`. The script version backs up the current script and needs a
+  restart. The Windows build installs the new release zip and restarts by itself.
 - **Presidio check.** PII Shield asks PyPI for the latest `presidio-analyzer` and
   `presidio-anonymizer` versions. If a newer version exists, the status bar and the **Log** tab
   show the `pip install -U` command to run. PII Shield never installs packages itself.
