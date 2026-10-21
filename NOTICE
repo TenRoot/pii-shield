@@ -1,0 +1,14 @@
+PII Shield
+
+This product includes detection patterns, JSON key lists and test log lines adapted from
+logtotal-sanitizer by SOC Prime (https://github.com/socprime/logtotal-sanitizer),
+licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+The adapted material is in these files:
+  github-repo-template/rules/secrets.yaml
+  github-repo-template/rules/identity.yaml
+  github-repo-template/rules/hosts.yaml
+  github-repo-template/rules/json_fields.yaml
+  tests/test_core.py (EngineTests.LOG_CASES and the JSON and benign log tests)
+
+The patterns were rewritten for Python regular expressions and the PII Shield rule format.

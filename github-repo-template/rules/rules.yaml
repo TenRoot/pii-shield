@@ -6,15 +6,18 @@
 #   recognizers:
 #     - name:            unique rule name (later files / local rules override same name)
 #       entity:          UPPER_SNAKE_CASE entity -> token prefix, e.g. HOSTNAME -> <HOSTNAME_1>
-#       patterns:        list of {name, regex, score}  (Python 're' syntax)
+#       patterns:        list of {name, regex, score}  (Python 're' syntax). A (?P<value>...) group
+#                        masks only that part: 'password=(?P<value>\S+)' -> password=<SECRET_1>
 #       deny_list:       list of literal values (whole-word match)
 #       wordlist:        path(s) to .txt files, one value per line, relative to this file
+#       json_keys:       JSON / Python-dict key names whose values are masked (case and - _ . ignored)
+#       json_key_contains: key fragments; any key that contains one is masked
 #       context:         words that boost the score when found near a match (Presidio)
 #       score:           0-1, default for patterns and the score for deny_list/wordlist hits
 #       case_sensitive:  default false
-#       validator:       optional: luhn | israeli_id | ipv4 | private_ipv4
+#       validator:       optional: luhn | israeli_id | ipv4 | private_ipv4 | high_entropy | not_well_known
 #       enabled:         default true
-#   A rule needs at least one of: patterns, deny_list, wordlist.
+#   A rule needs at least one of: patterns, deny_list, wordlist, json_keys, json_key_contains.
 #   Validate before pushing:  python pii_sanitizer.py --validate-rules rules/
 # =============================================================================
 version: 1
@@ -128,20 +131,13 @@ recognizers:
     score: 0.9
     wordlist: wordlists/usernames.txt
 
-  - name: WindowsProfilePath
-    entity: USER_PATH
-    description: C:\Users\<name>\... paths leak usernames
-    score: 0.85
-    patterns:
-      - name: user_profile
-        regex: '\b[A-Za-z]:\\Users\\(?!Public\b|Default\b|All Users\b)[^\\\s"''<>|]+'
-
   - name: UNCPath
     entity: UNC_PATH
+    description: UNC paths such as \\server\share. Backslashes inside a path such as C:\\Users\\x are skipped.
     score: 0.85
     patterns:
       - name: unc
-        regex: '\\\\[A-Za-z0-9._$-]+\\[^\s"''<>|]+'
+        regex: '(?<![\w\\:$.-])\\\\[A-Za-z0-9._$-]+\\[^\s"''<>|]+'
 
   - name: CustomerNames
     entity: CUSTOMER
@@ -183,11 +179,11 @@ recognizers:
 
   - name: CredentialAssignment
     entity: SECRET
-    description: key=value credentials in configs/logs (the whole "password=..." span is masked)
+    description: key=value credentials in configs and logs. Only the value is masked - password=<SECRET_1>
     score: 0.85
     patterns:
       - name: kv_secret
-        regex: '(?:password|passwd|pwd|secret|api[_-]?key|client[_-]?secret|token)\s*[:=]\s*["'']?[^\s"'',;]{6,}'
+        regex: '(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|private[_-]?key|signing[_-]?key|token)["'']?\s*[:=]\s*["'']?(?P<value>[^\s"'',;}]{6,})'
 
   - name: NTLMHashPair
     entity: SECRET

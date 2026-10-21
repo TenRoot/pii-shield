@@ -1,0 +1,55 @@
+# Accounts and identifiers in logs: SIDs, LDAP, cloud principals, log user fields, home folders.
+# Many patterns are adapted from socprime/logtotal-sanitizer (Apache-2.0). See NOTICE in the app repo.
+# validator not_well_known skips built-in names such as root, SYSTEM, Public and S-1-5-18.
+version: 1
+
+recognizers:
+
+  - name: WindowsSID
+    entity: SID
+    description: Windows security identifiers. Well-known SIDs such as S-1-5-18 and S-1-5-32-544 are skipped.
+    score: 0.9
+    validator: not_well_known
+    case_sensitive: true
+    patterns:
+      - {name: sid, regex: '\bS-1-(?:\d+-){1,14}\d+\b'}
+
+  - name: DirectoryUsers
+    entity: USERNAME
+    description: LDAP uid= and sAMAccountName= values and cn= names
+    score: 0.85
+    validator: not_well_known
+    patterns:
+      - {name: ldap_uid, regex: '\b(?:uid|sAMAccountName)=(?P<value>[\w.@+-]*[A-Za-z][\w.@+-]*)'}
+      - {name: ldap_cn,  regex: '\bcn=(?P<value>[A-Za-z0-9.''-]+(?: [A-Za-z0-9.''-]+){0,3})'}
+
+  - name: CloudPrincipals
+    entity: USERNAME
+    description: AWS IAM users, AWS assumed-role session names and Kubernetes service accounts
+    score: 0.85
+    patterns:
+      - {name: aws_iam_user,     regex: '\barn:aws[\w-]*:iam::\d*:user/(?:[\w+=,.@-]+/)*(?P<value>[\w+=,.@-]+)'}
+      - {name: aws_role_session, regex: '\barn:aws[\w-]*:sts::\d*:assumed-role/[\w+=,.@-]+/(?P<value>[\w+=,.@-]+)'}
+      - {name: k8s_service_acct, regex: '\bsystem:serviceaccount:[a-z0-9-]+:(?P<value>[a-z0-9-]+)'}
+
+  - name: LogUserFields
+    entity: USERNAME
+    description: User names in sshd, PAM and sudo lines and in user=value pairs. System accounts such as root are skipped.
+    score: 0.85
+    validator: not_well_known
+    patterns:
+      - {name: sshd_login,   regex: '\b(?:Accepted|Failed) \w+ for (?:invalid user |illegal user )?(?P<value>[A-Za-z0-9._-]+) from\b'}
+      - {name: sshd_invalid, regex: '\b(?:Invalid|Illegal) user (?P<value>[A-Za-z0-9._-]+) from\b'}
+      - {name: sudo,         regex: '\bsudo:\s+(?P<value>[A-Za-z0-9._-]+)(?=\s+:)'}
+      - {name: user_kv,      regex: '\b(?:user|username|user_name|ruser|suser|duser|logname|login|account|owner|actor|principal|requester|created_?by|modified_?by|assignee|operator)\s*=\s*["'']?(?P<value>[\w.@+-]*[A-Za-z][\w.@+-]*)'}
+
+  - name: HomeDirectoryUser
+    entity: USERNAME
+    description: The user name in home and profile paths - /home/dlevi, /Users/dlevi, C:\Users\dlevi. The rest of the path stays visible.
+    score: 0.85
+    validator: not_well_known
+    patterns:
+      - {name: unix_home,       regex: '(?<![\w.-])(?:/export|/usr|/var)?/home/(?P<value>[^/\\\s"''<>|]+)'}
+      - {name: mac_users,       regex: '(?<![\w.:-])(?:/mnt/[A-Za-z])?(?-i:/Users/)(?P<value>[^/\\\s"''<>|]+)'}
+      - {name: windows_profile, regex: '\b[A-Za-z]:[\\/]{1,2}(?:Users|Documents and Settings)[\\/]{1,2}(?P<value>[^/\\\s"''<>|]+)'}
+      - {name: wsl_home,        regex: '//wsl\$/[\w.-]+/home/(?P<value>[^/\\\s"''<>|]+)'}

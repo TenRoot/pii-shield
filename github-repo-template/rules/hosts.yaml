@@ -1,0 +1,46 @@
+# Host names in log lines: syslog host field, host= pairs, Kerberos SPNs, default Windows names.
+# Many patterns are adapted from socprime/logtotal-sanitizer (Apache-2.0). See NOTICE in the app repo.
+version: 1
+
+recognizers:
+
+  - name: SyslogHost
+    entity: HOSTNAME
+    description: The host field of a syslog line - "Oct 12 10:01:02 webgw01 sshd[311]:". Log levels such as INFO are skipped.
+    score: 0.9
+    patterns:
+      - name: bsd_syslog
+        regex: '\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+(?!(?:TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRIT|CRITICAL|FATAL|ALERT|EMERG)\b)(?P<value>(?=[\w.-]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9-]{1,63})*)(?=\s+[A-Za-z][\w.@/-]*(?:\[\d+\])?:)'
+      - name: iso_syslog
+        regex: '\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\s+(?!(?:TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRIT|CRITICAL|FATAL|ALERT|EMERG)\b)(?P<value>(?=[\w.-]*[A-Za-z])[A-Za-z0-9][A-Za-z0-9-]{0,62}(?:\.[A-Za-z0-9-]{1,63})*)(?=\s+[A-Za-z][\w.@/-]*(?:\[\d+\])?:)'
+
+  - name: HostKeyValue
+    entity: HOSTNAME
+    description: Values of host=, hostname=, computer= and similar log fields
+    score: 0.85
+    patterns:
+      - name: host_kv
+        regex: '\b(?:host|hostname|host_name|computer|computer_?name|workstation|shost|dhost|server)\s*=\s*["'']?(?P<value>(?=[\w.-]*[A-Za-z])[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)'
+
+  - name: KerberosSpnHost
+    entity: HOSTNAME
+    description: The host part of a Kerberos SPN - HTTP/web01.acme.com@ACME.COM (the realm must be UPPERCASE)
+    score: 0.9
+    patterns:
+      - name: spn
+        regex: '\b[A-Za-z][A-Za-z0-9]*/(?P<value>[A-Za-z0-9][A-Za-z0-9.-]*)(?::\d+)?(?=@(?-i:[A-Z0-9-]+(?:\.[A-Z0-9-]+)+)\b)'
+
+  - name: WindowsDefaultNames
+    entity: HOSTNAME
+    description: Default Windows computer names - WIN-4F7K2LQ9PZ1, DESKTOP-8HD2KQ1, LAPTOP-1A2B3C4D
+    score: 0.85
+    case_sensitive: true
+    patterns:
+      - {name: default_name, regex: '\b(?:WIN|DESKTOP|LAPTOP)-(?=[A-Z]*\d)[A-Z0-9]{7,12}\b'}
+
+  - name: InventoryHosts
+    entity: HOSTNAME
+    description: Inventory-style names that end in a number - web-prod-01, srv-app-07, node-pool-12
+    score: 0.8
+    patterns:
+      - {name: inventory, regex: '(?<![\w.-])(?:srv|web|db|app|host|node|pod|vm|k8s)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+(?![\w-])'}

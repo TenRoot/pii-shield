@@ -1,0 +1,61 @@
+# Mask JSON and Python-dict values by their key name: {"userName": "dlevi"} -> {"userName": "<USERNAME_1>"}.
+# Key matching ignores case and the separators - _ . and space, so userName = user_name = USER-NAME.
+# json_keys must match the whole key. json_key_contains matches any key that contains the text.
+# Key lists are adapted from socprime/logtotal-sanitizer (Apache-2.0). See NOTICE in the app repo.
+version: 1
+
+recognizers:
+
+  - name: JsonSecretFields
+    entity: SECRET
+    score: 0.9
+    json_keys: [password, passwd, pwd, pass, token, authorization, apiKey, xApiKey, secret, accessToken,
+                refreshToken, idToken, clientSecret, privateKey, secretKey, apiSecret, credentials,
+                accessKey, secretAccessKey, awsSecretAccessKey, awsSessionToken, xAmzSecurityToken,
+                signature, bearerToken, authToken, authKey, apiToken, appSecret, consumerSecret,
+                oauthToken, oauthTokenSecret, masterKey, encryptionKey, sharedKey, sharedSecret,
+                webhookSecret, signingSecret, signingKey, connectionString, connStr, passwordHash,
+                pwdHash, otp, totp, mfaCode, oneTimePassword, verificationCode, recoveryCode, sshKey,
+                subscriptionKey, ocpApimSubscriptionKey, xAuthToken, xAccessToken, proxyAuthorization,
+                sasToken, vaultToken, xVaultToken, jwt, samlResponse, samlAssertion, pinBlock,
+                sessionId, sid, cookie, cookies, setCookie, jsessionid, phpsessid, csrfToken, xsrfToken,
+                xCsrfToken, csrf, sessionToken, sessionKey, sessionCookie, session, rememberToken, authCookie]
+    json_key_contains: [password, passwd, secret, apikey, accesstoken, refreshtoken, idtoken, authtoken,
+                        bearertoken, privatekey, credential, passphrase, connectionstring, sessionid,
+                        sessiontoken, cookie, csrf, xsrf]
+
+  - name: JsonUserFields
+    entity: USERNAME
+    score: 0.9
+    validator: not_well_known
+    json_keys: [user, username, login, account, accountName, samAccountName, userPrincipalName, upn,
+                actor, principal, owner, createdBy, modifiedBy, updatedBy, deletedBy, requestedBy,
+                submittedBy, approvedBy, userId, uid, usr, loginName, loginId, logonName, userSid,
+                author, committer, reporter, assignee, impersonatedUser, effectiveUser, sudoUser, ruser,
+                suser, duser, employeeId, employeeNumber, staffId, studentId, gecos, distinguishedName,
+                userDn, targetUserName, subjectUserName, initiator]
+    json_key_contains: [username, principalname, loginname, accountname]
+
+  - name: JsonPersonFields
+    entity: PERSON
+    score: 0.9
+    json_keys: [firstName, lastName, fullName, displayName, userDisplayName, givenName, surname,
+                middleName, nickname, maidenName, familyName, legalName, realName, customerName,
+                contactName]
+    json_key_contains: [firstname, lastname, fullname]
+
+  - name: JsonHostFields
+    entity: HOSTNAME
+    score: 0.9
+    json_keys: [host, hostname, fqdn, computer, computerName, serverName, nodeName, dnsName, machineName,
+                targetHost, remoteHost, sourceHost, destinationHost, srcHost, dstHost, shost, dhost,
+                clientHost, hostFqdn, workstation, workstationName, deviceName, deviceHostname, sni,
+                serverNameIndication, tlsServerName, virtualHost, vhost, httpHost, xForwardedHost,
+                qname, queryName, smtpHost, mailServer]
+    json_key_contains: [computer, hostname, fqdn, workstation]
+
+  - name: JsonDomainFields
+    entity: DOMAIN
+    score: 0.9
+    json_keys: [domain, domainName, dnsDomain, targetDomainName, subjectDomainName]
+    json_key_contains: [domainname]
