@@ -121,6 +121,7 @@ DEFAULT_CONFIG: Dict = {
         "score_threshold": 0.35,
         "builtin_entities": list(DEFAULT_BUILTIN_ENTITIES),
         "detect_organizations": True,   # spaCy ORG: some false positives, but safer to over-detect
+        "skip_ner_on_logs": False,      # drop spaCy PERSON/ORG/LOCATION findings when the input looks like a log
         "check_presidio_updates": True,  # ask PyPI at startup; reports only, never installs
     },
     "behavior": {
@@ -1245,6 +1246,35 @@ def find_literal(text: str, value: str, case_insensitive: bool) -> Iterable[Tupl
     return [(m.start(), m.end()) for m in rx.finditer(text)]
 
 
+# A line is a log line when it starts with a timestamp, a syslog priority or a log level, holds a
+# JSON object, or has two key=value pairs. spaCy NER reads such lines as prose and tags field
+# names and values ("arn", "COMMAND=/bin/ls") as PERSON or ORGANIZATION.
+_MONTH = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+_LOG_LINE_START_RE = re.compile(
+    r"^\s*(?:<\d{1,3}>\s*)?(?:"
+    r"\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}"                      # ISO 8601
+    r"|" + _MONTH + r"\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"            # BSD syslog
+    r"|\[?\d{1,2}/\d{1,2}/\d{2,4}[ ,]+\d{1,2}:\d{2}"             # 10/12/2024 10:01
+    r"|\[?\d{10}(?:\.\d+|\d{3})?\b"                              # Unix epoch
+    r"|\[?(?:TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRIT|CRITICAL|FATAL|ALERT|EMERG)\b[\]:]?"
+    r"|\{.*\}\s*$)")
+_LOG_LINE_ANY_RE = re.compile(r"\[\d{2}/" + _MONTH + r"/\d{4}:\d{2}:\d{2}:\d{2}")  # Apache access log
+_KEY_VALUE_RE = re.compile(r"(?<![\w.-])[A-Za-z_][\w.-]{0,40}=(?=\S)")
+LOG_LINE_RATIO = 0.6        # share of non-blank lines that must look like log lines
+LOG_SAMPLE_LINES = 500
+
+
+def is_log_line(line: str) -> bool:
+    return bool(_LOG_LINE_START_RE.match(line) or _LOG_LINE_ANY_RE.search(line) or
+                len(_KEY_VALUE_RE.findall(line)) >= 2)
+
+
+def looks_like_log(text: str) -> bool:
+    """True when most non-blank lines (of the first LOG_SAMPLE_LINES) are log lines."""
+    lines = [ln for ln in text.splitlines() if ln.strip()][:LOG_SAMPLE_LINES]
+    return bool(lines) and sum(map(is_log_line, lines)) >= LOG_LINE_RATIO * len(lines)
+
+
 # ===========================================================================
 # 4. Session vault (token <-> raw value), in memory only
 # ===========================================================================
@@ -1503,6 +1533,9 @@ if PRESIDIO_OK:
             return EntityRecognizer.remove_duplicates(results)
 
 
+NER_RECOGNIZERS = ("SpacyRecognizer", "StanzaRecognizer", "TransformersRecognizer")
+
+
 class DetectionEngine:
     """Owns the (expensive) NLP engine once; recognizer registries are rebuilt on hot reload."""
 
@@ -1516,6 +1549,7 @@ class DetectionEngine:
         self.mode = "uninitialized"       # presidio+spacy | presidio-regex-only | lite
         self.ruleset = RuleSet()
         self.builtin_supported: List[str] = []
+        self.last_ner_skipped = False     # True when the last analyze() dropped NER findings on log input
 
     # ---- lifecycle
     def initialize(self, progress: Callable[[str], None] = lambda s: None) -> str:
@@ -1570,7 +1604,7 @@ class DetectionEngine:
         registry.load_predefined_recognizers(languages=["en"], nlp_engine=self.nlp_engine)
         if self.mode == "presidio-regex-only":
             for rec in list(registry.recognizers):
-                if rec.__class__.__name__ in ("SpacyRecognizer", "StanzaRecognizer", "TransformersRecognizer"):
+                if rec.__class__.__name__ in NER_RECOGNIZERS:
                     registry.recognizers.remove(rec)
         for r in rs.rules:
             kw = dict(supported_entity=r.entity, name=r.name, supported_language="en",
@@ -1638,12 +1672,16 @@ class DetectionEngine:
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
 
+        skip_ner = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
+        self.last_ner_skipped = skip_ner
         if analyzer is not None:
             entities = sorted(set(ecfg.get("builtin_entities", [])) | set(rs.entities))
             results = analyzer.analyze(text=text, language="en", entities=entities or None,
                                        score_threshold=threshold)
             for r in results:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
+                if skip_ner and rname in NER_RECOGNIZERS:
+                    continue
                 src = "custom" if rname in custom_names else "presidio"
                 found.append(Finding(r.start, r.end, text[r.start:r.end], r.entity_type,
                                      float(r.score), src, rname))
@@ -2626,6 +2664,9 @@ if QT_OK:
             self.threshold.setValue(float(e.get("score_threshold", 0.35)))
             self.orgs = QtWidgets.QCheckBox("Detect ORGANIZATION names with spaCy NER (noisy)")
             self.orgs.setChecked(bool(e.get("detect_organizations")))
+            self.skip_ner_logs = QtWidgets.QCheckBox("Turn off spaCy NER (names, organizations, places) "
+                                                     "when the input looks like log lines")
+            self.skip_ner_logs.setChecked(bool(e.get("skip_ner_on_logs")))
             self.entities = QtWidgets.QListWidget()
             known = sorted(set(engine.builtin_supported) | set(DEFAULT_BUILTIN_ENTITIES) |
                            set(e.get("builtin_entities", [])) | ({"ORGANIZATION"} if e.get("detect_organizations") else set()))
@@ -2638,6 +2679,7 @@ if QT_OK:
             f1.addRow("spaCy model", self.model)
             f1.addRow("Score threshold", self.threshold)
             f1.addRow("", self.orgs)
+            f1.addRow("", self.skip_ner_logs)
             f1.addRow(QtWidgets.QLabel("Built-in Presidio entities (custom-rule entities are always on):"))
             f1.addRow(self.entities)
             tabs.addTab(w1, "Detection")
@@ -2694,6 +2736,7 @@ if QT_OK:
             e["spacy_model"] = model
             e["score_threshold"] = round(self.threshold.value(), 2)
             e["detect_organizations"] = self.orgs.isChecked()
+            e["skip_ner_on_logs"] = self.skip_ner_logs.isChecked()
             ents = [self.entities.item(i).text() for i in range(self.entities.count())
                     if self.entities.item(i).checkState() == Qt.CheckState.Checked]
             if self.orgs.isChecked() and "ORGANIZATION" not in ents:
@@ -3207,6 +3250,8 @@ if QT_OK:
                 self._highlight()
                 log.info("analysis: %d detections, %d unique values", len(findings),
                          len({self.vault.key(f.text) for f in findings}))
+                if self.engine.last_ner_skipped:
+                    self.statusBar().showMessage("Input looks like log lines - spaCy NER findings skipped", 8000)
             self._run(self.engine.analyze, done, text, list(self.manual_rules), self.vault, thr)
 
         def populate_table(self):
