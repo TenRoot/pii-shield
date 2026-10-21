@@ -4,8 +4,9 @@
 PII Shield - local, two-way PII / sensitive-data sanitizer for LLM prompt engineering.
 
   * 100% local processing: Microsoft Presidio + local spaCy model. The only network
-    traffic this program ever makes is the on-demand GitHub rules sync (HTTP GET of
-    rule files, plus an optional version check). Prompt text is never transmitted.
+    traffic this program makes is the GitHub rules sync (HTTP GET of rule files, plus an
+    optional version check; at startup and on demand) and a startup PyPI version check for
+    Presidio. Offline mode turns all of it off. Prompt text is never transmitted.
   * Human-in-the-loop: every detection is staged in an editable table before masking.
   * Consistent tokens: identical values always map to the same token for the session.
   * Hot-reloadable custom recognizers from ./rules (local) and ./rules/remote (GitHub).
@@ -89,6 +90,7 @@ DEFAULT_CONFIG: Dict = {
         "repo_url": "",               # e.g. https://api.github.com/repos/org/repo/contents/rules
         "branch": "main",
         "check_app_updates": True,
+        "auto_sync_on_startup": True,  # pull rules in the background when the app starts
         "version_path": "app/version.json",  # path in the repo (repo root relative)
         "ca_bundle": "",              # optional corporate CA bundle for TLS inspection proxies
         "timeout": 20,
@@ -100,6 +102,7 @@ DEFAULT_CONFIG: Dict = {
         "score_threshold": 0.35,
         "builtin_entities": list(DEFAULT_BUILTIN_ENTITIES),
         "detect_organizations": True,   # spaCy ORG: some false positives, but safer to over-detect
+        "check_presidio_updates": True,  # ask PyPI at startup; reports only, never installs
     },
     "behavior": {
         "token_format": "<{entity}_{n}>",
@@ -107,7 +110,7 @@ DEFAULT_CONFIG: Dict = {
         "case_insensitive_values": True,  # "SRV-DC01" and "srv-dc01" share a token
         "lenient_restore": True,         # also restore HOSTNAME_1, [HOSTNAME_1], &lt;HOSTNAME_1&gt;
         "clipboard_clear_seconds": 0,    # 0 = never auto-clear
-        "offline_mode": False,           # True = GitHub sync disabled entirely
+        "offline_mode": False,           # True = no network at all: no GitHub sync, no update checks
     },
 }
 
@@ -1071,7 +1074,7 @@ NETWORK_GUARD = {"enabled": True, "blocked": 0}
 
 def _network_audit_hook(event: str, args) -> None:
     """Python audit hook: sockets may only be opened from code explicitly running inside
-    allow_network() (the GitHub sync). Everything else - analysis, anonymization,
+    allow_network() (the GitHub sync and the PyPI update check). Everything else - analysis, anonymization,
     any third-party library - is blocked from touching the network."""
     if event in ("socket.connect", "socket.getaddrinfo", "socket.sendto") and NETWORK_GUARD["enabled"]:
         if not getattr(_NET, "allowed", False):
@@ -1431,6 +1434,9 @@ def normalize_repo_url(url: str) -> Tuple[str, str, str]:
     raise SyncError("Unrecognized GitHub URL")
 
 
+SYNC_LOCK = threading.Lock()   # one rules pull at a time (startup sync vs. the sync dialog)
+
+
 class GitHubSync:
     MAX_FILES = 500
     MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -1466,7 +1472,7 @@ class GitHubSync:
             raise SyncError("Refusing to follow a URL on a different host")
         headers = {"Accept": "application/vnd.github.raw"} if raw else {}
         try:
-            with allow_network():   # the ONLY place in the program allowed to open a socket
+            with allow_network():   # with check_package_updates, the only code allowed to open a socket
                 r = self.s.get(url, headers=headers, timeout=self.timeout, verify=self.verify,
                                params={"ref": self.branch}, allow_redirects=False)
         except self.requests.exceptions.SSLError as exc:
@@ -1543,6 +1549,14 @@ class GitHubSync:
         return SyncPlan(files, added, sorted(changed), removed, unchanged)
 
     def pull(self, force: bool = False) -> Tuple[SyncPlan, RuleSet]:
+        if not SYNC_LOCK.acquire(blocking=False):
+            raise SyncError("Another rules sync is already running - try again in a moment")
+        try:
+            return self._pull(force)
+        finally:
+            SYNC_LOCK.release()
+
+    def _pull(self, force: bool) -> Tuple[SyncPlan, RuleSet]:
         plan = self.plan()
         if not plan.has_changes and not force:
             self.progress("Already up to date.")
@@ -1645,6 +1659,53 @@ class GitHubSync:
         tmp.write_bytes(data)
         os.replace(tmp, target)
         return target
+
+
+# ===========================================================================
+# 7a. Startup updates (run in the background by the GUI, testable without Qt)
+# ===========================================================================
+PRESIDIO_PACKAGES = ("presidio-analyzer", "presidio-anonymizer")
+PYPI_URL = "https://pypi.org/pypi"
+
+
+def auto_sync_rules(config: AppConfig, token: str, engine: Optional[DetectionEngine] = None,
+                    rules_root: Path = RULES_DIR) -> Optional[Tuple[SyncPlan, RuleSet]]:
+    """Startup rules pull. Returns None, with no network traffic, when the sync is disabled,
+    offline mode is on, or no repo is set. The pull itself is validated and atomic."""
+    g = config["github"]
+    if (not g.get("auto_sync_on_startup", True) or config["behavior"].get("offline_mode")
+            or not (g.get("repo_url") or "").strip()):
+        return None
+    return GitHubSync(config, token, engine, rules_root).pull()
+
+
+def check_package_updates(config: AppConfig, packages: Sequence[str] = PRESIDIO_PACKAGES,
+                          index_url: str = PYPI_URL) -> Optional[List[Dict]]:
+    """Ask PyPI for the newest release of each package. Reports only - never installs anything.
+    Returns None, with no network traffic, when the check is disabled or offline mode is on."""
+    if not config["engine"].get("check_presidio_updates", True) or config["behavior"].get("offline_mode"):
+        return None
+    import requests
+    from importlib import metadata
+    verify = (config["github"].get("ca_bundle") or "").strip() or True
+    timeout = int(config["github"].get("timeout", 20))
+    out = []
+    for pkg in packages:
+        try:
+            installed = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            installed = None
+        try:
+            with allow_network():   # sends only the package name; no prompt text, no token
+                r = requests.get(f"{index_url}/{pkg}/json", timeout=timeout, verify=verify,
+                                 allow_redirects=False, headers={"User-Agent": f"{APP_ID}/{__version__}"})
+            r.raise_for_status()
+            latest = str(r.json()["info"]["version"])
+        except Exception as exc:
+            raise SyncError(f"PyPI check for {pkg} failed: {exc}")
+        out.append({"package": pkg, "installed": installed, "latest": latest,
+                    "newer": installed is not None and parse_version(latest) > parse_version(installed)})
+    return out
 
 
 # ===========================================================================
@@ -2032,8 +2093,12 @@ if QT_OK:
             self.clip.setRange(0, 3600)
             self.clip.setSuffix(" s  (0 = never)")
             self.clip.setValue(int(b.get("clipboard_clear_seconds", 0)))
-            self.offline = QtWidgets.QCheckBox("Offline mode - disable GitHub sync entirely")
+            self.offline = QtWidgets.QCheckBox("Offline mode - no GitHub sync and no update checks")
             self.offline.setChecked(bool(b.get("offline_mode")))
+            self.auto_sync = QtWidgets.QCheckBox("Sync rules from GitHub at startup (in the background)")
+            self.auto_sync.setChecked(bool(self.config["github"].get("auto_sync_on_startup", True)))
+            self.check_presidio = QtWidgets.QCheckBox("Check PyPI for Presidio updates at startup (report only)")
+            self.check_presidio.setChecked(bool(e.get("check_presidio_updates", True)))
             f2.addRow("Token format", self.token_format)
             f2.addRow("", QtWidgets.QLabel("Must contain {entity} and {n}, e.g. <{entity}_{n}> or [[{entity}-{n}]]"))
             f2.addRow("", self.propagate)
@@ -2041,6 +2106,8 @@ if QT_OK:
             f2.addRow("", self.lenient)
             f2.addRow("Auto-clear clipboard", self.clip)
             f2.addRow("", self.offline)
+            f2.addRow("", self.auto_sync)
+            f2.addRow("", self.check_presidio)
             tabs.addTab(w2, "Behavior")
 
             bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
@@ -2072,6 +2139,8 @@ if QT_OK:
             b.update(token_format=tf, propagate_values=self.propagate.isChecked(),
                      case_insensitive_values=self.ci.isChecked(), lenient_restore=self.lenient.isChecked(),
                      clipboard_clear_seconds=self.clip.value(), offline_mode=self.offline.isChecked())
+            self.config["github"]["auto_sync_on_startup"] = self.auto_sync.isChecked()
+            e["check_presidio_updates"] = self.check_presidio.isChecked()
             self.config.save()
             self.accept()
 
@@ -2084,6 +2153,7 @@ if QT_OK:
             super().__init__()
             self.config = config
             self.secrets = SecretStore(config)
+            self._startup_checked = False
             self.engine = DetectionEngine(config)
             b = config["behavior"]
             self.vault = SessionVault(b.get("token_format", "<{entity}_{n}>"), b.get("case_insensitive_values", True))
@@ -2410,7 +2480,43 @@ if QT_OK:
                 self.lbl_engine.setText(f"Engine: {desc}  ·  offline")
                 self.btn_analyze.setEnabled(True)
                 self._update_rules_badge(self.engine.ruleset)
+                self._startup_updates()
             self._run(self.engine.initialize, done, progress=True)
+
+        def _startup_updates(self):
+            """Once per app start, after the engine is ready: pull rules and check Presidio in the background.
+            Failures only go to the log - a missing network must not interrupt work."""
+            if self._startup_checked:
+                return
+            self._startup_checked = True
+
+            def synced(res):
+                if res is None:
+                    return
+                plan, rs = res
+                self._update_rules_badge(rs)
+                if plan.has_changes:
+                    log.info("Startup rules sync: +%d ~%d -%d files", len(plan.added), len(plan.changed),
+                             len(plan.removed))
+                    set_badge(self.badge_rules, f"Rules auto-updated ({len(rs.rules)} rules loaded)",
+                              "warn" if rs.errors else "ok")
+                else:
+                    log.info("Startup rules sync: already up to date")
+            self._run(auto_sync_rules, synced, self.config, self.secrets.get(), self.engine,
+                      error=lambda m: log.warning("Startup rules sync failed: %s", m))
+
+            def checked(res):
+                if res is None:
+                    return
+                newer = [r for r in res if r["newer"]]
+                for r in res:
+                    log.info("%s: installed %s, latest %s", r["package"], r["installed"] or "(none)", r["latest"])
+                if newer:
+                    cmd = "pip install -U " + " ".join(r["package"] for r in newer)
+                    log.warning("Presidio update available - close the app and run: %s", cmd)
+                    self.statusBar().showMessage(f"Presidio update available - see Log ({cmd})")
+            self._run(check_package_updates, checked, self.config,
+                      error=lambda m: log.warning("Presidio update check failed: %s", m))
 
         def reload_rules(self):
             self._run(self.engine.reload_rules, lambda rs: (self._update_rules_badge(rs),

@@ -1,5 +1,6 @@
 """GitHub sync tests against a local mock of the GitHub REST 'contents' API over HTTPS.
 Requires the `openssl` CLI to mint a throwaway localhost certificate."""
+import gc
 import hashlib
 import json
 import os
@@ -80,6 +81,28 @@ class MockGitHub(BaseHTTPRequestHandler):
         return self._send(200, list(children.values()))
 
 
+class MockPyPI(BaseHTTPRequestHandler):
+    """PyPI JSON API: GET /pypi/<package>/json -> {"info": {"version": ...}}"""
+    versions = {}
+    requests_seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        MockPyPI.requests_seen.append(self.path)
+        parts = self.path.strip("/").split("/")
+        if len(parts) != 3 or parts[0] != "pypi" or parts[2] != "json" or parts[1] not in self.versions:
+            body, code = b'{"message": "Not Found"}', 404
+        else:
+            body, code = json.dumps({"info": {"version": self.versions[parts[1]]}}).encode(), 200
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 GOOD_RULES = b"""version: 1
 allow_list: [localhost]
 recognizers:
@@ -106,6 +129,10 @@ class SyncTests(unittest.TestCase):
         cls.httpd.socket = ctx.wrap_socket(cls.httpd.socket, server_side=True)
         cls.port = cls.httpd.server_address[1]
         threading.Thread(target=cls.httpd.serve_forever, daemon=True).start()
+        cls.pypi = ThreadingHTTPServer(("127.0.0.1", 0), MockPyPI)
+        cls.pypi.socket = ctx.wrap_socket(cls.pypi.socket, server_side=True)
+        threading.Thread(target=cls.pypi.serve_forever, daemon=True).start()
+        cls.pypi_url = f"https://localhost:{cls.pypi.server_address[1]}/pypi"
         cls.cert = cert
         os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1"
         ps.install_network_guard()   # sync must still work with the guard active
@@ -113,6 +140,7 @@ class SyncTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.httpd.shutdown()
+        cls.pypi.shutdown()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
@@ -128,12 +156,21 @@ class SyncTests(unittest.TestCase):
         (self.rules / "local").mkdir(parents=True)
         (self.rules / "local" / "mine.yaml").write_text(
             "recognizers:\n  - name: Mine\n    entity: CODENAME\n    deny_list: [Bluebird]\n", "utf-8")
-        self.cfg = ps.AppConfig(self.root / "config.json")
-        self.cfg["github"].update(repo_url=f"https://localhost:{self.port}/api/v3/repos/acme/rules-repo/contents/rules",
-                                  branch="main", ca_bundle=str(self.cert))
+        self.cfg = self.new_config()
         ps.BACKUP_DIR = self.root / "backups"
         self.engine = ps.DetectionEngine(self.cfg, self.rules)
         self.engine.initialize()
+
+    def tearDown(self):
+        # unittest keeps every TestCase instance alive; drop the spaCy-backed engine so memory stays flat
+        self.engine = None
+        gc.collect()
+
+    def new_config(self, name="config.json"):
+        cfg = ps.AppConfig(self.root / name)
+        cfg["github"].update(repo_url=f"https://localhost:{self.port}/api/v3/repos/acme/rules-repo/contents/rules",
+                             branch="main", ca_bundle=str(self.cert))
+        return cfg
 
     def client(self, token=TOKEN):
         return ps.GitHubSync(self.cfg, token, self.engine, self.rules)
@@ -240,6 +277,59 @@ class SyncTests(unittest.TestCase):
         c = self.client()
         with self.assertRaisesRegex(ps.SyncError, "different host"):
             c._get("https://evil.example.com/steal")
+
+    # ---- startup updates
+    def test_auto_sync_on_startup(self):
+        plan, rs = ps.auto_sync_rules(self.cfg, TOKEN, self.engine, self.rules)
+        self.assertEqual(sorted(plan.added), ["rules.yaml", "wordlists/customers.txt"])
+        self.assertIn("Hosts", {r.name for r in rs.rules})
+        self.assertTrue((self.rules / "remote" / "rules.yaml").exists())
+
+    def test_auto_sync_skipped(self):
+        cases = {"disabled": ("github", {"auto_sync_on_startup": False}),
+                 "offline": ("behavior", {"offline_mode": True}),
+                 "no repo": ("github", {"repo_url": ""})}
+        for name, (section, change) in cases.items():
+            with self.subTest(name):
+                cfg = self.new_config(f"{name}.json")
+                cfg[section].update(change)
+                seen = len(MockGitHub.requests_seen)
+                self.assertIsNone(ps.auto_sync_rules(cfg, TOKEN, self.engine, self.rules))
+                self.assertEqual(len(MockGitHub.requests_seen), seen, "a skipped sync must not touch the network")
+                self.assertFalse((self.rules / "remote").exists())
+
+    def test_concurrent_pull_refused(self):
+        with ps.SYNC_LOCK:
+            with self.assertRaisesRegex(ps.SyncError, "already running"):
+                self.client().pull()
+        self.client().pull()   # the lock is released again
+
+    def test_presidio_update_check(self):
+        from importlib import metadata
+        installed = metadata.version("presidio-anonymizer")
+        MockPyPI.versions = {"presidio-analyzer": "999.0.0", "presidio-anonymizer": installed}
+        res = {r["package"]: r for r in ps.check_package_updates(self.cfg, index_url=self.pypi_url)}
+        self.assertTrue(res["presidio-analyzer"]["newer"])
+        self.assertEqual(res["presidio-analyzer"]["latest"], "999.0.0")
+        self.assertEqual(res["presidio-analyzer"]["installed"], metadata.version("presidio-analyzer"))
+        self.assertFalse(res["presidio-anonymizer"]["newer"])
+
+    def test_presidio_update_check_skipped(self):
+        MockPyPI.versions = {"presidio-analyzer": "999.0.0", "presidio-anonymizer": "999.0.0"}
+        cases = {"disabled": ("engine", {"check_presidio_updates": False}),
+                 "offline": ("behavior", {"offline_mode": True})}
+        for name, (section, change) in cases.items():
+            with self.subTest(name):
+                cfg = self.new_config(f"{name}.json")
+                cfg[section].update(change)
+                seen = len(MockPyPI.requests_seen)
+                self.assertIsNone(ps.check_package_updates(cfg, index_url=self.pypi_url))
+                self.assertEqual(len(MockPyPI.requests_seen), seen)
+
+    def test_presidio_update_check_error(self):
+        MockPyPI.versions = {}
+        with self.assertRaisesRegex(ps.SyncError, "PyPI check"):
+            ps.check_package_updates(self.cfg, index_url=self.pypi_url)
 
 
 if __name__ == "__main__":

@@ -4,9 +4,10 @@ PII Shield removes personal and sensitive data from text before you send the tex
 It replaces each sensitive value with a token, for example `<HOSTNAME_1>`. When the LLM
 replies, PII Shield puts the original values back.
 
-All processing is local. PII Shield uses Microsoft Presidio and a local spaCy model. The only
-network traffic is the GitHub rules sync, and you start that sync manually. PII Shield never
-sends prompt text.
+All processing is local. PII Shield uses Microsoft Presidio and a local spaCy model. The app
+makes only two kinds of network requests: the GitHub rules sync and a Presidio version check
+on PyPI. Both run at startup, and you can also start the rules sync manually. PII Shield never
+sends prompt text. Offline mode turns off all network access.
 
 ## Features
 
@@ -139,6 +140,19 @@ The sync downloads only `.yaml`, `.yml`, `.json`, `.txt`, `.lst` and `.csv` file
 the git blob SHA of each file and validates all rules in a staging folder. If any check
 fails, the sync changes nothing.
 
+### Updates at startup
+
+After the engine loads, PII Shield runs two checks in the background:
+
+- **Rules sync.** If a rules repo is set, PII Shield pulls the rules with the same checks as a
+  manual sync. If the pull fails, the app keeps the current rules and writes the error to the
+  **Log** tab.
+- **Presidio check.** PII Shield asks PyPI for the latest `presidio-analyzer` and
+  `presidio-anonymizer` versions. If a newer version exists, the status bar and the **Log** tab
+  show the `pip install -U` command to run. PII Shield never installs packages itself.
+
+To turn off either check, open **Settings → Behavior**. Offline mode turns off both.
+
 Validate rules before you push them:
 
 ```bash
@@ -151,12 +165,12 @@ python pii_sanitizer.py --validate-rules github-repo-template/rules
 python -m unittest discover -s tests -v
 ```
 
-The suite has 28 tests:
+The suite has two files:
 
 - `tests/test_core.py` — detection, tokens, restore, rule reload and the offline guard. These
   tests use the rules in `github-repo-template/rules/`.
-- `tests/test_sync.py` — GitHub sync against a local mock HTTPS server. These tests need the
-  `openssl` command.
+- `tests/test_sync.py` — GitHub sync, startup updates and the Presidio check, against local
+  mock GitHub and PyPI servers over HTTPS. These tests need the `openssl` command.
 
 Run the tests with the Python from your virtual environment, because the tests import
 Presidio and spaCy.
