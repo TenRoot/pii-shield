@@ -1,7 +1,7 @@
 {
-  "version": "1.3.1",
+  "version": "1.4.0",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "bd354667149cc7c29bb36e6132cb6afd3dd99ca714b87bd4b69dd2cf8eca919f",
-  "notes": "Checks the rules repo for a newer app version at startup and asks before installing (SHA-256 verified, current script backed up)",
+  "sha256": "1e9d302f5aa6f723a1a8aa11bdbd79339fbbf04042551a0071c327ad1bbfe709",
+  "notes": "Portable Windows build (PII-Shield.exe, no Python needed); the Windows build updates itself from the verified release zip; Presidio hint fits the Windows build; --self-test and --log-file options",
   "published": "2026-10-21"
 }
