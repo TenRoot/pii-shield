@@ -279,6 +279,66 @@ class BundledRulesTests(unittest.TestCase):
             f.unlink()
             self.engine.reload_rules()
 
+    def test_self_test(self):
+        ok, lines = ps.self_test(self.engine)
+        self.assertTrue(ok, "\n".join(lines))
+        self.assertIn("PASS", lines[-1])
+
+
+class FrozenAndCliTests(unittest.TestCase):
+    """Behaviour of the PyInstaller build (sys.frozen) and of the CLI without a console."""
+
+    def test_app_dir(self):
+        from unittest import mock
+        exe = Path("/opt/PII-Shield/PII-Shield.exe")
+        env = {k: v for k, v in os.environ.items() if k != "PII_SHIELD_HOME"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", str(exe)):
+                self.assertEqual(ps.default_app_dir(), exe.resolve().parent)
+            with mock.patch.object(sys, "frozen", False, create=True):
+                self.assertEqual(ps.default_app_dir(), Path(ps.__file__).resolve().parent)
+        with mock.patch.dict(os.environ, {"PII_SHIELD_HOME": "/data/pii"}):
+            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(sys, "executable", str(exe)):
+                self.assertEqual(ps.default_app_dir(), Path("/data/pii"))
+
+    def test_presidio_hint(self):
+        newer = [{"package": "presidio-analyzer", "installed": "2.2.364", "latest": "2.3.0"}]
+        hint = ps.presidio_update_hint(newer, frozen=False)
+        self.assertIn("pip install -U presidio-analyzer", hint)
+        hint = ps.presidio_update_hint(newer, frozen=True)
+        self.assertNotIn("pip", hint)
+        self.assertIn("presidio-analyzer 2.3.0", hint)
+        self.assertIn("new PII Shield release", hint)
+
+    def test_cli_without_console(self):
+        """A windowed (GUI-subsystem) build has sys.stdout/sys.stderr = None; the CLI must still work."""
+        from unittest import mock
+        with mock.patch.object(sys, "stdout", None), mock.patch.object(sys, "stderr", None):
+            self.assertEqual(ps.main(["--version"]), 0)
+            self.assertEqual(ps.main(["--validate-rules", str(TEMPLATE_RULES)]), 0)
+
+    def test_gui_start_path(self):
+        """main() with no CLI flag builds the QApplication and the main window (Qt itself is mocked)."""
+        from unittest import mock
+        if not ps.QT_OK:
+            self.skipTest("PyQt6 not installed")
+        with mock.patch.object(ps.QtWidgets, "QApplication") as app, mock.patch.object(ps, "MainWindow") as win, \
+                mock.patch.object(ps, "_ensure_dirs"):
+            app.return_value.exec.return_value = 0
+            self.assertEqual(ps.main([]), 0)
+            win.return_value.show.assert_called_once()
+
+    def test_log_file(self):
+        from unittest import mock
+        out = Path(tempfile.mkdtemp()) / "cli.log"
+        try:
+            with mock.patch.object(sys, "stdout", sys.stdout), mock.patch.object(sys, "stderr", sys.stderr):
+                self.assertEqual(ps.main(["--validate-rules", str(TEMPLATE_RULES), "--log-file", str(out)]), 0)
+            text = out.read_text("utf-8")
+            self.assertIn("0 error(s)", text)
+        finally:
+            shutil.rmtree(out.parent, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

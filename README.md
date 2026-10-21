@@ -40,6 +40,34 @@ installed, PII Shield runs in regex-only mode with no name detection.
 credential store. Without `keyring`, PII Shield stores the token in plain text in
 `config.json`.
 
+## Windows build
+
+Each release on GitHub has a portable Windows build, `PII-Shield-<version>-win64.zip`. It needs
+no Python and no other install:
+
+1. Download the zip from the **Releases** page and unzip it to a folder you can write to. Do not
+   use `Program Files`.
+2. Run `PII-Shield\PII-Shield.exe`. PII Shield stores `config.json`, `rules/` and `backups/`
+   next to the exe.
+
+The exe is not code-signed, so Windows SmartScreen can show a warning on first start.
+
+The exe has no console. To see the output of a command-line option, add `--log-file`:
+
+```powershell
+.\PII-Shield.exe --self-test --log-file self-test.log
+```
+
+To update the Windows build, the app downloads the new release zip and checks its SHA-256. It
+then closes, replaces `PII-Shield.exe` and `_internal\`, and starts again. Your settings and
+rules stay. For this to work, `app/version.json` in the rules repo must contain
+`windows_zip_url` and `windows_zip_sha256`. Each release includes a `version.json` with these
+fields, ready to copy.
+
+To build the zip, push a `v<version>` tag. The workflow in `.github/workflows/build-windows.yml`
+runs the tests, builds with `packaging/pii_shield.spec`, smoke-tests the exe and publishes the
+release.
+
 ## Running the app
 
 ```bash
@@ -47,6 +75,8 @@ python pii_sanitizer.py                          # start the GUI
 python pii_sanitizer.py --validate-rules DIR     # validate a rules folder and exit
 python pii_sanitizer.py --version
 python pii_sanitizer.py --debug                  # verbose logging
+python pii_sanitizer.py --self-test              # load the engine, analyze a sample, exit
+python pii_sanitizer.py --log-file FILE          # write console output to FILE
 ```
 
 The GUI has five tabs:

@@ -103,6 +103,36 @@ class MockPyPI(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+class MockDownloads(BaseHTTPRequestHandler):
+    """Static release assets (github.com/.../releases/download/...): no auth, plain bytes."""
+    files = {}
+    auth_seen = []
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        MockDownloads.auth_seen.append(self.headers.get("Authorization"))
+        data = self.files.get(self.path)
+        self.send_response(200 if data is not None else 404)
+        self.send_header("Content-Length", str(len(data or b"")))
+        self.end_headers()
+        self.wfile.write(data or b"")
+
+
+def make_zip(entries) -> bytes:
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        for name, data in entries.items():
+            z.writestr(name, data)
+    return buf.getvalue()
+
+
+WIN_BUILD = {"PII-Shield/PII-Shield.exe": b"MZ new exe", "PII-Shield/_internal/python312.dll": b"dll"}
+
+
 GOOD_RULES = b"""version: 1
 allow_list: [localhost]
 recognizers:
@@ -133,6 +163,10 @@ class SyncTests(unittest.TestCase):
         cls.pypi.socket = ctx.wrap_socket(cls.pypi.socket, server_side=True)
         threading.Thread(target=cls.pypi.serve_forever, daemon=True).start()
         cls.pypi_url = f"https://localhost:{cls.pypi.server_address[1]}/pypi"
+        cls.dl = ThreadingHTTPServer(("127.0.0.1", 0), MockDownloads)
+        cls.dl.socket = ctx.wrap_socket(cls.dl.socket, server_side=True)
+        threading.Thread(target=cls.dl.serve_forever, daemon=True).start()
+        cls.dl_url = f"https://127.0.0.1:{cls.dl.server_address[1]}"
         cls.cert = cert
         os.environ["NO_PROXY"] = os.environ["no_proxy"] = "localhost,127.0.0.1"
         ps.install_network_guard()   # sync must still work with the guard active
@@ -141,6 +175,7 @@ class SyncTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.pypi.shutdown()
+        cls.dl.shutdown()
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
@@ -329,6 +364,69 @@ class SyncTests(unittest.TestCase):
                 seen = len(MockGitHub.requests_seen)
                 self.assertIsNone(ps.auto_check_app_update(cfg, TOKEN))
                 self.assertEqual(len(MockGitHub.requests_seen), seen, "a skipped check must not touch the network")
+
+    # ---- frozen (PyInstaller) app update: verified release zip + updater script
+    def win_info(self, data, sha=None, url=None, name="build"):
+        path = f"/releases/download/v9.9.9/{name}/PII-Shield-9.9.9-win64.zip"
+        MockDownloads.files[path] = data
+        return {"version": "9.9.9", "newer": True,
+                "windows_zip_url": url or f"{self.dl_url}{path}",
+                "windows_zip_sha256": sha or hashlib.sha256(data).hexdigest()}
+
+    def test_windows_build_download(self):
+        MockDownloads.auth_seen = []
+        app = self.root / "app"
+        app.mkdir()
+        info = self.win_info(make_zip(WIN_BUILD))
+        script = ps.download_windows_build(info, self.cfg, app_dir=app, pid=4321)
+        new = app / "updates" / "9.9.9" / "PII-Shield"
+        self.assertEqual((new / "PII-Shield.exe").read_bytes(), b"MZ new exe")
+        self.assertTrue((new / "_internal" / "python312.dll").exists())
+        self.assertFalse(list((app / "updates").glob("*.zip")), "the verified zip is deleted after extraction")
+        text = script.read_text("utf-8")
+        self.assertEqual(script.suffix, ".ps1")
+        self.assertIn("$procId = 4321", text)
+        self.assertIn(f"$app = '{app}'", text)
+        self.assertIn(f"$new = '{new}'", text)
+        self.assertEqual(MockDownloads.auth_seen, [None], "the GitHub token must never go to the download host")
+
+    def test_update_script_quotes_paths(self):
+        app = self.root / "it's here"
+        new = app / "updates" / "9.9.9" / "PII-Shield"
+        new.mkdir(parents=True)
+        text = ps.write_update_script(new, app, 7).read_text("utf-8")
+        self.assertIn("$app = '" + str(app).replace("'", "''") + "'", text)
+
+    def test_windows_build_rejected(self):
+        good = make_zip(WIN_BUILD)
+        cases = {
+            "sha mismatch": (self.win_info(good, sha="0" * 64, name="sha"), "SHA-256 mismatch"),
+            "zip slip": (self.win_info(make_zip({**WIN_BUILD, "PII-Shield/../../evil.txt": b"x"}), name="slip"),
+                         "unsafe path"),
+            "no exe": (self.win_info(make_zip({"PII-Shield/_internal/a.dll": b"x"}), name="noexe"), "PII-Shield.exe"),
+            "http url": (self.win_info(good, url="http://example.com/x.zip"), "https"),
+            "no fields": ({"version": "9.9.9", "newer": True}, "windows_zip_url"),
+        }
+        for name, (info, err) in cases.items():
+            with self.subTest(name):
+                app = self.root / name.replace(" ", "_")
+                app.mkdir()
+                with self.assertRaisesRegex(ps.SyncError, err):
+                    ps.download_windows_build(info, self.cfg, app_dir=app, pid=1)
+                self.assertFalse((self.root / "evil.txt").exists())
+                self.assertFalse(list(app.rglob("*.exe")), "nothing is left behind on failure")
+
+    def test_install_dispatch(self):
+        from unittest import mock
+        c = self.client()
+        with mock.patch.object(sys, "frozen", False, create=True), \
+                mock.patch.object(ps.GitHubSync, "download_app_update", return_value=Path("s.py")) as m:
+            self.assertEqual(c.install_app_update({"version": "9.9.9"}), ("script", Path("s.py")))
+            m.assert_called_once()
+        with mock.patch.object(sys, "frozen", True, create=True), \
+                mock.patch.object(ps, "download_windows_build", return_value=Path("u.ps1")) as m:
+            self.assertEqual(c.install_app_update({"version": "9.9.9"}), ("restart", Path("u.ps1")))
+            m.assert_called_once()
 
     def test_concurrent_pull_refused(self):
         with ps.SYNC_LOCK:

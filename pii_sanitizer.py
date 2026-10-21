@@ -57,7 +57,22 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-APP_DIR = Path(os.environ.get("PII_SHIELD_HOME", Path(__file__).resolve().parent))
+def is_frozen() -> bool:
+    """True when running from the PyInstaller build (PII-Shield.exe)."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def default_app_dir() -> Path:
+    """Data folder: PII_SHIELD_HOME, else next to PII-Shield.exe (the build's own files live in
+    _internal/), else next to this script."""
+    if os.environ.get("PII_SHIELD_HOME"):
+        return Path(os.environ["PII_SHIELD_HOME"])
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+APP_DIR = default_app_dir()
 RULES_DIR = APP_DIR / "rules"
 LOCAL_RULES_DIR = RULES_DIR / "local"
 REMOTE_RULES_DIR = RULES_DIR / "remote"
@@ -1641,6 +1656,13 @@ class GitHubSync:
         info["newer"] = parse_version(info["version"]) > parse_version(__version__)
         return info
 
+    def install_app_update(self, info: Dict) -> Tuple[str, Path]:
+        """("script", path): the .py was replaced - restart to use it.
+        ("restart", path): the build was downloaded - run this updater script after the app exits."""
+        if is_frozen():
+            return "restart", download_windows_build(info, {"github": self.cfg}, pid=os.getpid())
+        return "script", self.download_app_update(info)
+
     def download_app_update(self, info: Dict, target: Path = Path(__file__).resolve()) -> Path:
         script = info.get("script_path")
         expected = (info.get("sha256") or "").lower()
@@ -1659,6 +1681,118 @@ class GitHubSync:
         tmp.write_bytes(data)
         os.replace(tmp, target)
         return target
+
+
+# ===========================================================================
+# 7. (cont.) Windows build update: verified release zip + updater script
+# ===========================================================================
+WINDOWS_EXE = "PII-Shield.exe"
+WINDOWS_ZIP_ROOT = "PII-Shield"     # the release zip holds PII-Shield/PII-Shield.exe and PII-Shield/_internal/
+
+
+def download_windows_build(info: Dict, config, app_dir: Optional[Path] = None, pid: Optional[int] = None,
+                           progress: Callable[[str], None] = lambda s: None) -> Path:
+    """Download the release zip named in version.json, verify its SHA-256, extract it under
+    <app_dir>/updates/<version>/ and write the updater script. Returns the script path.
+    The download is unauthenticated: the GitHub token never leaves the API host."""
+    app_dir = app_dir or APP_DIR
+    url = str(info.get("windows_zip_url") or "")
+    expected = str(info.get("windows_zip_sha256") or "").lower()
+    if not url or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise SyncError("version.json has no Windows build (windows_zip_url and windows_zip_sha256) - "
+                        "download the new release manually")
+    if urlparse(url).scheme != "https":
+        raise SyncError("windows_zip_url must use https")
+    version = re.sub(r"[^0-9A-Za-z._-]", "_", str(info.get("version", "new")))
+    updates = app_dir / "updates"
+    dest = updates / version
+    zpath = updates / f"{WINDOWS_ZIP_ROOT}-{version}.zip"
+    shutil.rmtree(dest, ignore_errors=True)
+    updates.mkdir(parents=True, exist_ok=True)
+    import requests
+    import zipfile
+    g = config["github"]
+    try:
+        h = hashlib.sha256()
+        progress(f"Downloading {url}")
+        with allow_network():
+            with requests.get(url, stream=True, timeout=int(g.get("timeout", 20)),
+                              verify=(g.get("ca_bundle") or "").strip() or True,
+                              headers={"User-Agent": f"{APP_ID}/{__version__}"}) as r:
+                r.raise_for_status()
+                with open(zpath, "wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        h.update(chunk)
+                        fh.write(chunk)
+        if h.hexdigest() != expected:
+            raise SyncError("SHA-256 mismatch - update rejected")
+        progress("Download verified - extracting")
+        with zipfile.ZipFile(zpath) as z:
+            root = dest.resolve()
+            for name in z.namelist():
+                target = (dest / name).resolve()
+                if target != root and root not in target.parents:
+                    raise SyncError(f"Zip contains an unsafe path - update rejected: {name}")
+            z.extractall(dest)
+        new = dest / WINDOWS_ZIP_ROOT
+        if not (new / WINDOWS_EXE).is_file() or not (new / "_internal").is_dir():
+            raise SyncError(f"Zip has no {WINDOWS_ZIP_ROOT}/{WINDOWS_EXE} and _internal/ - update rejected")
+    except SyncError:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    except Exception as exc:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise SyncError(f"Windows build download failed: {exc}")
+    finally:
+        zpath.unlink(missing_ok=True)
+    return write_update_script(new, app_dir, os.getpid() if pid is None else pid)
+
+
+def _ps_quote(value) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def write_update_script(new_dir: Path, app_dir: Path, pid: int) -> Path:
+    """PowerShell updater: wait for the app to exit, swap PII-Shield.exe and _internal/ (rolling
+    back on failure), restart. config.json, rules/ and backups/ are never touched."""
+    script = app_dir / "updates" / "apply-update.ps1"
+    script.write_text(f"""# Generated by {APP_NAME} {__version__} - installs the downloaded build, then restarts the app.
+$ErrorActionPreference = 'Stop'
+$procId = {int(pid)}
+$app = {_ps_quote(app_dir)}
+$new = {_ps_quote(new_dir)}
+$exe = {_ps_quote(WINDOWS_EXE)}
+Start-Transcript -Path (Join-Path $app 'updates\\update.log') -Append | Out-Null
+Wait-Process -Id $procId -Timeout 120 -ErrorAction SilentlyContinue
+if (Get-Process -Id $procId -ErrorAction SilentlyContinue) {{ throw 'PII Shield is still running - update not installed' }}
+$oldInternal = Join-Path $app '_internal.old'
+$oldExe = Join-Path $app ($exe + '.old')
+Remove-Item -Recurse -Force -LiteralPath $oldInternal, $oldExe -ErrorAction SilentlyContinue
+Rename-Item -LiteralPath (Join-Path $app '_internal') -NewName '_internal.old'
+Rename-Item -LiteralPath (Join-Path $app $exe) -NewName ($exe + '.old')
+try {{
+    Move-Item -LiteralPath (Join-Path $new '_internal') -Destination (Join-Path $app '_internal')
+    Move-Item -LiteralPath (Join-Path $new $exe) -Destination (Join-Path $app $exe)
+}} catch {{
+    Remove-Item -Recurse -Force -LiteralPath (Join-Path $app '_internal'), (Join-Path $app $exe) -ErrorAction SilentlyContinue
+    Rename-Item -LiteralPath $oldInternal -NewName '_internal'
+    Rename-Item -LiteralPath $oldExe -NewName $exe
+    Start-Process -FilePath (Join-Path $app $exe) -WorkingDirectory $app
+    throw
+}}
+Remove-Item -Recurse -Force -LiteralPath $oldInternal, $oldExe, (Split-Path $new -Parent) -ErrorAction SilentlyContinue
+Start-Process -FilePath (Join-Path $app $exe) -WorkingDirectory $app
+Stop-Transcript | Out-Null
+""", "utf-8")
+    return script
+
+
+def launch_update_script(script: Path) -> None:
+    """Start the updater detached; the caller then quits so the files are no longer locked."""
+    import subprocess
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                      "-File", str(script)], creationflags=flags, close_fds=True)
 
 
 # ===========================================================================
@@ -1717,6 +1851,40 @@ def check_package_updates(config: AppConfig, packages: Sequence[str] = PRESIDIO_
         out.append({"package": pkg, "installed": installed, "latest": latest,
                     "newer": installed is not None and parse_version(latest) > parse_version(installed)})
     return out
+
+
+def presidio_update_hint(newer: Sequence[Dict], frozen: bool) -> str:
+    """What the user can do about a newer Presidio: pip for a script install; the next
+    release for the Windows build, which carries its own copy of Presidio."""
+    if frozen:
+        found = ", ".join(f"{r['package']} {r['latest']}" for r in newer)
+        return f"Presidio update available ({found}) - it ships with the next new PII Shield release"
+    return "Presidio update available - close the app and run: pip install -U " + " ".join(r["package"] for r in newer)
+
+
+def self_test(engine: Optional[DetectionEngine] = None) -> Tuple[bool, List[str]]:
+    """Load the real NLP engine with only the bundled rules and analyze a known sentence.
+    Catches a build that is missing the spaCy model, Presidio config or rule data."""
+    tmp = Path(tempfile.mkdtemp(prefix="pii_shield_selftest_"))
+    try:
+        if engine is None:
+            engine = DetectionEngine(AppConfig(tmp / "config.json"), tmp / "rules")
+        if engine.mode == "uninitialized":
+            engine.initialize()
+        text = "John Smith logged into SRV-DC01 from 10.20.30.40 as CORP\\jsmith."
+        found = {(f.entity, f.text) for f in engine.analyze(text, [], SessionVault())}
+        checks = [("engine mode presidio+spacy", engine.mode == "presidio+spacy"),
+                  ("bundled rules loaded without errors", bool(engine.ruleset.rules) and not engine.ruleset.errors),
+                  ("PERSON John Smith (spaCy NER)", ("PERSON", "John Smith") in found),
+                  ("HOSTNAME SRV-DC01 (bundled rule)", ("HOSTNAME", "SRV-DC01") in found),
+                  ("USERNAME CORP\\jsmith (bundled rule)", ("USERNAME", "CORP\\jsmith") in found)]
+        lines = [f"{'ok  ' if ok else 'FAIL'}  {name}" for name, ok in checks]
+        ok = all(ok for _, ok in checks)
+        lines.append(f"{APP_NAME} {__version__} self-test: {'PASS' if ok else 'FAIL'} "
+                     f"(model {engine.model_name}, {len(engine.ruleset.rules)} rules)")
+        return ok, lines
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ===========================================================================
@@ -1856,6 +2024,20 @@ if QT_OK:
         label.setVisible(bool(text))
         label.style().unpolish(label)
         label.style().polish(label)
+
+    def finish_app_update(parent, result: Tuple[str, Path]) -> None:
+        """Script install: ask for a restart. Windows build: run the updater and quit, so it can swap the files."""
+        kind, path = result
+        if kind == "script":
+            log.info("Installed update to %s. Restart the app to use it.", Path(path).name)
+            QtWidgets.QMessageBox.information(parent, "Update installed", "Update installed. Please restart PII Shield.")
+            return
+        log.info("Windows build downloaded and verified; updater: %s", path)
+        QtWidgets.QMessageBox.information(parent, "Update ready",
+                                          "The new version is downloaded and verified.\n\nPII Shield will now close, "
+                                          "install it and start again. Your settings and rules are kept.")
+        launch_update_script(Path(path))
+        QtWidgets.QApplication.quit()
 
     # -----------------------------------------------------------------------
     class SyncDialog(QtWidgets.QDialog):
@@ -2044,10 +2226,8 @@ if QT_OK:
                 "verified against the SHA-256 published in version.json.")
             if ans != QtWidgets.QMessageBox.StandardButton.Yes:
                 return
-            self._run(lambda progress: self._client(progress).download_app_update(app),
-                      lambda p: (self._log(f"Installed update to {Path(p).name}. Restart the app to use it."),
-                                 QtWidgets.QMessageBox.information(self, "Update installed",
-                                                                   "Update installed. Please restart PII Shield.")))
+            self._run(lambda progress: self._client(progress).install_app_update(app),
+                      lambda res: finish_app_update(self, res))
 
     # -----------------------------------------------------------------------
     class SettingsDialog(QtWidgets.QDialog):
@@ -2533,10 +2713,8 @@ if QT_OK:
                     "first, and the download is verified against the SHA-256 published in version.json.")
                 if ans != QtWidgets.QMessageBox.StandardButton.Yes:
                     return
-                self._run(lambda: GitHubSync(self.config, self.secrets.get()).download_app_update(info),
-                          lambda p: (log.info("Installed update to %s. Restart the app to use it.", Path(p).name),
-                                     QtWidgets.QMessageBox.information(self, "Update installed",
-                                                                       "Update installed. Please restart PII Shield.")))
+                self._run(lambda: GitHubSync(self.config, self.secrets.get()).install_app_update(info),
+                          lambda res: finish_app_update(self, res))
             self._run(auto_check_app_update, app_checked, self.config, self.secrets.get(),
                       error=lambda m: log.warning("Startup app update check failed: %s", m))
 
@@ -2547,9 +2725,9 @@ if QT_OK:
                 for r in res:
                     log.info("%s: installed %s, latest %s", r["package"], r["installed"] or "(none)", r["latest"])
                 if newer:
-                    cmd = "pip install -U " + " ".join(r["package"] for r in newer)
-                    log.warning("Presidio update available - close the app and run: %s", cmd)
-                    self.statusBar().showMessage(f"Presidio update available - see Log ({cmd})")
+                    hint = presidio_update_hint(newer, is_frozen())
+                    log.warning("%s", hint)
+                    self.statusBar().showMessage(hint + " (see Log)")
             self._run(check_package_updates, checked, self.config,
                       error=lambda m: log.warning("Presidio update check failed: %s", m))
 
@@ -3169,11 +3347,36 @@ def cli_validate(path: str) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="pii_sanitizer", description=f"{APP_NAME} - local PII sanitizer")
     ap.add_argument("--validate-rules", metavar="DIR", help="validate a rules folder and exit (for CI)")
+    ap.add_argument("--self-test", action="store_true", help="load the NLP engine, analyze a sample and exit")
     ap.add_argument("--version", action="store_true")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--log-file", metavar="FILE", help="write console output to FILE (the .exe has no console)")
     args = ap.parse_args(argv)
+    streams = sys.stdout, sys.stderr
+    out = open(args.log_file, "a", encoding="utf-8") if args.log_file else None
+    if out or sys.stdout is None or sys.stderr is None:
+        # the windowed .exe starts with no stdout/stderr; logging to None would fail on every record
+        out = out or open(os.devnull, "w", encoding="utf-8")
+        sys.stdout = sys.stdout if sys.stdout is not None and not args.log_file else out
+        sys.stderr = sys.stderr if sys.stderr is not None and not args.log_file else out
+    try:
+        return _main(args, argv)
+    finally:
+        if out:
+            root = logging.getLogger()
+            for h in [h for h in root.handlers if getattr(h, "stream", None) is out]:
+                root.removeHandler(h)
+            sys.stdout, sys.stderr = streams
+            out.close()
+
+
+def _main(args, argv=None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+                        format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr, force=True)
+    if args.self_test:
+        ok, lines = self_test()
+        print("\n".join(lines))
+        return 0 if ok else 1
     if args.version:
         print(f"{APP_NAME} {__version__}")
         return 0

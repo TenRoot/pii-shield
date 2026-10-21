@@ -1,0 +1,127 @@
+name: Build Windows release
+# Builds the portable PII-Shield-<version>-win64.zip (PII-Shield.exe + _internal/, no Python needed).
+# A v* tag publishes a GitHub Release; a manual run only uploads the zip as a workflow artifact.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Install pinned build requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Read version
+        id: ver
+        run: |
+          $v = python -c "import pii_sanitizer as ps; print(ps.__version__)"
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME does not match __version__ $v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm packaging/pii_shield.spec
+
+      - name: Smoke test the built exe
+        run: |
+          $exe = Resolve-Path dist\PII-Shield\PII-Shield.exe
+          $checks = @(
+            @{ name = 'version';        args = @('--version') },
+            @{ name = 'validate-rules'; args = @('--validate-rules', "$PWD\github-repo-template\rules") },
+            @{ name = 'self-test';      args = @('--self-test') }
+          )
+          foreach ($c in $checks) {
+            $log = "$PWD\smoke-$($c.name).log"
+            # GUI-subsystem exe: wait for it explicitly and read the exit code from the process object
+            $p = Start-Process -FilePath $exe -ArgumentList ($c.args + @('--log-file', "`"$log`"")) -Wait -PassThru
+            Write-Host "== $($c.name): exit $($p.ExitCode)"
+            if (Test-Path $log) { Get-Content $log | Where-Object { $_ -notmatch 'Recognizer not added' } }
+            if ($p.ExitCode -ne 0) { throw "smoke test '$($c.name)' failed" }
+          }
+          $extra = Get-ChildItem dist\PII-Shield | Where-Object { $_.Name -notin @('PII-Shield.exe', '_internal') }
+          if ($extra) { throw "unexpected files in the build folder: $($extra.Name -join ', ')" }
+
+      - name: Parse-check the generated updater script
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "upd test"
+          New-Item -ItemType Directory -Force (Join-Path $dir 'updates\9.9.9\PII-Shield') | Out-Null
+          $script = python -c "import sys, pathlib, pii_sanitizer as ps; d = pathlib.Path(sys.argv[1]); print(ps.write_update_script(d / 'updates' / '9.9.9' / 'PII-Shield', d, 1234))" $dir
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { $errs | ForEach-Object { Write-Host $_ }; throw 'updater script has PowerShell syntax errors' }
+          Write-Host "updater script parses: $script"
+
+      - name: Package zip, checksum and version.json
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $zip = "PII-Shield-$v-win64.zip"
+          7z a -tzip -mx=5 $zip .\dist\PII-Shield | Out-Null
+          $stamped = Get-Content github-repo-template\app\version.json -Raw | ConvertFrom-Json
+          $scriptSha = (Get-FileHash pii_sanitizer.py -Algorithm SHA256).Hash.ToLower()
+          if ($stamped.version -ne $v -or $stamped.sha256 -ne $scriptSha) {
+            throw "github-repo-template/app/version.json is not stamped for v$v ($scriptSha)"
+          }
+          $zipSha = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$zipSha  $zip" | Set-Content "$zip.sha256" -Encoding ascii
+          [ordered]@{
+            version            = $v
+            script_path        = 'app/pii_sanitizer.py'
+            sha256             = $scriptSha
+            windows_zip_url    = "https://github.com/${{ github.repository }}/releases/download/v$v/$zip"
+            windows_zip_sha256 = $zipSha
+            notes              = $stamped.notes
+            published          = (Get-Date).ToString('yyyy-MM-dd')
+          } | ConvertTo-Json | Set-Content version.json -Encoding utf8
+          Get-Content version.json
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+        id: pkg
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PII-Shield-${{ steps.ver.outputs.version }}-win64
+          path: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.zip }}.sha256
+            version.json
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = '${{ steps.ver.outputs.version }}'
+          $zip = '${{ steps.pkg.outputs.zip }}'
+          $notes = @"
+          Portable Windows build of PII Shield $v. No Python or other install needed.
+
+          1. Download ``$zip`` and unzip it to a folder you can write to (not Program Files).
+          2. Run ``PII-Shield\PII-Shield.exe``. Settings and rules are stored next to the exe.
+
+          ``$zip.sha256`` holds the SHA-256 of the zip. ``version.json`` is the file to publish as
+          ``app/version.json`` in your rules repo so existing installs can update themselves.
+          The exe is not code-signed, so Windows SmartScreen may warn on first start.
+          "@
+          gh release create "v$v" $zip "$zip.sha256" version.json --title "PII Shield $v" --notes $notes
