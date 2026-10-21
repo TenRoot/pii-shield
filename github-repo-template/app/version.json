@@ -1,7 +1,7 @@
 {
-  "version": "1.4.1",
+  "version": "1.5.0",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "58aeea1d7991ccea934ce6ef2d1f5999f25d1150ba90c87b58f7997a765cc83a",
-  "notes": "Rules sync from TenRoot/pii-shield by default (no token needed); app updates found through version.json at the repo root",
+  "sha256": "d0eb370941ae8e6d49258c31feecd4fe9190af8443934663319a2a4ffd3dc88e",
+  "notes": "Value-only masking (password=<SECRET_1>), JSON fields masked by key name, new rules for API tokens, SIDs, log user names and syslog hosts (adapted from socprime/logtotal-sanitizer)",
   "published": "2026-10-21"
 }

@@ -18,7 +18,7 @@ Usage:
 """
 from __future__ import annotations
 
-__version__ = "1.4.1"
+__version__ = "1.5.0"
 APP_NAME = "PII Shield"
 APP_ID = "pii-shield"
 
