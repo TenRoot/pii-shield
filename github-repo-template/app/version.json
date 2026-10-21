@@ -1,7 +1,7 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "3528f856857865f4683c6e7c2b498926b16a33ec3b2835e9d121c7647b26c6ba",
-  "notes": "Bundled rules active out of the box; DC01/File-SRV/AD-domain/street-address/org detection; ORG NER on by default",
+  "sha256": "4a0f67d4cbfe5fa0ff316bcb5886878b59e4798f28300d128269f7c4ef4f5cce",
+  "notes": "Default rules bundled in the script (active with an empty rules folder); computer-account detection (name$) as HOSTNAME",
   "published": "2026-10-21"
 }
