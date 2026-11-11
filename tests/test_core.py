@@ -400,6 +400,39 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(rx.findall("a SRV-DC01.corp.local. and srv-x"), ["SRV-DC01.corp.local", "srv-x"])
         rx = re.compile(ps.wildcard_to_regex("*.corp"), re.I)
         self.assertEqual(rx.findall("x.corp a.b.corp y.corporate"), ["x.corp", "a.b.corp"])
+        self.assertEqual(rx.findall("see .corp here"), [], "'*.' needs a label before the dot")
+
+    def test_default_threshold_keeps_core_entities(self):
+        self.assertEqual(ps.DEFAULT_CONFIG["engine"]["score_threshold"], 0.85)
+        text = ("Call +1 (212) 555-0199 or 054-123-4567 from 203.0.113.9, see https://intranet.example.org/x "
+                "and report.py. I live at Rothschild 1.")
+        d = {f.text: f.entity for f in self.analyze(text)[0]}
+        self.assertEqual(d.get("+1 (212) 555-0199"), "PHONE_NUMBER")
+        self.assertEqual(d.get("054-123-4567"), "PHONE_NUMBER")
+        self.assertEqual(d.get("203.0.113.9"), "IP_ADDRESS")
+        self.assertIn("URL", {e for t, e in d.items() if t.startswith("https://intranet.example.org")})
+        self.assertNotIn("report.py", d, "a bare file name is not a URL")
+        self.assertIn("STREET_ADDRESS", {e for t, e in d.items() if "Rothschild 1" in t})
+        d = {f.text for f in self.analyze("id 3f2504e0-4f89-11d3-9a0c-0305e82c3301 ok")[0]}
+        self.assertNotIn("3f2504e0-4f89-11d3-9a0c-0305e82c3301", d, "a GUID needs tenant context")
+
+    def test_wildcard_glob_crosses_dots(self):
+        import re
+        rx = re.compile(ps.wildcard_to_regex("*acme-labs*"), re.I)
+        line = '"db.int.prod.acme-labs.com","1","112","7"'
+        self.assertEqual(rx.findall(line), ["db.int.prod.acme-labs.com"])
+        self.assertEqual(rx.findall("acme-labs.com and x-acme-labs-01 end."),
+                         ["acme-labs.com", "x-acme-labs-01"])
+        self.assertEqual(rx.findall("cme-labs.com notacme-lab"), [])
+        self.assertEqual(rx.findall(" .acme-labs. "), ["acme-labs"], "never starts or ends on a dot")
+        rx = re.compile(ps.wildcard_to_regex("db*com"), re.I)
+        self.assertEqual(rx.findall("db.int.prod.acme-labs.com db..com dbcom"),
+                         ["db.int.prod.acme-labs.com", "dbcom"])
+        rx = re.compile(ps.wildcard_to_regex("SRV-*"), re.I)
+        self.assertEqual(rx.findall("SRV- and SRV-DC01"), ["SRV-", "SRV-DC01"])
+        rx = re.compile(ps.wildcard_to_regex("*"), re.I)
+        self.assertNotIn("", rx.findall("a b, c"), "a bare '*' must not match empty text")
+        self.assertEqual(ps.wildcard_to_regex("**x**"), ps.wildcard_to_regex("*x*"))
 
     def test_tldextract_is_offline(self):
         ps.install_network_guard()
