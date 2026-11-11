@@ -88,7 +88,7 @@ recognizers:
   - name: HostNumberedAnyCase
     entity: HOSTNAME
     description: Role prefix + 2-3 digits in any case - host223, ws54, srv01, dc02a (4 digits skipped so sql2019 stays a version)
-    score: 0.8
+    score: 0.85
     patterns:
       - name: prefix_2_3_digits
         regex: '(?<![\w.-])(?:host|server|srv|svr|dc|ws|pc|lt|vm|sql|db|fs|nas|fw|rtr|esx|hv|vdi|rds|exch|web|app)\d{2,3}[a-z]?(?![\w-])'
@@ -97,7 +97,7 @@ recognizers:
   - name: NetworkAppliances
     entity: HOSTNAME
     description: Vendor + model appliance host names - fortigate40d, FGT-60F, asa5506, synology918 (no space, so "FortiGate 40D" prose is skipped)
-    score: 0.8
+    score: 0.85
     patterns:
       - name: vendor_model
         regex: '(?<![\w.-])(?:forti(?:gate|wifi|switch|ap|analyzer|manager|mail|web)|fgt|fwf|paloalto|sonicwall|checkpoint|juniper|srx|asa|mikrotik|meraki|synology|qnap|unifi|aruba|netgear|cisco)[-_]?\d{2,5}[a-z]{0,3}(?![\w-])'
@@ -148,7 +148,7 @@ recognizers:
   - name: AzureGuidInContext
     entity: TENANT_ID
     description: GUIDs only flagged when tenant/subscription/client context is nearby (base score below threshold)
-    score: 0.3
+    score: 0.55
     patterns:
       - name: guid
         regex: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
@@ -196,7 +196,7 @@ recognizers:
   - name: StreetAddressInContext
     entity: STREET_ADDRESS
     description: "Street + number (Rothschild 1, Herzl St 12) - base score below threshold, flagged only near address words"
-    score: 0.3
+    score: 0.55
     patterns:
       - name: street_number
         regex: '\b[A-Z][a-z]{2,}(?:\s[A-Z][a-z]+){0,2}(?:\s(?:St|Street|Rd|Road|Ave|Avenue|Blvd|Lane|Ln|Way))?\.?\s\d{1,4}[A-Za-z]?\b'
@@ -223,7 +223,7 @@ recognizers:
 
   - name: IsraeliPhone
     entity: PHONE_NUMBER
-    score: 0.75
+    score: 0.85
     patterns:
       - name: il_phone
         regex: '(?<![\d+])(?:\+972[-\s]?|0)(?:5\d|[23489]|7\d)[-\s]?\d{3}[-\s]?\d{4}(?!\d)'

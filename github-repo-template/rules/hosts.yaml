@@ -41,6 +41,6 @@ recognizers:
   - name: InventoryHosts
     entity: HOSTNAME
     description: Inventory-style names that end in a number - web-prod-01, srv-app-07, node-pool-12
-    score: 0.8
+    score: 0.85
     patterns:
       - {name: inventory, regex: '(?<![\w.-])(?:srv|web|db|app|host|node|pod|vm|k8s)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+(?![\w-])'}

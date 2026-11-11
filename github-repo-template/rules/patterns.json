@@ -5,7 +5,7 @@
       "name": "TicketIDs",
       "entity": "TICKET_ID",
       "description": "Internal ticketing references (JSON format example)",
-      "score": 0.8,
+      "score": 0.85,
       "patterns": [
         {"name": "jira", "regex": "\\b(?:SEC|IR|SOC)-\\d{3,6}\\b"}
       ]

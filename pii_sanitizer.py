@@ -118,7 +118,7 @@ DEFAULT_CONFIG: Dict = {
     "engine": {
         "spacy_model": "en_core_web_lg",
         "language": "en",
-        "score_threshold": 0.35,
+        "score_threshold": 0.85,
         "builtin_entities": list(DEFAULT_BUILTIN_ENTITIES),
         "detect_organizations": True,   # spaCy ORG: some false positives, but safer to over-detect
         "skip_ner_on_logs": False,      # drop spaCy PERSON/ORG/LOCATION findings when the input looks like a log
@@ -645,7 +645,7 @@ recognizers:
   - name: InventoryHosts
     entity: HOSTNAME
     description: Inventory-style names that end in a number - web-prod-01, srv-app-07, node-pool-12
-    score: 0.8
+    score: 0.85
     patterns:
       - {name: inventory, regex: '(?<![\w.-])(?:srv|web|db|app|host|node|pod|vm|k8s)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+(?![\w-])'}
 """,
@@ -774,7 +774,7 @@ recognizers:
       "name": "TicketIDs",
       "entity": "TICKET_ID",
       "description": "Internal ticketing references (JSON format example)",
-      "score": 0.8,
+      "score": 0.85,
       "patterns": [
         {"name": "jira", "regex": "\\b(?:SEC|IR|SOC)-\\d{3,6}\\b"}
       ]
@@ -878,7 +878,7 @@ recognizers:
   - name: HostNumberedAnyCase
     entity: HOSTNAME
     description: Role prefix + 2-3 digits in any case - host223, ws54, srv01, dc02a (4 digits skipped so sql2019 stays a version)
-    score: 0.8
+    score: 0.85
     patterns:
       - name: prefix_2_3_digits
         regex: '(?<![\w.-])(?:host|server|srv|svr|dc|ws|pc|lt|vm|sql|db|fs|nas|fw|rtr|esx|hv|vdi|rds|exch|web|app)\d{2,3}[a-z]?(?![\w-])'
@@ -887,7 +887,7 @@ recognizers:
   - name: NetworkAppliances
     entity: HOSTNAME
     description: Vendor + model appliance host names - fortigate40d, FGT-60F, asa5506, synology918 (no space, so "FortiGate 40D" prose is skipped)
-    score: 0.8
+    score: 0.85
     patterns:
       - name: vendor_model
         regex: '(?<![\w.-])(?:forti(?:gate|wifi|switch|ap|analyzer|manager|mail|web)|fgt|fwf|paloalto|sonicwall|checkpoint|juniper|srx|asa|mikrotik|meraki|synology|qnap|unifi|aruba|netgear|cisco)[-_]?\d{2,5}[a-z]{0,3}(?![\w-])'
@@ -938,7 +938,7 @@ recognizers:
   - name: AzureGuidInContext
     entity: TENANT_ID
     description: GUIDs only flagged when tenant/subscription/client context is nearby (base score below threshold)
-    score: 0.3
+    score: 0.55
     patterns:
       - name: guid
         regex: '\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
@@ -986,7 +986,7 @@ recognizers:
   - name: StreetAddressInContext
     entity: STREET_ADDRESS
     description: "Street + number (Rothschild 1, Herzl St 12) - base score below threshold, flagged only near address words"
-    score: 0.3
+    score: 0.55
     patterns:
       - name: street_number
         regex: '\b[A-Z][a-z]{2,}(?:\s[A-Z][a-z]+){0,2}(?:\s(?:St|Street|Rd|Road|Ave|Avenue|Blvd|Lane|Ln|Way))?\.?\s\d{1,4}[A-Za-z]?\b'
@@ -1013,7 +1013,7 @@ recognizers:
 
   - name: IsraeliPhone
     entity: PHONE_NUMBER
-    score: 0.75
+    score: 0.85
     patterns:
       - name: il_phone
         regex: '(?<![\d+])(?:\+972[-\s]?|0)(?:5\d|[23489]|7\d)[-\s]?\d{3}[-\s]?\d{4}(?!\d)'
@@ -1081,7 +1081,7 @@ recognizers:
     description: >-
       Random-looking hex (32+) or base64 (40+) strings. Off by default because it also masks file
       hashes. To turn it on, copy this rule to rules/local/ and set enabled to true.
-    score: 0.6
+    score: 0.85
     validator: high_entropy
     case_sensitive: true
     patterns:
@@ -1148,12 +1148,31 @@ _HOSTCHARS = r"[\w\-]"
 
 
 def wildcard_to_regex(pattern: str) -> str:
-    """SRV-*  -> SRV-DC01, SRV-DC01.corp.local ;  *.corp -> a.b.corp ;  ? = one char."""
-    seg = _HOSTCHARS + r"+(?:\." + _HOSTCHARS + r"+)*"
+    """SRV-*  -> SRV-DC01, SRV-DC01.corp.local ;  *.corp -> a.b.corp ;  ? = one char ;
+    *acme* -> db.prod.acme.com, acme-labs.
+
+    A '*' next to a literal '.' stands for one or more whole labels, so '*.corp' needs a
+    label before the dot. Any other '*' is a glob: zero or more host characters, and it may
+    cross dots. It never starts or ends the match on a dot, and never makes two dots."""
+    H = _HOSTCHARS
+    labels = H + r"+(?:\." + H + r"+)*"                 # one or more whole labels
+    star_lead = r"(?:" + H + r"+\.)*" + H + r"*"         # may end on a dot before a literal
+    star_tail = H + r"*(?:\." + H + r"+)*"               # may start after a literal's char
+    star_mid = r"(?:" + H + r"|\.(?=" + H + r"))*"       # dots only between host chars
+    pat = re.sub(r"\*+", "*", pattern.strip())
     out = []
-    for ch in pattern.strip():
+    for i, ch in enumerate(pat):
         if ch == "*":
-            out.append(seg)
+            prev = pat[i - 1] if i > 0 else ""
+            nxt = pat[i + 1] if i + 1 < len(pat) else ""
+            if pat == "*" or "." in (prev, nxt):
+                out.append(labels)
+            elif not prev:
+                out.append(star_lead)
+            elif not nxt:
+                out.append(star_tail)
+            else:
+                out.append(star_mid)
         elif ch == "?":
             out.append(_HOSTCHARS)
         else:
@@ -1224,9 +1243,11 @@ SOURCE_PRIORITY = {"manual": 3, "custom": 2, "session": 2, "presidio": 1, "propa
 
 def resolve_overlaps(findings: List[Finding]) -> List[Finding]:
     """Greedy non-overlapping selection: manual > custom/session > presidio > propagated,
-    then the longer span (fs01.corp.local beats corp.local), then the higher score."""
+    then the longer span (fs01.corp.local beats corp.local), then the higher score, then a
+    pattern match over an NER guess (spaCy sometimes tags a URL as PERSON)."""
     ranked = sorted(findings, key=lambda f: (-SOURCE_PRIORITY.get(f.source, 1), -f.length,
-                                              -round(f.score, 3), f.start))
+                                              -round(f.score, 3), f.recognizer in NER_RECOGNIZERS,
+                                              f.start))
     taken: List[Tuple[int, int]] = []
     keep: List[Finding] = []
     for f in ranked:
@@ -1534,6 +1555,23 @@ if PRESIDIO_OK:
 
 
 NER_RECOGNIZERS = ("SpacyRecognizer", "StanzaRecognizer", "TransformersRecognizer")
+# Presidio's own scores sit below the 0.85 default threshold. Raise them so these entities stay
+# detected. Only URL patterns that need a scheme are raised: "Non schema URL" also matches
+# file names such as report.py, so it keeps Presidio's 0.5 and stays below the threshold.
+BUILTIN_MIN_SCORES = {"IpRecognizer": 0.85, "UrlRecognizer": 0.85, "PhoneRecognizer": 0.85}
+
+
+def _raise_builtin_scores(registry) -> None:
+    for rec in registry.recognizers:
+        floor = BUILTIN_MIN_SCORES.get(rec.__class__.__name__)
+        if floor is None:
+            continue
+        if hasattr(rec, "SCORE"):                       # PhoneRecognizer: one score, no patterns
+            rec.SCORE = max(rec.SCORE, floor)
+        if getattr(rec, "patterns", None):              # copies: Presidio shares PATTERNS per class
+            rec.patterns = [Pattern(p.name, p.regex, max(p.score, floor))
+                            if rec.__class__.__name__ != "UrlRecognizer" or "https?://" in p.regex
+                            else Pattern(p.name, p.regex, p.score) for p in rec.patterns]
 
 
 class DetectionEngine:
@@ -1602,6 +1640,7 @@ class DetectionEngine:
     def _build_registry(self, rs: RuleSet):
         registry = RecognizerRegistry(supported_languages=["en"])
         registry.load_predefined_recognizers(languages=["en"], nlp_engine=self.nlp_engine)
+        _raise_builtin_scores(registry)
         if self.mode == "presidio-regex-only":
             for rec in list(registry.recognizers):
                 if rec.__class__.__name__ in NER_RECOGNIZERS:
@@ -1668,7 +1707,7 @@ class DetectionEngine:
         with self.lock:
             analyzer, rs = self.analyzer, self.ruleset
         ecfg, bcfg = self.config["engine"], self.config["behavior"]
-        threshold = ecfg.get("score_threshold", 0.35) if threshold is None else threshold
+        threshold = ecfg.get("score_threshold", 0.85) if threshold is None else threshold
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
 
@@ -2661,7 +2700,7 @@ if QT_OK:
             self.threshold = QtWidgets.QDoubleSpinBox()
             self.threshold.setRange(0.0, 1.0)
             self.threshold.setSingleStep(0.05)
-            self.threshold.setValue(float(e.get("score_threshold", 0.35)))
+            self.threshold.setValue(float(e.get("score_threshold", 0.85)))
             self.orgs = QtWidgets.QCheckBox("Detect ORGANIZATION names with spaCy NER (noisy)")
             self.orgs.setChecked(bool(e.get("detect_organizations")))
             self.skip_ner_logs = QtWidgets.QCheckBox("Turn off spaCy NER (names, organizations, places) "
@@ -2841,7 +2880,7 @@ if QT_OK:
             self.thr = QtWidgets.QDoubleSpinBox()
             self.thr.setRange(0.0, 1.0)
             self.thr.setSingleStep(0.05)
-            self.thr.setValue(float(self.config["engine"].get("score_threshold", 0.35)))
+            self.thr.setValue(float(self.config["engine"].get("score_threshold", 0.85)))
             self.thr.setPrefix("min score ")
             self.lbl_stale = QtWidgets.QLabel()
             self.lbl_stale.setVisible(False)
