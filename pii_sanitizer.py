@@ -2877,6 +2877,9 @@ if QT_OK:
             btn_load.clicked.connect(self.load_file)
             btn_clear = _button("Clear")
             btn_clear.clicked.connect(lambda: self.input.clear())
+            self.btn_send = _button("Send to Sanitize", tip="Generate the sanitized prompt and open tab 2 (Ctrl+G)")
+            self.btn_send.clicked.connect(self.generate)
+            self.btn_send.setEnabled(False)
             self.thr = QtWidgets.QDoubleSpinBox()
             self.thr.setRange(0.0, 1.0)
             self.thr.setSingleStep(0.05)
@@ -2888,6 +2891,7 @@ if QT_OK:
             row.addWidget(self.thr)
             row.addWidget(btn_load)
             row.addWidget(btn_clear)
+            row.addWidget(self.btn_send)
             row.addWidget(self.lbl_stale)
             row.addStretch(1)
             self.lbl_input_stats = QtWidgets.QLabel("")
@@ -3266,6 +3270,12 @@ if QT_OK:
             elif self.analyzed_text is not None:
                 set_note(self.lbl_stale, "", "stale")
                 self._highlight()
+            self._update_send_button()
+
+        def _update_send_button(self):
+            """On only when the input is exactly the text that was analyzed and reviewed."""
+            self.btn_send.setEnabled(self.analyzed_text is not None
+                                     and self.input.toPlainText() == self.analyzed_text)
 
         def analyze(self):
             if not self.btn_analyze.isEnabled():
@@ -3285,6 +3295,7 @@ if QT_OK:
                 self.findings = findings
                 self.analyzed_text = text
                 set_note(self.lbl_stale, "", "stale")
+                self._update_send_button()
                 self.populate_table()
                 self._highlight()
                 log.info("analysis: %d detections, %d unique values", len(findings),
@@ -3730,6 +3741,7 @@ if QT_OK:
             self.input.setExtraSelections([])
             set_note(self.lbl_leak, "", "leak")
             set_note(self.lbl_stale, "", "stale")
+            self._update_send_button()
             self.lbl_gen.setText("")
             self.lbl_restore.setText("")
             self.populate_table()
