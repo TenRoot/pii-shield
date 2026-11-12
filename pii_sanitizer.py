@@ -2877,7 +2877,7 @@ if QT_OK:
             btn_load.clicked.connect(self.load_file)
             btn_clear = _button("Clear")
             btn_clear.clicked.connect(lambda: self.input.clear())
-            self.btn_send = _button("Send to Sanitize", tip="Generate the sanitized prompt and open tab 2 (Ctrl+G)")
+            self.btn_send = _button("Send to Sanitize (Ctrl+G)", tip="Generate the sanitized prompt and open tab 2")
             self.btn_send.clicked.connect(self.generate)
             self.btn_send.setEnabled(False)
             self.thr = QtWidgets.QDoubleSpinBox()
