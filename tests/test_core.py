@@ -590,6 +590,7 @@ class SendToSanitizeButtonTests(unittest.TestCase):
 
     def test_button_follows_analysis_state(self):
         w = self.win
+        self.assertEqual(w.btn_send.text(), "Send to Sanitize (Ctrl+G)")
         self.assertFalse(w.btn_send.isEnabled(), "off before any analysis")
         w.input.setPlainText("host SRV-DC01")
         w.analyzed_text = "host SRV-DC01"
