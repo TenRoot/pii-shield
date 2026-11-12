@@ -2885,8 +2885,9 @@ if QT_OK:
             self.btn_analyze.setEnabled(False)
             btn_load = _button("Load File...")
             btn_load.clicked.connect(self.load_file)
-            btn_clear = _button("Clear")
-            btn_clear.clicked.connect(lambda: self.input.clear())
+            btn_clear = _button("Clear", tip="Clear the input and the Step 2 review. The session map and "
+                                             "temporary rules stay until Reset Session.")
+            btn_clear.clicked.connect(self.clear_input_and_review)
             self.btn_send = _button("Send to Sanitize (Ctrl+G)", primary=True,
                                     tip="Generate the sanitized prompt and open tab 2")
             self.btn_send.clicked.connect(self.generate)
@@ -3273,9 +3274,44 @@ if QT_OK:
             p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load text file", "", "Text (*.txt *.log *.md *.json *.yaml *.yml *.csv *.xml *.ps1 *.py *.conf *.ini);;All (*)")
             if p:
                 try:
-                    self.input.setPlainText(Path(p).read_text("utf-8", errors="replace"))
+                    text = Path(p).read_text("utf-8", errors="replace")
+                    self.clear_review()
+                    self.input.setPlainText(text)
                 except Exception as exc:
                     QtWidgets.QMessageBox.warning(self, "Load file", str(exc))
+
+        def clear_review(self):
+            """Drop the Step 2 review: staged findings, table rows and highlights. Keeps the session map."""
+            self.findings, self.analyzed_text = [], None
+            self.input.setExtraSelections([])
+            set_note(self.lbl_stale, "", "stale")
+            self.populate_table()
+            self.lbl_counts.setText("No analysis yet.")
+            self._update_send_button()
+
+        def clear_input_and_review(self):
+            """Clear Step 1 and Step 2. If the session still holds values, offer to reset it too: those
+            values are flagged again in every new analysis, whatever the min score."""
+            n_vals, n_rules = len(self.vault), len(self.manual_rules)
+            if n_vals or n_rules:
+                SB = QtWidgets.QMessageBox.StandardButton
+                mb = QtWidgets.QMessageBox(QtWidgets.QMessageBox.Icon.Question, "Clear",
+                                           f"The session map holds {n_vals} value(s) and {n_rules} temporary "
+                                           f"rule(s). They are flagged again in every new analysis, whatever "
+                                           f"the min score.\n\nReset the session too? Tokens in earlier AI "
+                                           f"responses can then no longer be restored.",
+                                           SB.Yes | SB.No | SB.Cancel, self)
+                mb.button(SB.Yes).setText("Reset session too")
+                mb.button(SB.No).setText("Keep session map")
+                mb.setDefaultButton(SB.No)
+                choice = mb.exec()
+                if choice == SB.Cancel:
+                    return
+                if choice == SB.Yes:
+                    self.reset_session(confirm=False)
+                    return
+            self.clear_review()
+            self.input.clear()
 
         def _on_input_changed(self):
             text = self.input.toPlainText()
@@ -3759,8 +3795,8 @@ if QT_OK:
             self.refresh_map()
             self.statusBar().showMessage(f"Imported {n} map entries", 4000)
 
-        def reset_session(self):
-            if (len(self.vault) or self.findings) and QtWidgets.QMessageBox.question(
+        def reset_session(self, confirm: bool = True):
+            if confirm and (len(self.vault) or self.findings) and QtWidgets.QMessageBox.question(
                     self, "Reset session", "Clear the session map, staged detections, temporary rules and all "
                     "text boxes?\nTokens in earlier AI responses can no longer be restored after this.") \
                     != QtWidgets.QMessageBox.StandardButton.Yes:

@@ -629,6 +629,54 @@ class MainWindowGuiTests(unittest.TestCase):
         self.assertEqual(w.output.toPlainText(), "host <HOSTNAME_1>")
 
 
+    def test_clear_and_load_file_clear_the_review(self):
+        w = self.win
+        w.vault.commit("SRV-DC01", "<HOSTNAME_1>", "HOSTNAME")
+
+        def stage():
+            w.input.setPlainText("host SRV-DC01")
+            w.analyzed_text = "host SRV-DC01"
+            w.findings = [ps.Finding(5, 13, "SRV-DC01", "HOSTNAME", 0.9, "custom", token="<HOSTNAME_1>")]
+            w.populate_table()
+            w._update_send_button()
+            self.assertEqual(w.table.rowCount(), 1)
+
+        SB = ps.QtWidgets.QMessageBox.StandardButton
+        stage()
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "exec", return_value=SB.Cancel):
+            w.clear_input_and_review()
+        self.assertEqual((w.input.toPlainText(), w.table.rowCount()), ("host SRV-DC01", 1), "Cancel keeps all")
+
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "exec", return_value=SB.No) as asked:
+            w.clear_input_and_review()
+        asked.assert_called_once()
+        self.assertEqual((w.input.toPlainText(), w.table.rowCount(), w.findings), ("", 0, []))
+        self.assertIsNone(w.analyzed_text)
+        self.assertFalse(w.btn_send.isEnabled())
+        self.assertEqual(len(w.vault), 1, "'Keep session map' keeps it")
+
+        stage()
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "exec", return_value=SB.Yes):
+            w.clear_input_and_review()
+        self.assertEqual((w.input.toPlainText(), w.table.rowCount(), len(w.vault)), ("", 0, 0),
+                         "'Reset session too' empties the session map")
+
+        w.input.setPlainText("text")
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "exec") as asked:
+            w.clear_input_and_review()
+        asked.assert_not_called()
+        self.assertEqual(w.input.toPlainText(), "", "an empty session clears without asking")
+
+        w.vault.commit("SRV-DC01", "<HOSTNAME_1>", "HOSTNAME")
+
+        stage()
+        log = self.tmp / "new.log"
+        log.write_text("a fresh log line", "utf-8")
+        with mock.patch.object(ps.QtWidgets.QFileDialog, "getOpenFileName", return_value=(str(log), "")):
+            w.load_file()
+        self.assertEqual((w.input.toPlainText(), w.table.rowCount()), ("a fresh log line", 0))
+        self.assertIsNone(w.analyzed_text)
+
     def test_review_table_columns_resize_by_drag(self):
         from PyQt6.QtTest import QTest
         from PyQt6.QtCore import QPoint, Qt
