@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -569,6 +570,46 @@ class FrozenAndCliTests(unittest.TestCase):
             self.assertIn("0 error(s)", text)
         finally:
             shutil.rmtree(out.parent, ignore_errors=True)
+
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+class SendToSanitizeButtonTests(unittest.TestCase):
+    """Tab 1 'Send to Sanitize' button: on only while the input matches the analyzed text."""
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        with mock.patch.object(ps.MainWindow, "_start_engine"):
+            self.win = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
+        self.addCleanup(self.win.deleteLater)
+
+    def test_button_follows_analysis_state(self):
+        w = self.win
+        self.assertFalse(w.btn_send.isEnabled(), "off before any analysis")
+        w.input.setPlainText("host SRV-DC01")
+        w.analyzed_text = "host SRV-DC01"
+        w._update_send_button()
+        self.assertTrue(w.btn_send.isEnabled(), "on after analysis")
+        w.input.setPlainText("host SRV-DC02")
+        self.assertFalse(w.btn_send.isEnabled(), "off once the input changes")
+        w.input.setPlainText("host SRV-DC01")
+        self.assertTrue(w.btn_send.isEnabled(), "on again when the input matches")
+
+    def test_button_generates_and_opens_tab_2(self):
+        w = self.win
+        w.input.setPlainText("host SRV-DC01")
+        w.analyzed_text = "host SRV-DC01"
+        w.findings = [ps.Finding(5, 13, "SRV-DC01", "HOSTNAME", 0.9, "custom", token="<HOSTNAME_1>")]
+        w._update_send_button()
+        w.btn_send.click()
+        self.assertEqual(w.tabs.currentIndex(), 1)
+        self.assertNotIn("SRV-DC01", w.output.toPlainText())
+        self.assertEqual(w.output.toPlainText(), "host <HOSTNAME_1>")
 
 
 if __name__ == "__main__":
