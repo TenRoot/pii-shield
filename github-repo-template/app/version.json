@@ -1,7 +1,7 @@
 {
-  "version": "1.5.1",
+  "version": "1.5.2",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "94cd160fb0172a4868aaaa150af87b09bd0b23ec825e5a6cf5d01d1c306f185f",
-  "notes": "Option to skip spaCy NER on log input (Settings > Detection); user_kv no longer reads principal=arn:... as a user; pwd=/path is no longer masked as a secret",
-  "published": "2026-10-21"
+  "sha256": "2d27ec96e540c88870c63bdc68200feb1a0a61aaab3c6f4779db563146b27979",
+  "notes": "Default min score is now 0.85, with rule and Presidio scores raised so phones, IPs, URLs, hosts and tickets stay detected; wildcard * now crosses dots (*acme* matches db.prod.acme.com); new Send to Sanitize (Ctrl+G) button on tab 1",
+  "published": "2026-11-12"
 }
