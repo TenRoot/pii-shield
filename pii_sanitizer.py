@@ -3082,6 +3082,9 @@ if QT_OK:
             self.map_table.setColumnWidth(0, 200)
             self.map_table.setColumnWidth(2, 150)
             self.map_table.setSortingEnabled(True)
+            self.map_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.map_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.map_table.customContextMenuRequested.connect(self._map_menu)
             info = QtWidgets.QLabel("The session map lives only in memory: identical values always receive the "
                                     "same token. It is destroyed on Reset Session or when the app closes.")
             info.setStyleSheet("color:gray;")
@@ -3692,6 +3695,25 @@ if QT_OK:
                     self.map_table.setItem(r, c, it)
             self.map_table.setSortingEnabled(True)
             set_badge(self.badge_session, f"Session: {len(self.vault)} tokens", "info")
+
+        def _map_menu(self, pos):
+            """Right-click on the session map: copy the raw value or the token of the selected rows."""
+            clicked = self.map_table.itemAt(pos)
+            if clicked is None:
+                return
+            if not self.map_table.item(clicked.row(), 0).isSelected():
+                self.map_table.selectRow(clicked.row())
+            rows = sorted({i.row() for i in self.map_table.selectedItems()})
+            tokens = [self.map_table.item(r, 0).text() for r in rows]
+            m = QtWidgets.QMenu(self)
+            a_val = m.addAction("Copy original value" if len(tokens) == 1 else f"Copy {len(tokens)} original values")
+            a_tok = m.addAction("Copy token" if len(tokens) == 1 else f"Copy {len(tokens)} tokens")
+            act = m.exec(self.map_table.viewport().mapToGlobal(pos))
+            if act is a_val:
+                # the raw value from the vault, even while the table shows masked values
+                self.copy_text("\n".join(self.vault.token_to_value.get(t, "") for t in tokens))
+            elif act is a_tok:
+                self.copy_text("\n".join(tokens))
 
         def export_map(self):
             if not len(self.vault):

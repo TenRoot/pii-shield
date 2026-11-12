@@ -573,8 +573,8 @@ class FrozenAndCliTests(unittest.TestCase):
 
 
 @unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
-class SendToSanitizeButtonTests(unittest.TestCase):
-    """Tab 1 'Send to Sanitize' button: on only while the input matches the analyzed text."""
+class MainWindowGuiTests(unittest.TestCase):
+    """Main window, offscreen: tab 1 Send to Sanitize button and the session map menu."""
 
     @classmethod
     def setUpClass(cls):
@@ -611,6 +611,27 @@ class SendToSanitizeButtonTests(unittest.TestCase):
         self.assertEqual(w.tabs.currentIndex(), 1)
         self.assertNotIn("SRV-DC01", w.output.toPlainText())
         self.assertEqual(w.output.toPlainText(), "host <HOSTNAME_1>")
+
+
+    def test_session_map_right_click_copies_raw_value(self):
+        w = self.win
+        w.vault.commit("SRV-DC01", "<HOSTNAME_1>", "HOSTNAME")
+        w.vault.commit("10.20.30.40", "<INTERNAL_IP_1>", "INTERNAL_IP")
+        w.chk_reveal.setChecked(False)
+        w.refresh_map()
+        row = next(r for r in range(w.map_table.rowCount()) if w.map_table.item(r, 0).text() == "<HOSTNAME_1>")
+        self.assertNotEqual(w.map_table.item(row, 1).text(), "SRV-DC01", "the table shows a masked value")
+        pos = w.map_table.visualItemRect(w.map_table.item(row, 1)).center()
+        clip = ps.QtWidgets.QApplication.clipboard()
+        for pick, expect in ((0, "SRV-DC01"), (1, "<HOSTNAME_1>")):
+            w.map_table.clearSelection()
+            with mock.patch.object(ps.QtWidgets.QMenu, "exec", lambda m, *a, i=pick: m.actions()[i]):
+                w._map_menu(pos)
+            self.assertEqual(clip.text(), expect)
+        w.map_table.selectAll()
+        with mock.patch.object(ps.QtWidgets.QMenu, "exec", lambda m, *a: m.actions()[0]):
+            w._map_menu(pos)
+        self.assertEqual(sorted(clip.text().split("\n")), ["10.20.30.40", "SRV-DC01"])
 
 
 if __name__ == "__main__":
