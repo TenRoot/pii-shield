@@ -44,3 +44,13 @@ recognizers:
     score: 0.85
     patterns:
       - {name: inventory, regex: '(?<![\w.-])(?:srv|web|db|app|host|node|pod|vm|k8s)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+(?![\w-])'}
+
+  - name: EnvironmentNames
+    entity: HOSTNAME
+    description: >-
+      Name + environment suffix - acme-prod, billing-dev, acme-test, shop-uat-02. Skips common words
+      that look the same - unit-test, load-test, e2e-test, pen-test, a-b-test, pre-prod, non-prod, web-dev.
+    score: 0.85
+    patterns:
+      - name: env_suffix
+        regex: '(?<![\w.-])(?!(?:(?:unit|load|smoke|stress|perf|performance|e2e|pen|integration|regression|acceptance|a-b|ab|self|re|speed|field|user|beta|alpha|crash)-test|(?:non|pre|post)-prod(?:uction)?|web-dev)(?:-\d+)?(?![\w-]))[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-(?:prod|production|dev|develop|test|qa|uat|stg|staging|preprod|sandbox)(?:-\d+)?(?![\w-])'

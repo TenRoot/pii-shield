@@ -417,6 +417,21 @@ class EngineTests(unittest.TestCase):
         d = {f.text for f in self.analyze("id 3f2504e0-4f89-11d3-9a0c-0305e82c3301 ok")[0]}
         self.assertNotIn("3f2504e0-4f89-11d3-9a0c-0305e82c3301", d, "a GUID needs tenant context")
 
+    def test_environment_suffix_names(self):
+        hits = ["acme-prod", "acme-dev", "acme-test", "ACME-PROD", "billing-api-staging", "shop-uat-02",
+                "acme-qa", "acme-production", "acme-preprod", "acme-sandbox", "acme-stg"]
+        fs, _ = self.analyze("deploy " + ", ".join(hits) + " today")
+        d = self.by_text(fs)
+        for h in hits:
+            self.assertIn(h, d, h)
+            self.assertEqual(d[h].entity, "HOSTNAME", h)
+        skips = ["unit-test", "load-test", "smoke-test", "e2e-test", "pen-test", "a-b-test", "pre-prod",
+                 "non-prod", "pre-production", "web-dev", "self-test", "unit-test-01"]
+        fs, _ = self.analyze("we ran " + ", ".join(skips) + " today")
+        self.assertEqual([f.text for f in fs if f.recognizer == "EnvironmentNames"], [])
+        fs, _ = self.analyze("prod dev test production acme-production-line acme.prod acme_prod")
+        self.assertEqual([f.text for f in fs if f.recognizer == "EnvironmentNames"], [])
+
     def test_wildcard_glob_crosses_dots(self):
         import re
         rx = re.compile(ps.wildcard_to_regex("*acme-labs*"), re.I)
@@ -591,6 +606,7 @@ class MainWindowGuiTests(unittest.TestCase):
     def test_button_follows_analysis_state(self):
         w = self.win
         self.assertEqual(w.btn_send.text(), "Send to Sanitize (Ctrl+G)")
+        self.assertEqual(w.btn_send.objectName(), w.btn_analyze.objectName(), "same style as Analyze")
         self.assertFalse(w.btn_send.isEnabled(), "off before any analysis")
         w.input.setPlainText("host SRV-DC01")
         w.analyzed_text = "host SRV-DC01"
@@ -612,6 +628,23 @@ class MainWindowGuiTests(unittest.TestCase):
         self.assertNotIn("SRV-DC01", w.output.toPlainText())
         self.assertEqual(w.output.toPlainText(), "host <HOSTNAME_1>")
 
+
+    def test_review_table_columns_resize_by_drag(self):
+        from PyQt6.QtTest import QTest
+        from PyQt6.QtCore import QPoint, Qt
+        w = self.win
+        w.show()
+        self.app.processEvents()
+        hh = w.table.horizontalHeader()
+        for c in range(len(ps.COLS) - 1):           # the last column fills the free space
+            before = hh.sectionSize(c)
+            x, y = hh.sectionViewportPosition(c) + before - 1, hh.height() // 2
+            QTest.mousePress(hh.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, QPoint(x, y))
+            QTest.mouseMove(hh.viewport(), QPoint(x + 20, y))
+            QTest.mouseMove(hh.viewport(), QPoint(x + 40, y))
+            QTest.mouseRelease(hh.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                               QPoint(x + 40, y))
+            self.assertGreater(hh.sectionSize(c), before, f"column {ps.COLS[c]} must resize by drag")
 
     def test_session_map_right_click_copies_raw_value(self):
         w = self.win

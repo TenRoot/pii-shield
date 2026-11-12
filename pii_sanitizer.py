@@ -648,6 +648,16 @@ recognizers:
     score: 0.85
     patterns:
       - {name: inventory, regex: '(?<![\w.-])(?:srv|web|db|app|host|node|pod|vm|k8s)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+(?![\w-])'}
+
+  - name: EnvironmentNames
+    entity: HOSTNAME
+    description: >-
+      Name + environment suffix - acme-prod, billing-dev, acme-test, shop-uat-02. Skips common words
+      that look the same - unit-test, load-test, e2e-test, pen-test, a-b-test, pre-prod, non-prod, web-dev.
+    score: 0.85
+    patterns:
+      - name: env_suffix
+        regex: '(?<![\w.-])(?!(?:(?:unit|load|smoke|stress|perf|performance|e2e|pen|integration|regression|acceptance|a-b|ab|self|re|speed|field|user|beta|alpha|crash)-test|(?:non|pre|post)-prod(?:uction)?|web-dev)(?:-\d+)?(?![\w-]))[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*-(?:prod|production|dev|develop|test|qa|uat|stg|staging|preprod|sandbox)(?:-\d+)?(?![\w-])'
 """,
     "identity.yaml": r"""# Accounts and identifiers in logs: SIDs, LDAP, cloud principals, log user fields, home folders.
 # Many patterns are adapted from socprime/logtotal-sanitizer (Apache-2.0). See NOTICE in the app repo.
@@ -2877,7 +2887,8 @@ if QT_OK:
             btn_load.clicked.connect(self.load_file)
             btn_clear = _button("Clear")
             btn_clear.clicked.connect(lambda: self.input.clear())
-            self.btn_send = _button("Send to Sanitize (Ctrl+G)", tip="Generate the sanitized prompt and open tab 2")
+            self.btn_send = _button("Send to Sanitize (Ctrl+G)", primary=True,
+                                    tip="Generate the sanitized prompt and open tab 2")
             self.btn_send.clicked.connect(self.generate)
             self.btn_send.setEnabled(False)
             self.thr = QtWidgets.QDoubleSpinBox()
@@ -2933,10 +2944,12 @@ if QT_OK:
                                        QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed |
                                        QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
             hh = self.table.horizontalHeader()
+            # Every column is user-resizable. A Stretch column would ignore drags, so the last column
+            # (Source) takes up the free space instead.
             hh.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
-            hh.setStretchLastSection(False)
-            hh.setSectionResizeMode(C_TEXT, QtWidgets.QHeaderView.ResizeMode.Stretch)
-            for c, w in ((C_EN, 60), (C_ENT, 150), (C_TOK, 170), (C_START, 60), (C_END, 60), (C_SCORE, 55), (C_SRC, 100)):
+            hh.setStretchLastSection(True)
+            for c, w in ((C_EN, 60), (C_TEXT, 300), (C_ENT, 150), (C_TOK, 170), (C_START, 60), (C_END, 60),
+                         (C_SCORE, 55), (C_SRC, 100)):
                 self.table.setColumnWidth(c, w)
             self.table.setSortingEnabled(True)
             self.table.sortByColumn(C_START, Qt.SortOrder.AscendingOrder)
