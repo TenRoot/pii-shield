@@ -1,9 +1,9 @@
 {
-  "version": "1.5.2",
+  "version": "1.5.3",
   "script_path": "pii_sanitizer.py",
-  "sha256": "2d27ec96e540c88870c63bdc68200feb1a0a61aaab3c6f4779db563146b27979",
-  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.5.2/PII-Shield-1.5.2-win64.zip",
-  "windows_zip_sha256": "27a69eb0960de51bba85e8d142bbe0cc4984f4f1c41415a4370da8603b296636",
-  "notes": "Default min score is now 0.85, with rule and Presidio scores raised so phones, IPs, URLs, hosts and tickets stay detected; wildcard * now crosses dots (*acme* matches db.prod.acme.com); new Send to Sanitize (Ctrl+G) button on tab 1",
+  "sha256": "a1b49824ac54bfc5608334d8c734bd0295b82cb184cc48a0564540dad0beba93",
+  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.5.3/PII-Shield-1.5.3-win64.zip",
+  "windows_zip_sha256": "c3045c38a232f203145cd514fd418fdd51d5add590312d996deb55aede93b38e",
+  "notes": "Right-click on the Session Map to copy a row's original value or token (works while values are masked; several rows copy one per line)",
   "published": "2026-11-12"
 }
