@@ -1,9 +1,9 @@
 {
-  "version": "1.5.1",
+  "version": "1.5.2",
   "script_path": "pii_sanitizer.py",
-  "sha256": "94cd160fb0172a4868aaaa150af87b09bd0b23ec825e5a6cf5d01d1c306f185f",
-  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.5.1/PII-Shield-1.5.1-win64.zip",
-  "windows_zip_sha256": "ca062bca66bc641c66f9000f1be68813fb986c52cc69b08be447fa1679a1dc18",
-  "notes": "Option to skip spaCy NER on log input (Settings > Detection); user_kv no longer reads principal=arn:... as a user; pwd=/path is no longer masked as a secret",
-  "published": "2026-10-21"
+  "sha256": "2d27ec96e540c88870c63bdc68200feb1a0a61aaab3c6f4779db563146b27979",
+  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.5.2/PII-Shield-1.5.2-win64.zip",
+  "windows_zip_sha256": "27a69eb0960de51bba85e8d142bbe0cc4984f4f1c41415a4370da8603b296636",
+  "notes": "Default min score is now 0.85, with rule and Presidio scores raised so phones, IPs, URLs, hosts and tickets stay detected; wildcard * now crosses dots (*acme* matches db.prod.acme.com); new Send to Sanitize (Ctrl+G) button on tab 1",
+  "published": "2026-11-12"
 }
