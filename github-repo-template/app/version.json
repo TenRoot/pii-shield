@@ -1,7 +1,7 @@
 {
-  "version": "1.5.2",
+  "version": "1.5.3",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "2d27ec96e540c88870c63bdc68200feb1a0a61aaab3c6f4779db563146b27979",
-  "notes": "Default min score is now 0.85, with rule and Presidio scores raised so phones, IPs, URLs, hosts and tickets stay detected; wildcard * now crosses dots (*acme* matches db.prod.acme.com); new Send to Sanitize (Ctrl+G) button on tab 1",
+  "sha256": "a1b49824ac54bfc5608334d8c734bd0295b82cb184cc48a0564540dad0beba93",
+  "notes": "Right-click on the Session Map to copy a row's original value or token (works while values are masked; several rows copy one per line)",
   "published": "2026-11-12"
 }
