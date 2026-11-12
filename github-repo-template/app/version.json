@@ -1,7 +1,7 @@
 {
-  "version": "1.5.3",
+  "version": "1.5.4",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "a1b49824ac54bfc5608334d8c734bd0295b82cb184cc48a0564540dad0beba93",
-  "notes": "Right-click on the Session Map to copy a row's original value or token (works while values are masked; several rows copy one per line)",
+  "sha256": "9260460854ee190902dab88f98a8b81347d6693ffe5d27c38fd9f72b177a90e8",
+  "notes": "Names ending in -prod, -dev, -test, -qa, -uat, -staging and similar are now masked by default (common words like unit-test and pre-prod are skipped); Step 2 review columns resize by drag; Send to Sanitize matches the Analyze PII button; Clear and Load File now clear the Step 2 review, and Clear asks whether to keep or reset a non-empty session map",
   "published": "2026-11-12"
 }
