@@ -302,5 +302,84 @@ class ScanTests(unittest.TestCase):
         self.assertIn("git was not found on PATH", str(cm.exception))
 
 
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+class GitScanDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        with mock.patch.object(ps.MainWindow, "_start_engine"):
+            self.win = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
+        self.addCleanup(self.win.deleteLater)
+
+    def _result(self, findings, commits=2, skipped=()):
+        return ps.GitScanResult(Path("/r"), "commits not on any remote (remote refs as of the last fetch)",
+                                commits, 0.85, list(findings), list(skipped))
+
+    def _dialog(self):
+        d = ps.GitScanDialog(self.win.config, self.win.engine, lambda: 0.85, self.win)
+        self.addCleanup(d.deleteLater)
+        return d
+
+    def test_button_waits_for_engine(self):
+        self.assertEqual(self.win.btn_git_scan.text(), "Scan Git Repo...")
+        self.assertFalse(self.win.btn_git_scan.isEnabled())
+
+    def test_show_result_with_findings(self):
+        d = self._dialog()
+        f = ps.GitFinding("abc1234567", "app/cfg.py", 3, "SECRET", "Sup3rS3cret!", "Passwords", 0.9)
+        d.show_result(self._result([f], skipped=[("blob.bin", "binary")]))
+        self.assertEqual(d.table.rowCount(), 1)
+        self.assertEqual(d.table.item(0, 1).text(), "app/cfg.py")
+        self.assertEqual(d.lbl_note.text(), "1 findings. Fix them before you push.")
+        self.assertEqual(d.lbl_note.objectName(), "leak")
+        self.assertIn("· 1 findings · 1 skipped · min score 0.85", d.lbl_status.text())
+        self.assertEqual(d.results_tsv().splitlines()[1].split("\t"),
+                         ["abc1234567", "app/cfg.py", "3", "SECRET", "Sup3rS3cret!", "Passwords"])
+        self.assertEqual(d.skipped_list.item(0).text(), "blob.bin — binary")
+
+    def test_show_result_clean_and_zero_commits(self):
+        d = self._dialog()
+        d.show_result(self._result([], commits=4))
+        self.assertEqual(d.lbl_note.text(), "No findings in 4 commits and the uncommitted changes.")
+        self.assertEqual(d.lbl_note.objectName(), "okmsg")
+        d.show_result(self._result([], commits=0))
+        self.assertEqual(d.lbl_note.text(), "0 commits to push. No findings in the uncommitted changes.")
+        self.assertEqual(d.lbl_note.objectName(), "stale")
+        self.assertEqual(d.table.rowCount(), 0)
+
+    def test_ner_box_clear_and_last_repo_remembered(self):
+        self.win.config["behavior"]["git_scan_last_repo"] = str(self.tmp)
+        d = self._dialog()
+        self.assertFalse(d.chk_ner.isChecked())
+        self.assertEqual(d.path_edit.text(), str(self.tmp))
+
+    def test_line_column_sorts_as_number(self):
+        d = self._dialog()
+        fs = [ps.GitFinding("uncommitted", "a.txt", n, "SECRET", f"v{n}", "r", 0.9) for n in (10, 9, 100)]
+        d.show_result(self._result(fs))
+        d.table.sortItems(2)
+        self.assertEqual([d.table.item(i, 2).text() for i in range(3)], ["9", "10", "100"])
+
+    def test_double_click_copies_file_and_line(self):
+        d = self._dialog()
+        d.show_result(self._result([ps.GitFinding("untracked", "x/y.py", 7, "SECRET", "v", "r", 0.9)]))
+        d.table.cellDoubleClicked.emit(0, 0)
+        self.assertEqual(ps.QtWidgets.QApplication.clipboard().text(), "x/y.py:7")
+
+    def test_empty_path_does_not_scan(self):
+        d = self._dialog()
+        d.path_edit.setText("")
+        with mock.patch.object(ps, "scan_git_repo") as scan:
+            d.start_scan()
+        scan.assert_not_called()
+        self.assertEqual(d.lbl_note.text(), "Choose a repo folder.")
+
+
 if __name__ == "__main__":
     unittest.main()

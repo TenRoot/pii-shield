@@ -133,6 +133,7 @@ DEFAULT_CONFIG: Dict = {
         "lenient_restore": True,         # also restore HOSTNAME_1, [HOSTNAME_1], &lt;HOSTNAME_1&gt;
         "clipboard_clear_seconds": 0,    # 0 = never auto-clear
         "offline_mode": False,           # True = no network at all: no GitHub sync, no update checks
+        "git_scan_last_repo": "",        # last folder used in Scan Git Repo
     },
 }
 
@@ -2757,7 +2758,7 @@ if QT_OK:
                 self.signals.done.emit(self.fn(*self.args, **self.kwargs))
             except Exception as exc:
                 log.debug(traceback.format_exc())
-                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision)) else str(exc))
+                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision, GitScanError)) else str(exc))
 
     def _mono_font() -> QtGui.QFont:
         f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
@@ -3124,6 +3125,161 @@ if QT_OK:
             self.accept()
 
     # -----------------------------------------------------------------------
+    class GitScanDialog(QtWidgets.QDialog):
+        """Scan Git Repo: report PII and secrets in what a push of the branch sends, plus local work."""
+        HEADERS = ("Source", "File", "Line", "Entity", "Value", "Recognizer")
+
+        def __init__(self, config: AppConfig, engine: DetectionEngine,
+                     threshold: Callable[[], float], parent=None):
+            super().__init__(parent)
+            self.config, self.engine, self.threshold = config, engine, threshold
+            self._task = None
+            self.setWindowTitle("Git Scan")
+            self.setModal(False)
+            self.resize(1000, 620)
+            lay = QtWidgets.QVBoxLayout(self)
+
+            row = QtWidgets.QHBoxLayout()
+            self.path_edit = QtWidgets.QLineEdit(config["behavior"].get("git_scan_last_repo", ""))
+            self.path_edit.setPlaceholderText("Repo folder (a linked worktree also works)")
+            self.path_edit.returnPressed.connect(self.start_scan)
+            self.btn_browse = _button("Browse...")
+            self.btn_browse.clicked.connect(self._browse)
+            row.addWidget(QtWidgets.QLabel("Repo:"))
+            row.addWidget(self.path_edit, 1)
+            row.addWidget(self.btn_browse)
+            lay.addLayout(row)
+
+            row = QtWidgets.QHBoxLayout()
+            self.chk_ner = QtWidgets.QCheckBox("Find names with spaCy (more noise)")
+            self.chk_ner.setChecked(False)
+            self.btn_scan = _button("Scan", primary=True)
+            self.btn_scan.clicked.connect(self.start_scan)
+            row.addWidget(self.chk_ner)
+            row.addStretch(1)
+            row.addWidget(self.btn_scan)
+            lay.addLayout(row)
+
+            self.lbl_status = QtWidgets.QLabel("Scans the commits this branch would push, plus uncommitted "
+                                               "and untracked files. Nothing in the repo changes.")
+            self.lbl_status.setWordWrap(True)
+            lay.addWidget(self.lbl_status)
+            self.lbl_note = QtWidgets.QLabel()
+            self.lbl_note.setWordWrap(True)
+            set_note(self.lbl_note, "", "okmsg")
+            lay.addWidget(self.lbl_note)
+
+            self.table = QtWidgets.QTableWidget(0, len(self.HEADERS))
+            self.table.setHorizontalHeaderLabels(self.HEADERS)
+            self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.verticalHeader().setVisible(False)
+            hdr = self.table.horizontalHeader()
+            hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+            hdr.setStretchLastSection(True)
+            for col, width in enumerate((100, 300, 60, 130, 220)):
+                self.table.setColumnWidth(col, width)
+            self.table.setSortingEnabled(True)
+            self.table.cellDoubleClicked.connect(self._copy_location)
+            self.table.setToolTip("Double-click a row to copy file:line")
+            lay.addWidget(self.table, 1)
+
+            self.skipped_box = QtWidgets.QGroupBox("Skipped files (0)")
+            self.skipped_box.setCheckable(True)
+            self.skipped_box.setChecked(False)
+            sb = QtWidgets.QVBoxLayout(self.skipped_box)
+            self.skipped_list = QtWidgets.QListWidget()
+            self.skipped_list.setMaximumHeight(120)
+            self.skipped_list.setVisible(False)
+            sb.addWidget(self.skipped_list)
+            self.skipped_box.toggled.connect(self.skipped_list.setVisible)
+            lay.addWidget(self.skipped_box)
+
+            row = QtWidgets.QHBoxLayout()
+            self.btn_copy = _button("Copy Results")
+            self.btn_copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.results_tsv()))
+            btn_close = _button("Close")
+            btn_close.clicked.connect(self.close)
+            row.addWidget(self.btn_copy)
+            row.addStretch(1)
+            row.addWidget(btn_close)
+            lay.addLayout(row)
+
+        def _browse(self):
+            p = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose a Git repo folder", self.path_edit.text())
+            if p:
+                self.path_edit.setText(p)
+
+        def start_scan(self) -> None:
+            path = self.path_edit.text().strip()
+            if not path:
+                set_note(self.lbl_note, "Choose a repo folder.", "stale")
+                return
+            if not self.btn_scan.isEnabled():
+                return
+            self.config["behavior"]["git_scan_last_repo"] = path
+            try:
+                self.config.save()
+            except OSError as exc:
+                log.warning("Could not save config.json: %s", exc)
+            thr = float(self.threshold())
+            self.btn_scan.setEnabled(False)
+            set_note(self.lbl_note, "", "okmsg")
+            self.lbl_status.setText("Scanning...")
+            t = Task(scan_git_repo, Path(path), self.engine, thr, use_ner=self.chk_ner.isChecked(),
+                     wants_progress=True)
+            t.signals.progress.connect(self.lbl_status.setText)
+            t.signals.done.connect(self._scan_done)
+            t.signals.error.connect(self._scan_error)
+            self._task = t
+            QtCore.QThreadPool.globalInstance().start(t)
+
+        def _scan_done(self, result: GitScanResult):
+            self.btn_scan.setEnabled(True)
+            self.show_result(result)
+
+        def _scan_error(self, msg: str):
+            self.btn_scan.setEnabled(True)
+            self.lbl_status.setText("The scan did not run.")
+            set_note(self.lbl_note, msg, "leak")
+            log.error("Git scan: %s", msg)
+
+        def show_result(self, result: GitScanResult) -> None:
+            r = result
+            self.lbl_status.setText(f"Range: {r.range_desc} · {r.commits} commits · {len(r.findings)} findings · "
+                                    f"{len(r.skipped)} skipped · min score {r.threshold:.2f}")
+            n = len(r.findings)
+            if n:
+                set_note(self.lbl_note, f"{n} findings. Fix them before you push.", "leak")
+            elif r.commits:
+                set_note(self.lbl_note, f"No findings in {r.commits} commits and the uncommitted changes.", "okmsg")
+            else:
+                set_note(self.lbl_note, "0 commits to push. No findings in the uncommitted changes.", "stale")
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(n)
+            for i, f in enumerate(r.findings):
+                for col, val in enumerate((f.source, f.file, f.line, f.entity, f.value, f.recognizer)):
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setData(Qt.ItemDataRole.DisplayRole, val)   # an int sorts as a number
+                    self.table.setItem(i, col, item)
+            self.table.setSortingEnabled(True)
+            self.skipped_box.setTitle(f"Skipped files ({len(r.skipped)})")
+            self.skipped_list.clear()
+            self.skipped_list.addItems([f"{p} — {why}" for p, why in r.skipped])
+
+        def _copy_location(self, row: int, _col: int):
+            f, ln = self.table.item(row, 1), self.table.item(row, 2)
+            if f is not None and ln is not None:
+                QtWidgets.QApplication.clipboard().setText(f"{f.text()}:{ln.text()}")
+
+        def results_tsv(self) -> str:
+            out = ["\t".join(self.HEADERS)]
+            for i in range(self.table.rowCount()):
+                out.append("\t".join(self.table.item(i, c).text() if self.table.item(i, c) else ""
+                                     for c in range(len(self.HEADERS))))
+            return "\n".join(out)
+
+    # -----------------------------------------------------------------------
     COLS = ["Enable", "Original Text", "Entity Type", "Token", "Start", "End", "Score", "Source"]
     C_EN, C_TEXT, C_ENT, C_TOK, C_START, C_END, C_SCORE, C_SRC = range(8)
 
@@ -3209,6 +3365,11 @@ if QT_OK:
             self.btn_analyze.setEnabled(False)
             btn_load = _button("Load File...")
             btn_load.clicked.connect(self.load_file)
+            self.btn_git_scan = _button("Scan Git Repo...", tip="Scan the commits this branch would push, plus "
+                                        "uncommitted and untracked files, for PII and secrets")
+            self.btn_git_scan.clicked.connect(self.open_git_scan)
+            self.btn_git_scan.setEnabled(False)
+            self._git_scan_dialog = None
             btn_clear = _button("Clear", tip="Clear the input and the Step 2 review. The session map and "
                                              "temporary rules stay until Reset Session.")
             btn_clear.clicked.connect(self.clear_input_and_review)
@@ -3226,6 +3387,7 @@ if QT_OK:
             row.addWidget(self.btn_analyze)
             row.addWidget(self.thr)
             row.addWidget(btn_load)
+            row.addWidget(self.btn_git_scan)
             row.addWidget(btn_clear)
             row.addWidget(self.btn_send)
             row.addWidget(self.lbl_stale)
@@ -3456,6 +3618,7 @@ if QT_OK:
         def _task_error(self, msg):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.btn_analyze.setEnabled(self.engine.mode != "uninitialized")
+            self.btn_git_scan.setEnabled(self.engine.mode != "uninitialized")
             log.error(msg)
             QtWidgets.QMessageBox.critical(self, APP_NAME, msg)
 
@@ -3469,6 +3632,7 @@ if QT_OK:
                         "lite": "Lite regex engine (Presidio not installed)"}.get(mode, mode)
                 self.lbl_engine.setText(f"Engine: {desc}  ·  offline")
                 self.btn_analyze.setEnabled(True)
+                self.btn_git_scan.setEnabled(True)
                 self._update_rules_badge(self.engine.ruleset)
                 self._startup_updates()
             self._run(self.engine.initialize, done, progress=True)
@@ -3594,6 +3758,13 @@ if QT_OK:
                 self.statusBar().showMessage("Settings saved - re-analyze to apply detection changes", 6000)
 
         # ================= Step 1 / 2
+        def open_git_scan(self):
+            if self._git_scan_dialog is None:
+                self._git_scan_dialog = GitScanDialog(self.config, self.engine, self.thr.value, self)
+            self._git_scan_dialog.show()
+            self._git_scan_dialog.raise_()
+            self._git_scan_dialog.activateWindow()
+
         def load_file(self):
             p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load text file", "", "Text (*.txt *.log *.md *.json *.yaml *.yml *.csv *.xml *.ps1 *.py *.conf *.ini);;All (*)")
             if p:
