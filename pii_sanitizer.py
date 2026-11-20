@@ -1937,6 +1937,8 @@ def parse_unified_diff(text: str, source: str) -> Tuple[List[AddedChunk], List[T
         if in_hunk:
             if raw.startswith("\\"):            # "\ No newline at end of file"
                 continue
+            if raw == "":
+                raw = " " * nparents            # a blank context line can lose its prefix column
             cols, content = raw[:nparents], raw[nparents:]
             in_new = "-" not in cols
             for i, c in enumerate(cols):
@@ -1956,6 +1958,7 @@ def parse_unified_diff(text: str, source: str) -> Tuple[List[AddedChunk], List[T
             header, cur = _header_path(line), None
             continue
         if line.startswith("+++ "):
+            flush()
             path = _git_path(line[4:])
             cur = AddedChunk(source, path) if path is not None else None
             continue
@@ -2032,7 +2035,13 @@ class GitScanResult:
 
 # An inherited GIT_DIR or GIT_WORK_TREE would make git read another repo than the folder picked.
 _GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
-_GIT_DIFF_OPTS = ("--no-color", "--no-ext-diff", "--no-textconv", "--unified=0", "-M")
+# Pin every option that changes the diff format, so repo config cannot hide added lines:
+# --text stops .gitattributes "-diff"/"binary" from hiding text (real binaries are found by NUL);
+# fixed prefixes beat diff.noprefix/mnemonicPrefix; --no-relative beats diff.relative.
+_GIT_DIFF_OPTS = ("--no-color", "--no-ext-diff", "--no-textconv", "--text", "--unified=0",
+                  "--inter-hunk-context=0", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/", "-M")
+_GIT_FIXED_CONFIG = ("core.fsmonitor=false", "core.quotepath=off", "diff.suppressBlankEmpty=false")
+LFS_POINTER_FIRST_LINE = "version https://git-lfs.github.com/spec/v1"
 
 
 def _git_env() -> Dict[str, str]:
@@ -2041,10 +2050,15 @@ def _git_env() -> Dict[str, str]:
     return env
 
 
-def run_git(repo: Path, *args: str, timeout: float = 120, input: bytes = b"") -> bytes:
-    """Run one local git command. No shell, no prompts, no repo-configured fsmonitor program."""
+def run_git(repo: Path, *args: str, timeout: float = 120, input: bytes = b"",
+            config: Sequence[str] = ()) -> bytes:
+    """Run one local git command. No shell, no prompts, no repo-configured fsmonitor program.
+    `config` adds more `-c key=value` overrides (the scan uses it to switch off filter drivers)."""
     import subprocess
-    cmd = ["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", *args]
+    cmd = ["git"]
+    for kv in (*_GIT_FIXED_CONFIG, *config):
+        cmd += ["-c", kv]
+    cmd += list(args)
     try:
         r = subprocess.run(cmd, cwd=str(repo), env=_git_env(), input=input, capture_output=True,
                            timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -2110,8 +2124,22 @@ def scan_git_repo(repo: Path, engine: "DetectionEngine", threshold: float, use_n
     ignore. Changes nothing in the repo and never touches the session map."""
     root = git_repo_root(Path(repo))
 
+    # Filter drivers (git-lfs, git-crypt, custom clean/smudge) run programs when git hashes a
+    # worktree file. Switch every configured driver off for this scan.
+    overrides: List[str] = []
+    try:
+        cfg = run_git(root, "config", "--get-regexp", r"^filter\.").decode("utf-8", "replace")
+    except GitNotFound:
+        raise
+    except GitScanError:
+        cfg = ""                 # exit code 1: no filter configured
+    for name in sorted({ln.split(" ", 1)[0][len("filter."):].rsplit(".", 1)[0]
+                        for ln in cfg.splitlines() if ln.startswith("filter.")}):
+        overrides += [f"filter.{name}.clean=", f"filter.{name}.smudge=", f"filter.{name}.process=",
+                      f"filter.{name}.required=false"]
+
     def git(*args: str, **kw) -> str:
-        return run_git(root, *args, **kw).decode("utf-8", "replace")
+        return run_git(root, *args, config=overrides, **kw).decode("utf-8", "replace")
 
     try:
         git("rev-parse", "--verify", "-q", "HEAD")
@@ -2129,8 +2157,8 @@ def scan_git_repo(repo: Path, engine: "DetectionEngine", threshold: float, use_n
     commits = 0
     if has_head:
         progress("Reading commits...")
-        c, s, commits = parse_git_log(git("log", "-p", "--cc", *_GIT_DIFF_OPTS, GIT_LOG_FORMAT,
-                                          "HEAD", "--not", "--remotes"))
+        c, s, commits = parse_git_log(git("log", "-p", "--cc", "--root", "--no-show-signature",
+                                          *_GIT_DIFF_OPTS, GIT_LOG_FORMAT, "HEAD", "--not", "--remotes"))
         chunks += c
         skipped += s
         base = "HEAD"
@@ -2153,6 +2181,13 @@ def scan_git_repo(repo: Path, engine: "DetectionEngine", threshold: float, use_n
     for ch in chunks:
         texts = [t for _, t in ch.lines]
         text = "\n".join(texts)
+        if "\x00" in text[:GIT_BINARY_SNIFF]:
+            if (ch.file, "binary") not in skipped:
+                skipped.append((ch.file, "binary"))
+            continue
+        if texts and texts[0].strip() == LFS_POINTER_FIRST_LINE:
+            skipped.append((ch.file, "LFS object (not scanned)"))   # the push uploads the real object
+            continue
         if len(text.encode("utf-8")) > GIT_SCAN_MAX_BYTES:
             skipped.append((ch.file, "too large"))
             continue
@@ -3251,6 +3286,9 @@ if QT_OK:
             n = len(r.findings)
             if n:
                 set_note(self.lbl_note, f"{n} findings. Fix them before you push.", "leak")
+            elif r.skipped:
+                set_note(self.lbl_note, f"No findings, but {len(r.skipped)} files were not scanned. "
+                                        "See Skipped files.", "stale")
             elif r.commits:
                 set_note(self.lbl_note, f"No findings in {r.commits} commits and the uncommitted changes.", "okmsg")
             else:

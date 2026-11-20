@@ -129,8 +129,14 @@ the table as tab-separated text. The scan uses the **min score** value from tab 
 spaCy reads code as prose and finds many false names, so the scan does not use spaCy by
 default. To find names, select **Find names with spaCy (more noise)**. The rules always run.
 
-The scan skips binary files and any file or diff part larger than 1 MB. The **Skipped files**
-list shows each skipped file and the reason. `git` must be on PATH.
+The scan skips binary files, Git LFS objects and any file or diff part larger than 1 MB. The
+**Skipped files** list shows each skipped file and the reason. When the scan skips a file, it
+never shows the green "no findings" note. Check skipped files by hand. `git` must be on PATH.
+
+The scan ignores repo settings that change the diff output (for example `diff.noprefix` or
+`log.showRoot`) and `-diff` or `binary` in `.gitattributes`. It turns off filter drivers (for
+example git-lfs or git-crypt) and signature checks, so the scan runs no program from the repo
+config.
 
 ### Data folder
 

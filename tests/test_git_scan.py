@@ -302,6 +302,74 @@ class ScanTests(unittest.TestCase):
         self.assertIn("git was not found on PATH", str(cm.exception))
 
 
+    # ---- final review: repo config and .gitattributes must not hide values or run programs
+    def test_output_config_cannot_hide_values(self):
+        repo = _init(self.tmp / "hostile")
+        for k, v in (("log.showRoot", "false"), ("diff.interHunkContext", "3"),
+                     ("diff.suppressBlankEmpty", "true"), ("diff.mnemonicPrefix", "true"),
+                     ("diff.noprefix", "true"), ("diff.relative", "true")):
+            _git(repo, "config", k, v)
+        _commit(repo, "root.txt", "password=RootS3cret1!\n")
+        _commit(repo, "a.txt", "a\nb\n\nc\nd\n")
+        _write(repo / "a.txt", "a\npassword=HunkOne1!\n\nc\npassword=HunkTwo1!\n")
+        _write(repo / "b.txt", "password=NextFile1!\n")
+        _git(repo, "add", "a.txt", "b.txt")
+        _git(repo, "commit", "-q", "-m", "two hunks")
+        _write(repo / "a.txt", "a\npassword=HunkOne1!\n\nc\npassword=HunkTwo1!\npassword=Uncommit1!\n")
+        v = self.vals(self.scan(repo))
+        self.assertIn(("commit", "root.txt", 1, "RootS3cret1!"), v)
+        self.assertIn(("commit", "a.txt", 2, "HunkOne1!"), v)
+        self.assertIn(("commit", "a.txt", 5, "HunkTwo1!"), v)
+        self.assertIn(("commit", "b.txt", 1, "NextFile1!"), v)
+        self.assertIn(("uncommitted", "a.txt", 6, "Uncommit1!"), v)
+
+    def test_gitattributes_cannot_mark_text_binary(self):
+        _commit(self.work, ".gitattributes", "*.env -diff\n")
+        _commit(self.work, "x.env", "password=EnvS3cret1!\n")
+        _write(self.work / "y.env", "password=EnvS3cret2!\n")
+        _git(self.work, "add", "y.env")
+        r = self.scan()
+        self.assertTrue({"EnvS3cret1!", "EnvS3cret2!"} <= self.values(r))
+        self.assertNotIn(("x.env", "binary"), r.skipped)
+
+    def test_real_binary_still_skipped_with_text_diff(self):
+        _commit(self.work, "img.bin", b"\x89PNG\x00\x00password=BinS3cret1!\n")
+        r = self.scan()
+        self.assertIn(("img.bin", "binary"), r.skipped)
+        self.assertNotIn("BinS3cret1!", self.values(r))
+
+    def test_lfs_pointer_skipped(self):
+        _commit(self.work, "big.csv", "version https://git-lfs.github.com/spec/v1\n"
+                "oid sha256:" + "a" * 64 + "\nsize 123456\n")
+        self.assertIn(("big.csv", "LFS object (not scanned)"), self.scan().skipped)
+
+    @unittest.skipIf(os.name == "nt", "uses POSIX shell scripts")
+    def test_repo_config_runs_no_program(self):
+        marker = self.tmp / "ran"
+        script = self.tmp / "evil.sh"
+        script.write_text("#!/bin/sh\necho \"$@\" >> '%s'\n"
+                          "case \"$*\" in *--verify*) exit 1;; esac\n"
+                          "case \"$*\" in *-bsau*|*-b*) cat >/dev/null; echo '[GNUPG:] SIG_CREATED ' >&2;"
+                          " printf -- '-----BEGIN PGP SIGNATURE-----\\n\\nAAAA\\n-----END PGP SIGNATURE-----\\n';"
+                          " exit 0;; esac\ncat\n" % marker)
+        script.chmod(0o755)
+        _git(self.work, "config", "filter.x.clean", str(script))
+        _git(self.work, "config", "filter.x.smudge", str(script))
+        _git(self.work, "config", "gpg.program", str(script))
+        _commit(self.work, ".gitattributes", "*.txt filter=x\n")
+        _write(self.work / "f.txt", "password=Filter1abc!\n")
+        _git(self.work, "add", "f.txt")
+        _git(self.work, "-c", "user.signingkey=x", "commit", "-q", "-S", "-m", "signed")
+        _write(self.work / "f.txt", "password=Filter1abc!\npassword=Filter2abc!\n")
+        os.utime(self.work / "f.txt", (1, 1))      # stat-dirty: git would re-hash through the filter
+        _git(self.work, "config", "log.showSignature", "true")
+        if marker.exists():
+            marker.unlink()
+        r = self.scan()
+        self.assertFalse(marker.exists(), "a repo-configured program ran during the scan")
+        self.assertTrue({"Filter1abc!", "Filter2abc!"} <= self.values(r))
+
+
 
 @unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
 class GitScanDialogTests(unittest.TestCase):
@@ -379,6 +447,13 @@ class GitScanDialogTests(unittest.TestCase):
             d.start_scan()
         scan.assert_not_called()
         self.assertEqual(d.lbl_note.text(), "Choose a repo folder.")
+
+    def test_skipped_files_block_the_green_note(self):
+        d = self._dialog()
+        d.show_result(self._result([], commits=3, skipped=[("dump.csv", "too large")]))
+        self.assertEqual(d.lbl_note.text(), "No findings, but 1 files were not scanned. See Skipped files.")
+        self.assertEqual(d.lbl_note.objectName(), "stale")
+
 
 
 if __name__ == "__main__":
