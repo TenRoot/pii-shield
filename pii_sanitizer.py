@@ -1852,6 +1852,153 @@ def leak_check(output: str, vault: SessionVault, extra_values: Iterable[str] = (
 
 
 # ===========================================================================
+# 6b. Git branch scan (leak check of what a push sends; it reports and changes nothing)
+# ===========================================================================
+GIT_COMMIT_MARK = "\x1ePIISHIELD-COMMIT "   # git format: %x1ePIISHIELD-COMMIT %H
+GIT_MSG_END = "\x1fPIISHIELD-END"            # git format: %x1fPIISHIELD-END
+GIT_LOG_FORMAT = "--format=%x1ePIISHIELD-COMMIT %H%n%B%x1fPIISHIELD-END"
+COMMIT_MESSAGE_FILE = "(commit message)"
+GIT_SCAN_MAX_BYTES = 1_000_000    # untracked file or one chunk of added text
+GIT_BINARY_SNIFF = 8192           # a NUL byte in the first 8 KB means binary
+_HUNK_RE = re.compile(r"^(@{2,}) (.*?) @{2,}")
+_BINARY_RE = re.compile(r"^Binary files (.*) and (.*) differ$")
+_GIT_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+@dataclass
+class AddedChunk:
+    source: str                       # short SHA (10 chars), "uncommitted" or "untracked"
+    file: str                         # repo-relative path, or COMMIT_MESSAGE_FILE
+    lines: List[Tuple[int, str]] = field(default_factory=list)   # (1-based line in the new file, text)
+
+
+def _git_unquote(path: str) -> str:
+    """Undo git's C-style path quoting. Octal escapes are the UTF-8 bytes of the name."""
+    if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
+        return path
+    s, out, i = path[1:-1], bytearray(), 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            if re.match(r"[0-7]{3}", s[i + 1:i + 4]):
+                out.append(int(s[i + 1:i + 4], 8))
+                i += 4
+                continue
+            nxt = s[i + 1]
+            out += bytes([_GIT_ESCAPES[nxt]]) if nxt in _GIT_ESCAPES else nxt.encode("utf-8")
+            i += 2
+            continue
+        out += c.encode("utf-8")
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
+def _git_path(spec: str) -> Optional[str]:
+    """'b/dir/x.txt', '"b/a\\tb"' or '/dev/null' -> repo path (None for /dev/null)."""
+    quoted = spec.startswith('"')
+    p = _git_unquote(spec) if quoted else spec.rstrip("\t")   # git adds a TAB after names with spaces
+    if p == "/dev/null":
+        return None
+    return p[2:] if p[:2] in ("a/", "b/") else p
+
+
+def _header_path(line: str) -> str:
+    if line.startswith("diff --cc ") or line.startswith("diff --combined "):
+        return _git_unquote(line.split(" ", 2)[2])
+    rest = line[len("diff --git "):]
+    if rest.endswith('"'):
+        q = rest.rfind(' "')
+        return _git_path(rest[q + 1:]) or ""
+    k = rest.rfind(" b/")
+    return rest[k + 3:] if k >= 0 else rest
+
+
+def parse_unified_diff(text: str, source: str) -> Tuple[List[AddedChunk], List[Tuple[str, str]]]:
+    """Added lines of a unified or combined (--cc) diff made with --unified=0.
+
+    A body line has one prefix column per parent. It is in the new file when no column is '-',
+    and it is added when it is in the new file and a column is '+'. Hunk line counts tell where
+    a hunk ends, so an added line that starts with '+++' is not read as a file header."""
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    cur: Optional[AddedChunk] = None
+    header = ""
+    in_hunk = False
+    nparents, lineno, new_left, old_left = 1, 0, 0, [0]
+
+    def flush():
+        if cur is not None and cur.lines:
+            chunks.append(cur)
+
+    for raw in text.split("\n"):
+        if in_hunk:
+            if raw.startswith("\\"):            # "\ No newline at end of file"
+                continue
+            cols, content = raw[:nparents], raw[nparents:]
+            in_new = "-" not in cols
+            for i, c in enumerate(cols):
+                if c != "+":
+                    old_left[i] -= 1
+            if in_new:
+                new_left -= 1
+                if "+" in cols and cur is not None:
+                    cur.lines.append((lineno, content[:-1] if content.endswith("\r") else content))
+                lineno += 1
+            if new_left <= 0 and all(o <= 0 for o in old_left):
+                in_hunk = False
+            continue
+        line = raw.rstrip("\r")
+        if line.startswith(("diff --git ", "diff --cc ", "diff --combined ")):
+            flush()
+            header, cur = _header_path(line), None
+            continue
+        if line.startswith("+++ "):
+            path = _git_path(line[4:])
+            cur = AddedChunk(source, path) if path is not None else None
+            continue
+        m = _BINARY_RE.match(line)
+        if m or line == "Binary files differ":
+            path = (_git_path(m.group(2)) or _git_path(m.group(1))) if m else None
+            skipped.append((path or header, "binary"))
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            nparents = len(m.group(1)) - 1
+            ranges = m.group(2).split()
+
+            def count(r: str) -> int:
+                return int(r.split(",")[1]) if "," in r else 1
+            old_left = [count(r) for r in ranges[:-1]]
+            new_left = count(ranges[-1])
+            lineno = int(ranges[-1][1:].split(",")[0])
+            if new_left == 0:
+                lineno += 1     # "+c,0" names the line before the gap; nothing is added anyway
+            in_hunk = new_left > 0 or any(o > 0 for o in old_left)
+    flush()
+    return chunks, skipped
+
+
+def parse_git_log(text: str) -> Tuple[List[AddedChunk], List[Tuple[str, str]], int]:
+    """Output of `git log -p --cc GIT_LOG_FORMAT` -> (chunks, skipped, number of commits)."""
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    parts = text.split(GIT_COMMIT_MARK)[1:]
+    for part in parts:
+        sha, _, rest = part.partition("\n")
+        short = sha.strip()[:10]
+        msg, _, diff = rest.partition(GIT_MSG_END)
+        lines = [ln.rstrip("\r") for ln in msg.split("\n")]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            chunks.append(AddedChunk(short, COMMIT_MESSAGE_FILE, [(i + 1, ln) for i, ln in enumerate(lines)]))
+        c, s = parse_unified_diff(diff, short)
+        chunks += c
+        skipped += s
+    return chunks, skipped, len(parts)
+
+
+# ===========================================================================
 # 7. GitHub rules sync
 # ===========================================================================
 class SyncError(Exception):
