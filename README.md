@@ -126,6 +126,12 @@ Each finding shows the source (a commit, `uncommitted` or `untracked`), the file
 the entity type and the value. Double-click a row to copy `file:line`. **Copy Results** copies
 the table as tab-separated text. The scan uses the **min score** value from tab 1.
 
+To remove a false finding, right-click its row and select **Add to permanent allow-list (never
+flag again)**. PII Shield adds the value to `rules/local/allow_list.yaml`. The value then leaves
+the list, together with every other row that has the same value. The match ignores case and
+spaces at the start and end. The next scan and the main screen do not flag the value again.
+You can select many rows before you right-click. The menu can also copy the value or `file:line`.
+
 spaCy reads code as prose and finds many false names, so the scan does not use spaCy by
 default. To find names, select **Find names with spaCy (more noise)**. The rules always run.
 
