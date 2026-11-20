@@ -9,3 +9,6 @@ allow_list:
 - Linux
 - Max-Age
 - Loading
+- the Jobs row
+- ETA
+- Jobs
