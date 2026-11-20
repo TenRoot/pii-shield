@@ -1713,7 +1713,7 @@ class DetectionEngine:
         return out
 
     def analyze(self, text: str, manual_rules: Sequence[ManualRule], vault: SessionVault,
-                threshold: Optional[float] = None) -> List[Finding]:
+                threshold: Optional[float] = None, skip_ner: bool = False) -> List[Finding]:
         with self.lock:
             analyzer, rs = self.analyzer, self.ruleset
         ecfg, bcfg = self.config["engine"], self.config["behavior"]
@@ -1721,8 +1721,9 @@ class DetectionEngine:
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
 
-        skip_ner = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
-        self.last_ner_skipped = skip_ner
+        log_skip = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
+        self.last_ner_skipped = log_skip
+        skip_ner = skip_ner or log_skip   # the Git scan asks for no NER; log input can also turn it off
         if analyzer is not None:
             entities = sorted(set(ecfg.get("builtin_entities", [])) | set(rs.entities))
             results = analyzer.analyze(text=text, language="en", entities=entities or None,
@@ -1759,13 +1760,19 @@ class DetectionEngine:
         # propagation: every literal occurrence of a detected value or a value already in the session map
         if bcfg.get("propagate_values", True):
             ci = bcfg.get("case_insensitive_values", True)
-            values: Dict[str, Tuple[str, float]] = {}
+            # value key -> (text, entity, score); a copy inherits the best score of its source hits
+            values: Dict[str, Tuple[str, str, float]] = {}
             for f in found:
-                values.setdefault(vault.key(f.text), (f.text, f.entity))
+                k = vault.key(f.text)
+                prev = values.get(k)
+                if prev is None:
+                    values[k] = (f.text, f.entity, f.score)
+                elif f.score > prev[2]:
+                    values[k] = (prev[0], prev[1], f.score)
             extra: List[Finding] = []
-            for k, (v, ent) in values.items():
+            for k, (v, ent, score) in values.items():
                 for s, e in find_literal(text, v, ci):
-                    extra.append(Finding(s, e, text[s:e], ent, 0.5, "propagated", "value-propagation"))
+                    extra.append(Finding(s, e, text[s:e], ent, score, "propagated", "value-propagation"))
             for tok, v in vault.active_tokens.items():
                 if v.casefold() in allow:
                     continue
