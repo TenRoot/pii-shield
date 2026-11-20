@@ -31,6 +31,7 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 import argparse
 import base64
+import bisect
 import copy
 import datetime as _dt
 import hashlib
@@ -39,6 +40,7 @@ import logging
 import math
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -1996,6 +1998,174 @@ def parse_git_log(text: str) -> Tuple[List[AddedChunk], List[Tuple[str, str]], i
         chunks += c
         skipped += s
     return chunks, skipped, len(parts)
+
+
+class GitScanError(Exception):
+    """A Git scan cannot run. The message is safe to show to the user."""
+
+
+class GitNotFound(GitScanError):
+    pass
+
+
+@dataclass
+class GitFinding:
+    source: str          # short SHA, "uncommitted" or "untracked"
+    file: str
+    line: int
+    entity: str
+    value: str
+    recognizer: str
+    score: float
+
+
+@dataclass
+class GitScanResult:
+    repo: Path
+    range_desc: str
+    commits: int
+    threshold: float
+    findings: List[GitFinding]
+    skipped: List[Tuple[str, str]]    # (path, "binary" | "too large" | "symlink" | "unreadable")
+
+
+# An inherited GIT_DIR or GIT_WORK_TREE would make git read another repo than the folder picked.
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+_GIT_DIFF_OPTS = ("--no-color", "--no-ext-diff", "--no-textconv", "--unified=0", "-M")
+
+
+def _git_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    return env
+
+
+def run_git(repo: Path, *args: str, timeout: float = 120, input: bytes = b"") -> bytes:
+    """Run one local git command. No shell, no prompts, no repo-configured fsmonitor program."""
+    import subprocess
+    cmd = ["git", "-c", "core.fsmonitor=false", "-c", "core.quotepath=off", *args]
+    try:
+        r = subprocess.run(cmd, cwd=str(repo), env=_git_env(), input=input, capture_output=True,
+                           timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except FileNotFoundError:
+        raise GitNotFound("git was not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise GitScanError("git timed out") from None
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise GitScanError(f"git {args[0]} failed: {err[0] if err else f'exit code {r.returncode}'}")
+    return r.stdout
+
+
+def git_repo_root(path: Path) -> Path:
+    """Root of the working tree that holds `path`. Works in linked worktrees, where .git is a file."""
+    if not Path(path).is_dir():
+        raise GitScanError(f"Not a Git working tree: {path}")
+    try:
+        out = run_git(Path(path), "rev-parse", "--show-toplevel")
+    except GitNotFound:
+        raise
+    except GitScanError:
+        raise GitScanError(f"Not a Git working tree: {path}") from None
+    root = out.decode("utf-8", "replace").strip()
+    if not root:
+        raise GitScanError(f"Not a Git working tree: {path}")
+    return Path(root)
+
+
+def _untracked_chunk(root: Path, name: str, skipped: List[Tuple[str, str]]) -> Optional[AddedChunk]:
+    p = root / name
+    try:
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            skipped.append((name, "symlink"))
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            skipped.append((name, "unreadable"))
+            return None
+        if st.st_size > GIT_SCAN_MAX_BYTES:
+            skipped.append((name, "too large"))
+            return None
+        data = p.read_bytes()
+    except OSError:
+        skipped.append((name, "unreadable"))
+        return None
+    if b"\x00" in data[:GIT_BINARY_SNIFF]:
+        skipped.append((name, "binary"))
+        return None
+    lines = data.decode("utf-8", "replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return AddedChunk("untracked", name, [(i + 1, ln[:-1] if ln.endswith("\r") else ln)
+                                          for i, ln in enumerate(lines)])
+
+
+def scan_git_repo(repo: Path, engine: "DetectionEngine", threshold: float, use_ner: bool = False,
+                  progress: Callable[[str], None] = lambda s: None) -> GitScanResult:
+    """Find PII and secrets in what a push of the current branch sends, plus local work.
+
+    Reads the added lines of every commit that no remote-tracking ref has (merge resolutions
+    and messages included), staged and unstaged changes, and untracked files that Git does not
+    ignore. Changes nothing in the repo and never touches the session map."""
+    root = git_repo_root(Path(repo))
+
+    def git(*args: str, **kw) -> str:
+        return run_git(root, *args, **kw).decode("utf-8", "replace")
+
+    try:
+        git("rev-parse", "--verify", "-q", "HEAD")
+        has_head = True
+    except GitNotFound:
+        raise
+    except GitScanError:
+        has_head = False         # a new repo with no commits yet
+    has_remotes = bool(git("remote").strip())
+    range_desc = ("commits not on any remote (remote refs as of the last fetch)" if has_remotes
+                  else "all commits (this repo has no remotes)")
+
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    commits = 0
+    if has_head:
+        progress("Reading commits...")
+        c, s, commits = parse_git_log(git("log", "-p", "--cc", *_GIT_DIFF_OPTS, GIT_LOG_FORMAT,
+                                          "HEAD", "--not", "--remotes"))
+        chunks += c
+        skipped += s
+        base = "HEAD"
+    else:
+        base = git("hash-object", "-t", "tree", "--stdin").strip()   # the empty tree, in this repo's hash
+    progress("Reading uncommitted changes...")
+    c, s = parse_unified_diff(git("diff", *_GIT_DIFF_OPTS, base), "uncommitted")
+    chunks += c
+    skipped += s
+
+    progress("Reading untracked files...")
+    for name in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        if name:
+            ch = _untracked_chunk(root, name, skipped)
+            if ch is not None and ch.lines:
+                chunks.append(ch)
+
+    progress(f"Analyzing {len(chunks)} chunks...")
+    findings: List[GitFinding] = []
+    for ch in chunks:
+        texts = [t for _, t in ch.lines]
+        text = "\n".join(texts)
+        if len(text.encode("utf-8")) > GIT_SCAN_MAX_BYTES:
+            skipped.append((ch.file, "too large"))
+            continue
+        starts, off = [], 0
+        for t in texts:
+            starts.append(off)
+            off += len(t) + 1
+        for f in engine.analyze(text, [], SessionVault(), threshold=threshold, skip_ner=not use_ner):
+            i = bisect.bisect_right(starts, f.start) - 1
+            findings.append(GitFinding(ch.source, ch.file, ch.lines[i][0], f.entity, f.text,
+                                       f.recognizer, float(f.score)))
+    log.info("Git scan: %s; %d commits, %d findings, %d skipped", range_desc, commits, len(findings),
+             len(skipped))
+    return GitScanResult(root, range_desc, commits, threshold, findings, skipped)
 
 
 # ===========================================================================
