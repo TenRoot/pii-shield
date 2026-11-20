@@ -1,7 +1,7 @@
 {
-  "version": "1.5.4",
+  "version": "1.6.0",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "9260460854ee190902dab88f98a8b81347d6693ffe5d27c38fd9f72b177a90e8",
-  "notes": "Names ending in -prod, -dev, -test, -qa, -uat, -staging and similar are now masked by default (common words like unit-test and pre-prod are skipped); Step 2 review columns resize by drag; Send to Sanitize matches the Analyze PII button; Clear and Load File now clear the Step 2 review, and Clear asks whether to keep or reset a non-empty session map",
-  "published": "2026-11-12"
+  "sha256": "1c4a03bea0b1c2f48deb2500adef8777cc6d54475ad38412d05a25adfef50def",
+  "notes": "New Scan Git Repo button: scan the commits a branch would push, plus uncommitted and untracked files, for PII and secrets (nothing in the repo changes); right-click a Git scan finding to add its value to the allow list, which removes it and its duplicates from the results",
+  "published": "2026-11-20"
 }
