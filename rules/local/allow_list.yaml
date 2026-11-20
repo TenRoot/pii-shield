@@ -1,0 +1,11 @@
+version: 1
+allow_list:
+- merge
+- Info
+- CSV
+- AI
+- dashboard
+- CI
+- Linux
+- Max-Age
+- Loading
