@@ -31,6 +31,7 @@ os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 import argparse
 import base64
+import bisect
 import copy
 import datetime as _dt
 import hashlib
@@ -39,6 +40,7 @@ import logging
 import math
 import re
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -131,6 +133,7 @@ DEFAULT_CONFIG: Dict = {
         "lenient_restore": True,         # also restore HOSTNAME_1, [HOSTNAME_1], &lt;HOSTNAME_1&gt;
         "clipboard_clear_seconds": 0,    # 0 = never auto-clear
         "offline_mode": False,           # True = no network at all: no GitHub sync, no update checks
+        "git_scan_last_repo": "",        # last folder used in Scan Git Repo
     },
 }
 
@@ -1713,7 +1716,7 @@ class DetectionEngine:
         return out
 
     def analyze(self, text: str, manual_rules: Sequence[ManualRule], vault: SessionVault,
-                threshold: Optional[float] = None) -> List[Finding]:
+                threshold: Optional[float] = None, skip_ner: bool = False) -> List[Finding]:
         with self.lock:
             analyzer, rs = self.analyzer, self.ruleset
         ecfg, bcfg = self.config["engine"], self.config["behavior"]
@@ -1721,8 +1724,9 @@ class DetectionEngine:
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
 
-        skip_ner = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
-        self.last_ner_skipped = skip_ner
+        log_skip = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
+        self.last_ner_skipped = log_skip
+        skip_ner = skip_ner or log_skip   # the Git scan asks for no NER; log input can also turn it off
         if analyzer is not None:
             entities = sorted(set(ecfg.get("builtin_entities", [])) | set(rs.entities))
             results = analyzer.analyze(text=text, language="en", entities=entities or None,
@@ -1759,13 +1763,19 @@ class DetectionEngine:
         # propagation: every literal occurrence of a detected value or a value already in the session map
         if bcfg.get("propagate_values", True):
             ci = bcfg.get("case_insensitive_values", True)
-            values: Dict[str, Tuple[str, float]] = {}
+            # value key -> (text, entity, score); a copy inherits the best score of its source hits
+            values: Dict[str, Tuple[str, str, float]] = {}
             for f in found:
-                values.setdefault(vault.key(f.text), (f.text, f.entity))
+                k = vault.key(f.text)
+                prev = values.get(k)
+                if prev is None:
+                    values[k] = (f.text, f.entity, f.score)
+                elif f.score > prev[2]:
+                    values[k] = (prev[0], prev[1], f.score)
             extra: List[Finding] = []
-            for k, (v, ent) in values.items():
+            for k, (v, ent, score) in values.items():
                 for s, e in find_literal(text, v, ci):
-                    extra.append(Finding(s, e, text[s:e], ent, 0.5, "propagated", "value-propagation"))
+                    extra.append(Finding(s, e, text[s:e], ent, score, "propagated", "value-propagation"))
             for tok, v in vault.active_tokens.items():
                 if v.casefold() in allow:
                     continue
@@ -1842,6 +1852,356 @@ def leak_check(output: str, vault: SessionVault, extra_values: Iterable[str] = (
         if find_literal(output, v, True):
             leaks.append(v)
     return leaks
+
+
+# ===========================================================================
+# 6b. Git branch scan (leak check of what a push sends; it reports and changes nothing)
+# ===========================================================================
+GIT_COMMIT_MARK = "\x1ePIISHIELD-COMMIT "   # git format: %x1ePIISHIELD-COMMIT %H
+GIT_MSG_END = "\x1fPIISHIELD-END"            # git format: %x1fPIISHIELD-END
+GIT_LOG_FORMAT = "--format=%x1ePIISHIELD-COMMIT %H%n%B%x1fPIISHIELD-END"
+COMMIT_MESSAGE_FILE = "(commit message)"
+GIT_SCAN_MAX_BYTES = 1_000_000    # untracked file or one chunk of added text
+GIT_BINARY_SNIFF = 8192           # a NUL byte in the first 8 KB means binary
+_HUNK_RE = re.compile(r"^(@{2,}) (.*?) @{2,}")
+_BINARY_RE = re.compile(r"^Binary files (.*) and (.*) differ$")
+_GIT_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+@dataclass
+class AddedChunk:
+    source: str                       # short SHA (10 chars), "uncommitted" or "untracked"
+    file: str                         # repo-relative path, or COMMIT_MESSAGE_FILE
+    lines: List[Tuple[int, str]] = field(default_factory=list)   # (1-based line in the new file, text)
+
+
+def _git_unquote(path: str) -> str:
+    """Undo git's C-style path quoting. Octal escapes are the UTF-8 bytes of the name."""
+    if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
+        return path
+    s, out, i = path[1:-1], bytearray(), 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            if re.match(r"[0-7]{3}", s[i + 1:i + 4]):
+                out.append(int(s[i + 1:i + 4], 8))
+                i += 4
+                continue
+            nxt = s[i + 1]
+            out += bytes([_GIT_ESCAPES[nxt]]) if nxt in _GIT_ESCAPES else nxt.encode("utf-8")
+            i += 2
+            continue
+        out += c.encode("utf-8")
+        i += 1
+    return out.decode("utf-8", "replace")
+
+
+def _git_path(spec: str) -> Optional[str]:
+    """'b/dir/x.txt', '"b/a\\tb"' or '/dev/null' -> repo path (None for /dev/null)."""
+    quoted = spec.startswith('"')
+    p = _git_unquote(spec) if quoted else spec.rstrip("\t")   # git adds a TAB after names with spaces
+    if p == "/dev/null":
+        return None
+    return p[2:] if p[:2] in ("a/", "b/") else p
+
+
+def _header_path(line: str) -> str:
+    if line.startswith("diff --cc ") or line.startswith("diff --combined "):
+        return _git_unquote(line.split(" ", 2)[2])
+    rest = line[len("diff --git "):]
+    if rest.endswith('"'):
+        q = rest.rfind(' "')
+        return _git_path(rest[q + 1:]) or ""
+    k = rest.rfind(" b/")
+    return rest[k + 3:] if k >= 0 else rest
+
+
+def parse_unified_diff(text: str, source: str) -> Tuple[List[AddedChunk], List[Tuple[str, str]]]:
+    """Added lines of a unified or combined (--cc) diff made with --unified=0.
+
+    A body line has one prefix column per parent. It is in the new file when no column is '-',
+    and it is added when it is in the new file and a column is '+'. Hunk line counts tell where
+    a hunk ends, so an added line that starts with '+++' is not read as a file header."""
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    cur: Optional[AddedChunk] = None
+    header = ""
+    in_hunk = False
+    nparents, lineno, new_left, old_left = 1, 0, 0, [0]
+
+    def flush():
+        if cur is not None and cur.lines:
+            chunks.append(cur)
+
+    for raw in text.split("\n"):
+        if in_hunk:
+            if raw.startswith("\\"):            # "\ No newline at end of file"
+                continue
+            if raw == "":
+                raw = " " * nparents            # a blank context line can lose its prefix column
+            cols, content = raw[:nparents], raw[nparents:]
+            in_new = "-" not in cols
+            for i, c in enumerate(cols):
+                if c != "+":
+                    old_left[i] -= 1
+            if in_new:
+                new_left -= 1
+                if "+" in cols and cur is not None:
+                    cur.lines.append((lineno, content[:-1] if content.endswith("\r") else content))
+                lineno += 1
+            if new_left <= 0 and all(o <= 0 for o in old_left):
+                in_hunk = False
+            continue
+        line = raw.rstrip("\r")
+        if line.startswith(("diff --git ", "diff --cc ", "diff --combined ")):
+            flush()
+            header, cur = _header_path(line), None
+            continue
+        if line.startswith("+++ "):
+            flush()
+            path = _git_path(line[4:])
+            cur = AddedChunk(source, path) if path is not None else None
+            continue
+        m = _BINARY_RE.match(line)
+        if m or line == "Binary files differ":
+            path = (_git_path(m.group(2)) or _git_path(m.group(1))) if m else None
+            skipped.append((path or header, "binary"))
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            nparents = len(m.group(1)) - 1
+            ranges = m.group(2).split()
+
+            def count(r: str) -> int:
+                return int(r.split(",")[1]) if "," in r else 1
+            old_left = [count(r) for r in ranges[:-1]]
+            new_left = count(ranges[-1])
+            lineno = int(ranges[-1][1:].split(",")[0])
+            if new_left == 0:
+                lineno += 1     # "+c,0" names the line before the gap; nothing is added anyway
+            in_hunk = new_left > 0 or any(o > 0 for o in old_left)
+    flush()
+    return chunks, skipped
+
+
+def parse_git_log(text: str) -> Tuple[List[AddedChunk], List[Tuple[str, str]], int]:
+    """Output of `git log -p --cc GIT_LOG_FORMAT` -> (chunks, skipped, number of commits)."""
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    parts = text.split(GIT_COMMIT_MARK)[1:]
+    for part in parts:
+        sha, _, rest = part.partition("\n")
+        short = sha.strip()[:10]
+        msg, _, diff = rest.partition(GIT_MSG_END)
+        lines = [ln.rstrip("\r") for ln in msg.split("\n")]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            chunks.append(AddedChunk(short, COMMIT_MESSAGE_FILE, [(i + 1, ln) for i, ln in enumerate(lines)]))
+        c, s = parse_unified_diff(diff, short)
+        chunks += c
+        skipped += s
+    return chunks, skipped, len(parts)
+
+
+class GitScanError(Exception):
+    """A Git scan cannot run. The message is safe to show to the user."""
+
+
+class GitNotFound(GitScanError):
+    pass
+
+
+@dataclass
+class GitFinding:
+    source: str          # short SHA, "uncommitted" or "untracked"
+    file: str
+    line: int
+    entity: str
+    value: str
+    recognizer: str
+    score: float
+
+
+@dataclass
+class GitScanResult:
+    repo: Path
+    range_desc: str
+    commits: int
+    threshold: float
+    findings: List[GitFinding]
+    skipped: List[Tuple[str, str]]    # (path, "binary" | "too large" | "symlink" | "unreadable")
+
+
+# An inherited GIT_DIR or GIT_WORK_TREE would make git read another repo than the folder picked.
+_GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY")
+# Pin every option that changes the diff format, so repo config cannot hide added lines:
+# --text stops .gitattributes "-diff"/"binary" from hiding text (real binaries are found by NUL);
+# fixed prefixes beat diff.noprefix/mnemonicPrefix; --no-relative beats diff.relative.
+_GIT_DIFF_OPTS = ("--no-color", "--no-ext-diff", "--no-textconv", "--text", "--unified=0",
+                  "--inter-hunk-context=0", "--no-relative", "--src-prefix=a/", "--dst-prefix=b/", "-M")
+_GIT_FIXED_CONFIG = ("core.fsmonitor=false", "core.quotepath=off", "diff.suppressBlankEmpty=false")
+LFS_POINTER_FIRST_LINE = "version https://git-lfs.github.com/spec/v1"
+
+
+def _git_env() -> Dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV_DROP}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    return env
+
+
+def run_git(repo: Path, *args: str, timeout: float = 120, input: bytes = b"",
+            config: Sequence[str] = ()) -> bytes:
+    """Run one local git command. No shell, no prompts, no repo-configured fsmonitor program.
+    `config` adds more `-c key=value` overrides (the scan uses it to switch off filter drivers)."""
+    import subprocess
+    cmd = ["git"]
+    for kv in (*_GIT_FIXED_CONFIG, *config):
+        cmd += ["-c", kv]
+    cmd += list(args)
+    try:
+        r = subprocess.run(cmd, cwd=str(repo), env=_git_env(), input=input, capture_output=True,
+                           timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except FileNotFoundError:
+        raise GitNotFound("git was not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise GitScanError("git timed out") from None
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise GitScanError(f"git {args[0]} failed: {err[0] if err else f'exit code {r.returncode}'}")
+    return r.stdout
+
+
+def git_repo_root(path: Path) -> Path:
+    """Root of the working tree that holds `path`. Works in linked worktrees, where .git is a file."""
+    if not Path(path).is_dir():
+        raise GitScanError(f"Not a Git working tree: {path}")
+    try:
+        out = run_git(Path(path), "rev-parse", "--show-toplevel")
+    except GitNotFound:
+        raise
+    except GitScanError:
+        raise GitScanError(f"Not a Git working tree: {path}") from None
+    root = out.decode("utf-8", "replace").strip()
+    if not root:
+        raise GitScanError(f"Not a Git working tree: {path}")
+    return Path(root)
+
+
+def _untracked_chunk(root: Path, name: str, skipped: List[Tuple[str, str]]) -> Optional[AddedChunk]:
+    p = root / name
+    try:
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            skipped.append((name, "symlink"))
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            skipped.append((name, "unreadable"))
+            return None
+        if st.st_size > GIT_SCAN_MAX_BYTES:
+            skipped.append((name, "too large"))
+            return None
+        data = p.read_bytes()
+    except OSError:
+        skipped.append((name, "unreadable"))
+        return None
+    if b"\x00" in data[:GIT_BINARY_SNIFF]:
+        skipped.append((name, "binary"))
+        return None
+    lines = data.decode("utf-8", "replace").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return AddedChunk("untracked", name, [(i + 1, ln[:-1] if ln.endswith("\r") else ln)
+                                          for i, ln in enumerate(lines)])
+
+
+def scan_git_repo(repo: Path, engine: "DetectionEngine", threshold: float, use_ner: bool = False,
+                  progress: Callable[[str], None] = lambda s: None) -> GitScanResult:
+    """Find PII and secrets in what a push of the current branch sends, plus local work.
+
+    Reads the added lines of every commit that no remote-tracking ref has (merge resolutions
+    and messages included), staged and unstaged changes, and untracked files that Git does not
+    ignore. Changes nothing in the repo and never touches the session map."""
+    root = git_repo_root(Path(repo))
+
+    # Filter drivers (git-lfs, git-crypt, custom clean/smudge) run programs when git hashes a
+    # worktree file. Switch every configured driver off for this scan.
+    overrides: List[str] = []
+    try:
+        cfg = run_git(root, "config", "--get-regexp", r"^filter\.").decode("utf-8", "replace")
+    except GitNotFound:
+        raise
+    except GitScanError:
+        cfg = ""                 # exit code 1: no filter configured
+    for name in sorted({ln.split(" ", 1)[0][len("filter."):].rsplit(".", 1)[0]
+                        for ln in cfg.splitlines() if ln.startswith("filter.")}):
+        overrides += [f"filter.{name}.clean=", f"filter.{name}.smudge=", f"filter.{name}.process=",
+                      f"filter.{name}.required=false"]
+
+    def git(*args: str, **kw) -> str:
+        return run_git(root, *args, config=overrides, **kw).decode("utf-8", "replace")
+
+    try:
+        git("rev-parse", "--verify", "-q", "HEAD")
+        has_head = True
+    except GitNotFound:
+        raise
+    except GitScanError:
+        has_head = False         # a new repo with no commits yet
+    has_remotes = bool(git("remote").strip())
+    range_desc = ("commits not on any remote (remote refs as of the last fetch)" if has_remotes
+                  else "all commits (this repo has no remotes)")
+
+    chunks: List[AddedChunk] = []
+    skipped: List[Tuple[str, str]] = []
+    commits = 0
+    if has_head:
+        progress("Reading commits...")
+        c, s, commits = parse_git_log(git("log", "-p", "--cc", "--root", "--no-show-signature",
+                                          *_GIT_DIFF_OPTS, GIT_LOG_FORMAT, "HEAD", "--not", "--remotes"))
+        chunks += c
+        skipped += s
+        base = "HEAD"
+    else:
+        base = git("hash-object", "-t", "tree", "--stdin").strip()   # the empty tree, in this repo's hash
+    progress("Reading uncommitted changes...")
+    c, s = parse_unified_diff(git("diff", *_GIT_DIFF_OPTS, base), "uncommitted")
+    chunks += c
+    skipped += s
+
+    progress("Reading untracked files...")
+    for name in git("ls-files", "--others", "--exclude-standard", "-z").split("\0"):
+        if name:
+            ch = _untracked_chunk(root, name, skipped)
+            if ch is not None and ch.lines:
+                chunks.append(ch)
+
+    progress(f"Analyzing {len(chunks)} chunks...")
+    findings: List[GitFinding] = []
+    for ch in chunks:
+        texts = [t for _, t in ch.lines]
+        text = "\n".join(texts)
+        if "\x00" in text[:GIT_BINARY_SNIFF]:
+            if (ch.file, "binary") not in skipped:
+                skipped.append((ch.file, "binary"))
+            continue
+        if texts and texts[0].strip() == LFS_POINTER_FIRST_LINE:
+            skipped.append((ch.file, "LFS object (not scanned)"))   # the push uploads the real object
+            continue
+        if len(text.encode("utf-8")) > GIT_SCAN_MAX_BYTES:
+            skipped.append((ch.file, "too large"))
+            continue
+        starts, off = [], 0
+        for t in texts:
+            starts.append(off)
+            off += len(t) + 1
+        for f in engine.analyze(text, [], SessionVault(), threshold=threshold, skip_ner=not use_ner):
+            i = bisect.bisect_right(starts, f.start) - 1
+            findings.append(GitFinding(ch.source, ch.file, ch.lines[i][0], f.entity, f.text,
+                                       f.recognizer, float(f.score)))
+    log.info("Git scan: %s; %d commits, %d findings, %d skipped", range_desc, commits, len(findings),
+             len(skipped))
+    return GitScanResult(root, range_desc, commits, threshold, findings, skipped)
 
 
 # ===========================================================================
@@ -2433,7 +2793,7 @@ if QT_OK:
                 self.signals.done.emit(self.fn(*self.args, **self.kwargs))
             except Exception as exc:
                 log.debug(traceback.format_exc())
-                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision)) else str(exc))
+                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision, GitScanError)) else str(exc))
 
     def _mono_font() -> QtGui.QFont:
         f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
@@ -2800,6 +3160,164 @@ if QT_OK:
             self.accept()
 
     # -----------------------------------------------------------------------
+    class GitScanDialog(QtWidgets.QDialog):
+        """Scan Git Repo: report PII and secrets in what a push of the branch sends, plus local work."""
+        HEADERS = ("Source", "File", "Line", "Entity", "Value", "Recognizer")
+
+        def __init__(self, config: AppConfig, engine: DetectionEngine,
+                     threshold: Callable[[], float], parent=None):
+            super().__init__(parent)
+            self.config, self.engine, self.threshold = config, engine, threshold
+            self._task = None
+            self.setWindowTitle("Git Scan")
+            self.setModal(False)
+            self.resize(1000, 620)
+            lay = QtWidgets.QVBoxLayout(self)
+
+            row = QtWidgets.QHBoxLayout()
+            self.path_edit = QtWidgets.QLineEdit(config["behavior"].get("git_scan_last_repo", ""))
+            self.path_edit.setPlaceholderText("Repo folder (a linked worktree also works)")
+            self.path_edit.returnPressed.connect(self.start_scan)
+            self.btn_browse = _button("Browse...")
+            self.btn_browse.clicked.connect(self._browse)
+            row.addWidget(QtWidgets.QLabel("Repo:"))
+            row.addWidget(self.path_edit, 1)
+            row.addWidget(self.btn_browse)
+            lay.addLayout(row)
+
+            row = QtWidgets.QHBoxLayout()
+            self.chk_ner = QtWidgets.QCheckBox("Find names with spaCy (more noise)")
+            self.chk_ner.setChecked(False)
+            self.btn_scan = _button("Scan", primary=True)
+            self.btn_scan.clicked.connect(self.start_scan)
+            row.addWidget(self.chk_ner)
+            row.addStretch(1)
+            row.addWidget(self.btn_scan)
+            lay.addLayout(row)
+
+            self.lbl_status = QtWidgets.QLabel("Scans the commits this branch would push, plus uncommitted "
+                                               "and untracked files. Nothing in the repo changes.")
+            self.lbl_status.setWordWrap(True)
+            lay.addWidget(self.lbl_status)
+            self.lbl_note = QtWidgets.QLabel()
+            self.lbl_note.setWordWrap(True)
+            set_note(self.lbl_note, "", "okmsg")
+            lay.addWidget(self.lbl_note)
+
+            self.table = QtWidgets.QTableWidget(0, len(self.HEADERS))
+            self.table.setHorizontalHeaderLabels(self.HEADERS)
+            self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.verticalHeader().setVisible(False)
+            hdr = self.table.horizontalHeader()
+            hdr.setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Interactive)
+            hdr.setStretchLastSection(True)
+            for col, width in enumerate((100, 300, 60, 130, 220)):
+                self.table.setColumnWidth(col, width)
+            self.table.setSortingEnabled(True)
+            self.table.cellDoubleClicked.connect(self._copy_location)
+            self.table.setToolTip("Double-click a row to copy file:line")
+            lay.addWidget(self.table, 1)
+
+            self.skipped_box = QtWidgets.QGroupBox("Skipped files (0)")
+            self.skipped_box.setCheckable(True)
+            self.skipped_box.setChecked(False)
+            sb = QtWidgets.QVBoxLayout(self.skipped_box)
+            self.skipped_list = QtWidgets.QListWidget()
+            self.skipped_list.setMaximumHeight(120)
+            self.skipped_list.setVisible(False)
+            sb.addWidget(self.skipped_list)
+            self.skipped_box.toggled.connect(self.skipped_list.setVisible)
+            lay.addWidget(self.skipped_box)
+
+            row = QtWidgets.QHBoxLayout()
+            self.btn_copy = _button("Copy Results")
+            self.btn_copy.clicked.connect(lambda: QtWidgets.QApplication.clipboard().setText(self.results_tsv()))
+            btn_close = _button("Close")
+            btn_close.clicked.connect(self.close)
+            row.addWidget(self.btn_copy)
+            row.addStretch(1)
+            row.addWidget(btn_close)
+            lay.addLayout(row)
+
+        def _browse(self):
+            p = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose a Git repo folder", self.path_edit.text())
+            if p:
+                self.path_edit.setText(p)
+
+        def start_scan(self) -> None:
+            path = self.path_edit.text().strip()
+            if not path:
+                set_note(self.lbl_note, "Choose a repo folder.", "stale")
+                return
+            if not self.btn_scan.isEnabled():
+                return
+            self.config["behavior"]["git_scan_last_repo"] = path
+            try:
+                self.config.save()
+            except OSError as exc:
+                log.warning("Could not save config.json: %s", exc)
+            thr = float(self.threshold())
+            self.btn_scan.setEnabled(False)
+            set_note(self.lbl_note, "", "okmsg")
+            self.lbl_status.setText("Scanning...")
+            t = Task(scan_git_repo, Path(path), self.engine, thr, use_ner=self.chk_ner.isChecked(),
+                     wants_progress=True)
+            t.signals.progress.connect(self.lbl_status.setText)
+            t.signals.done.connect(self._scan_done)
+            t.signals.error.connect(self._scan_error)
+            self._task = t
+            QtCore.QThreadPool.globalInstance().start(t)
+
+        def _scan_done(self, result: GitScanResult):
+            self.btn_scan.setEnabled(True)
+            self.show_result(result)
+
+        def _scan_error(self, msg: str):
+            self.btn_scan.setEnabled(True)
+            self.lbl_status.setText("The scan did not run.")
+            set_note(self.lbl_note, msg, "leak")
+            log.error("Git scan: %s", msg)
+
+        def show_result(self, result: GitScanResult) -> None:
+            r = result
+            self.lbl_status.setText(f"Range: {r.range_desc} · {r.commits} commits · {len(r.findings)} findings · "
+                                    f"{len(r.skipped)} skipped · min score {r.threshold:.2f}")
+            n = len(r.findings)
+            if n:
+                set_note(self.lbl_note, f"{n} findings. Fix them before you push.", "leak")
+            elif r.skipped:
+                set_note(self.lbl_note, f"No findings, but {len(r.skipped)} files were not scanned. "
+                                        "See Skipped files.", "stale")
+            elif r.commits:
+                set_note(self.lbl_note, f"No findings in {r.commits} commits and the uncommitted changes.", "okmsg")
+            else:
+                set_note(self.lbl_note, "0 commits to push. No findings in the uncommitted changes.", "stale")
+            self.table.setSortingEnabled(False)
+            self.table.setRowCount(n)
+            for i, f in enumerate(r.findings):
+                for col, val in enumerate((f.source, f.file, f.line, f.entity, f.value, f.recognizer)):
+                    item = QtWidgets.QTableWidgetItem()
+                    item.setData(Qt.ItemDataRole.DisplayRole, val)   # an int sorts as a number
+                    self.table.setItem(i, col, item)
+            self.table.setSortingEnabled(True)
+            self.skipped_box.setTitle(f"Skipped files ({len(r.skipped)})")
+            self.skipped_list.clear()
+            self.skipped_list.addItems([f"{p} — {why}" for p, why in r.skipped])
+
+        def _copy_location(self, row: int, _col: int):
+            f, ln = self.table.item(row, 1), self.table.item(row, 2)
+            if f is not None and ln is not None:
+                QtWidgets.QApplication.clipboard().setText(f"{f.text()}:{ln.text()}")
+
+        def results_tsv(self) -> str:
+            out = ["\t".join(self.HEADERS)]
+            for i in range(self.table.rowCount()):
+                out.append("\t".join(self.table.item(i, c).text() if self.table.item(i, c) else ""
+                                     for c in range(len(self.HEADERS))))
+            return "\n".join(out)
+
+    # -----------------------------------------------------------------------
     COLS = ["Enable", "Original Text", "Entity Type", "Token", "Start", "End", "Score", "Source"]
     C_EN, C_TEXT, C_ENT, C_TOK, C_START, C_END, C_SCORE, C_SRC = range(8)
 
@@ -2885,6 +3403,11 @@ if QT_OK:
             self.btn_analyze.setEnabled(False)
             btn_load = _button("Load File...")
             btn_load.clicked.connect(self.load_file)
+            self.btn_git_scan = _button("Scan Git Repo...", tip="Scan the commits this branch would push, plus "
+                                        "uncommitted and untracked files, for PII and secrets")
+            self.btn_git_scan.clicked.connect(self.open_git_scan)
+            self.btn_git_scan.setEnabled(False)
+            self._git_scan_dialog = None
             btn_clear = _button("Clear", tip="Clear the input and the Step 2 review. The session map and "
                                              "temporary rules stay until Reset Session.")
             btn_clear.clicked.connect(self.clear_input_and_review)
@@ -2902,6 +3425,7 @@ if QT_OK:
             row.addWidget(self.btn_analyze)
             row.addWidget(self.thr)
             row.addWidget(btn_load)
+            row.addWidget(self.btn_git_scan)
             row.addWidget(btn_clear)
             row.addWidget(self.btn_send)
             row.addWidget(self.lbl_stale)
@@ -3132,6 +3656,7 @@ if QT_OK:
         def _task_error(self, msg):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self.btn_analyze.setEnabled(self.engine.mode != "uninitialized")
+            self.btn_git_scan.setEnabled(self.engine.mode != "uninitialized")
             log.error(msg)
             QtWidgets.QMessageBox.critical(self, APP_NAME, msg)
 
@@ -3145,6 +3670,7 @@ if QT_OK:
                         "lite": "Lite regex engine (Presidio not installed)"}.get(mode, mode)
                 self.lbl_engine.setText(f"Engine: {desc}  ·  offline")
                 self.btn_analyze.setEnabled(True)
+                self.btn_git_scan.setEnabled(True)
                 self._update_rules_badge(self.engine.ruleset)
                 self._startup_updates()
             self._run(self.engine.initialize, done, progress=True)
@@ -3270,6 +3796,13 @@ if QT_OK:
                 self.statusBar().showMessage("Settings saved - re-analyze to apply detection changes", 6000)
 
         # ================= Step 1 / 2
+        def open_git_scan(self):
+            if self._git_scan_dialog is None:
+                self._git_scan_dialog = GitScanDialog(self.config, self.engine, self.thr.value, self)
+            self._git_scan_dialog.show()
+            self._git_scan_dialog.raise_()
+            self._git_scan_dialog.activateWindow()
+
         def load_file(self):
             p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load text file", "", "Text (*.txt *.log *.md *.json *.yaml *.yml *.csv *.xml *.ps1 *.py *.conf *.ini);;All (*)")
             if p:

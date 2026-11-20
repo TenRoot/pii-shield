@@ -96,6 +96,48 @@ The GUI has five tabs:
 5. **Log** — see engine and sync messages. The log never contains detected values or
    prompt text.
 
+### Scan a Git branch
+
+Use the Git scan to find PII and secrets in a branch before you push it. The scan only reports.
+It does not change the repo, and it does not add tokens to the session map.
+
+1. Wait until the engine is loaded, then click **Scan Git Repo...** in tab 1.
+2. Choose the repo folder. A linked worktree (`git worktree add`) also works.
+3. Click **Scan**.
+
+The scan reads:
+
+- the added lines of every commit that is not on a remote branch yet, including lines that you
+  add when you resolve a merge conflict;
+- the message of each of those commits;
+- staged and unstaged changes;
+- untracked files that Git does not ignore.
+
+The scan does not read:
+
+- author and committer names and emails;
+- lines that the branch does not add, because those lines are already on the remote;
+- files that Git ignores.
+
+The scan does not run `git fetch`. It compares against the remote branches as they were at
+your last fetch or pull. If the repo has no remote, the scan reads every commit.
+
+Each finding shows the source (a commit, `uncommitted` or `untracked`), the file, the line,
+the entity type and the value. Double-click a row to copy `file:line`. **Copy Results** copies
+the table as tab-separated text. The scan uses the **min score** value from tab 1.
+
+spaCy reads code as prose and finds many false names, so the scan does not use spaCy by
+default. To find names, select **Find names with spaCy (more noise)**. The rules always run.
+
+The scan skips binary files, Git LFS objects and any file or diff part larger than 1 MB. The
+**Skipped files** list shows each skipped file and the reason. When the scan skips a file, it
+never shows the green "no findings" note. Check skipped files by hand. `git` must be on PATH.
+
+The scan ignores repo settings that change the diff output (for example `diff.noprefix` or
+`log.showRoot`) and `-diff` or `binary` in `.gitattributes`. It turns off filter drivers (for
+example git-lfs or git-crypt) and signature checks, so the scan runs no program from the repo
+config.
+
 ### Data folder
 
 PII Shield keeps its data next to `pii_sanitizer.py`. To use a different folder, set

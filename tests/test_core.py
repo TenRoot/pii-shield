@@ -63,6 +63,26 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("054-123-4567" in f.text for f in fs))
         self.assertEqual(d["jsmith"].entity, "USERNAME", "only the user name in C:\\Users\\jsmith is masked")
 
+    def test_skip_ner_argument_drops_ner_findings(self):
+        if self.engine.mode != "presidio+spacy":
+            self.skipTest("needs a spaCy model")
+        fs = self.engine.analyze(SAMPLE, [], ps.SessionVault(), skip_ner=True)
+        self.assertFalse([f for f in fs if f.recognizer in ps.NER_RECOGNIZERS])
+        self.assertFalse([f for f in fs if f.text == "John Smith"], "no propagated copy of a dropped NER value")
+        self.assertTrue([f for f in fs if f.text == "AKIAIOSFODNN7EXAMPLE"], "rules still run")
+
+    def test_propagated_copy_inherits_source_score(self):
+        fs, _ = self.analyze(SAMPLE)
+        best = {}
+        for f in fs:
+            if f.source != "propagated":
+                k = f.text.casefold()
+                best[k] = max(best.get(k, 0.0), f.score)
+        props = [f for f in fs if f.source == "propagated"]
+        self.assertTrue(props, "SAMPLE has a lower-case srv-dc01 copy")
+        for f in props:
+            self.assertEqual(f.score, best[f.text.casefold()], f.text)
+
     def test_consistent_tokens_and_case_insensitive(self):
         fs, _ = self.analyze(SAMPLE)
         toks = {f.token for f in fs if f.text.casefold() == "srv-dc01"}
