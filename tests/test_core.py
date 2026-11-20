@@ -71,6 +71,18 @@ class EngineTests(unittest.TestCase):
         self.assertFalse([f for f in fs if f.text == "John Smith"], "no propagated copy of a dropped NER value")
         self.assertTrue([f for f in fs if f.text == "AKIAIOSFODNN7EXAMPLE"], "rules still run")
 
+    def test_propagated_copy_inherits_source_score(self):
+        fs, _ = self.analyze(SAMPLE)
+        best = {}
+        for f in fs:
+            if f.source != "propagated":
+                k = f.text.casefold()
+                best[k] = max(best.get(k, 0.0), f.score)
+        props = [f for f in fs if f.source == "propagated"]
+        self.assertTrue(props, "SAMPLE has a lower-case srv-dc01 copy")
+        for f in props:
+            self.assertEqual(f.score, best[f.text.casefold()], f.text)
+
     def test_consistent_tokens_and_case_insensitive(self):
         fs, _ = self.analyze(SAMPLE)
         toks = {f.token for f in fs if f.text.casefold() == "srv-dc01"}
