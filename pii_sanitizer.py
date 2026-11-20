@@ -3169,6 +3169,8 @@ if QT_OK:
             super().__init__(parent)
             self.config, self.engine, self.threshold = config, engine, threshold
             self._task = None
+            self._result: Optional[GitScanResult] = None
+            self.allow_list_path = ALLOW_LIST_FILE
             self.setWindowTitle("Git Scan")
             self.setModal(False)
             self.resize(1000, 620)
@@ -3216,7 +3218,15 @@ if QT_OK:
                 self.table.setColumnWidth(col, width)
             self.table.setSortingEnabled(True)
             self.table.cellDoubleClicked.connect(self._copy_location)
-            self.table.setToolTip("Double-click a row to copy file:line")
+            self.table.setToolTip("Double-click a row to copy file:line. Right-click for more.")
+            self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.table.customContextMenuRequested.connect(self._table_menu)
+            self._menu = QtWidgets.QMenu(self)
+            self.a_allow = self._menu.addAction("Add to permanent allow-list (never flag again)", self.allow_selected)
+            self._menu.addSeparator()
+            self.a_copy_value = self._menu.addAction("Copy value", self._copy_selected_values)
+            self.a_copy_loc = self._menu.addAction(
+                "Copy file:line", lambda: self._copy_location(self.table.currentRow(), 0))
             lay.addWidget(self.table, 1)
 
             self.skipped_box = QtWidgets.QGroupBox("Skipped files (0)")
@@ -3280,7 +3290,11 @@ if QT_OK:
             log.error("Git scan: %s", msg)
 
         def show_result(self, result: GitScanResult) -> None:
-            r = result
+            self._result = result
+            self._render()
+
+        def _render(self) -> None:
+            r = self._result
             self.lbl_status.setText(f"Range: {r.range_desc} · {r.commits} commits · {len(r.findings)} findings · "
                                     f"{len(r.skipped)} skipped · min score {r.threshold:.2f}")
             n = len(r.findings)
@@ -3304,6 +3318,53 @@ if QT_OK:
             self.skipped_box.setTitle(f"Skipped files ({len(r.skipped)})")
             self.skipped_list.clear()
             self.skipped_list.addItems([f"{p} — {why}" for p, why in r.skipped])
+
+        def table_menu_actions(self) -> List[QtGui.QAction]:
+            return [a for a in self._menu.actions() if not a.isSeparator()]
+
+        def _table_menu(self, pos):
+            if not self._selected_values():
+                return
+            self.a_allow.setEnabled(self.btn_scan.isEnabled())   # no rule reload while a scan runs
+            self._menu.exec(self.table.viewport().mapToGlobal(pos))
+
+        def _selected_values(self) -> List[str]:
+            rows = sorted({i.row() for i in self.table.selectedIndexes()})
+            items = [self.table.item(r, 4) for r in rows]
+            return sorted({it.text().strip() for it in items if it is not None and it.text().strip()})
+
+        def _copy_selected_values(self):
+            QtWidgets.QApplication.clipboard().setText("\n".join(self._selected_values()))
+
+        def allow_selected(self) -> None:
+            vals = self._selected_values()
+            if not vals:
+                return
+            if QtWidgets.QMessageBox.question(
+                    self, "Allow-list", f"Add {len(vals)} value(s) to rules/local/allow_list.yaml?\n"
+                    "They will never be flagged again (except by manual rules).\n"
+                    "All rows with these values leave this list.") != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            self.allow_values(vals)
+
+        def allow_values(self, values: List[str]) -> int:
+            """Add values to the allow list, drop every row with one of them, and reload the rules.
+            Matches like the allow list itself: trimmed and case-insensitive. Returns rows removed."""
+            add_to_allow_list(values, self.allow_list_path)
+            keys = {v.strip().casefold() for v in values}
+            removed = 0
+            if self._result is not None:
+                keep = [f for f in self._result.findings if f.value.strip().casefold() not in keys]
+                removed = len(self._result.findings) - len(keep)
+                self._result.findings = keep
+                self._render()
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "reload_rules"):
+                parent.reload_rules()
+            else:
+                self.engine.reload_rules()
+            log.info("Git scan: %d value(s) added to the allow list; %d row(s) removed", len(keys), removed)
+            return removed
 
         def _copy_location(self, row: int, _col: int):
             f, ln = self.table.item(row, 1), self.table.item(row, 2)

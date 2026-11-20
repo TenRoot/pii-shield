@@ -454,6 +454,61 @@ class GitScanDialogTests(unittest.TestCase):
         self.assertEqual(d.lbl_note.text(), "No findings, but 1 files were not scanned. See Skipped files.")
         self.assertEqual(d.lbl_note.objectName(), "stale")
 
+    def _dup_findings(self):
+        return [ps.GitFinding("abc1234567", "a.py", 1, "URL", "self.work", "UrlRecognizer", 0.5),
+                ps.GitFinding("abc1234567", "b.py", 9, "URL", "SELF.work ", "UrlRecognizer", 0.5),
+                ps.GitFinding("uncommitted", "c.py", 4, "URL", "self.work", "Propagated", 0.5),
+                ps.GitFinding("uncommitted", "c.py", 5, "SECRET", "Sup3rS3cret!", "Passwords", 0.9)]
+
+    def test_allow_values_removes_value_and_its_duplicates(self):
+        d = self._dialog()
+        d.allow_list_path = self.tmp / "allow_list.yaml"
+        d.show_result(self._result(self._dup_findings()))
+        with mock.patch.object(self.win, "reload_rules") as reload:
+            removed = d.allow_values(["self.work"])
+        self.assertEqual(removed, 3)
+        self.assertEqual(d.table.rowCount(), 1)
+        self.assertEqual(d.table.item(0, 4).text(), "Sup3rS3cret!")
+        self.assertEqual(d.lbl_note.text(), "1 findings. Fix them before you push.")
+        self.assertIn("· 1 findings ·", d.lbl_status.text())
+        self.assertEqual(d.results_tsv().count("\n"), 1)
+        self.assertIn("self.work", (self.tmp / "allow_list.yaml").read_text("utf-8"))
+        reload.assert_called_once()
+
+    def test_allow_all_values_gives_the_green_note(self):
+        d = self._dialog()
+        d.allow_list_path = self.tmp / "allow_list.yaml"
+        d.show_result(self._result(self._dup_findings(), commits=2))
+        with mock.patch.object(self.win, "reload_rules"):
+            d.allow_values(["self.work", "Sup3rS3cret!"])
+        self.assertEqual(d.table.rowCount(), 0)
+        self.assertEqual(d.lbl_note.text(), "No findings in 2 commits and the uncommitted changes.")
+        self.assertEqual(d.lbl_note.objectName(), "okmsg")
+
+    def test_allow_selected_asks_first_and_uses_selected_values(self):
+        d = self._dialog()
+        d.allow_list_path = self.tmp / "allow_list.yaml"
+        d.show_result(self._result(self._dup_findings()))
+        d.table.sortItems(1)   # a.py, b.py, c.py, c.py
+        d.table.selectRow(1)
+        no, yes = ps.QtWidgets.QMessageBox.StandardButton.No, ps.QtWidgets.QMessageBox.StandardButton.Yes
+        with mock.patch.object(self.win, "reload_rules"):
+            with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=no):
+                d.allow_selected()
+            self.assertEqual(d.table.rowCount(), 4)
+            self.assertFalse(d.allow_list_path.exists())
+            with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=yes):
+                d.allow_selected()
+        self.assertEqual(d.table.rowCount(), 1)
+        self.assertEqual(d.table.item(0, 4).text(), "Sup3rS3cret!")
+
+    def test_table_menu_offers_allow_list(self):
+        d = self._dialog()
+        d.show_result(self._result(self._dup_findings()))
+        self.assertEqual(d.table.contextMenuPolicy(), ps.Qt.ContextMenuPolicy.CustomContextMenu)
+        texts = [a.text() for a in d.table_menu_actions()]
+        self.assertIn("Add to permanent allow-list (never flag again)", texts)
+
 
 
 if __name__ == "__main__":
