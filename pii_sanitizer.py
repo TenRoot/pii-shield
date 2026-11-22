@@ -1328,6 +1328,33 @@ def save_rule(rules_root: Path, rule: RuleDef, new_raw: dict) -> None:
         update_rule_file(_overrides_path(rules_root), rules_root, lambda recs: _upsert(recs, new_raw))
 
 
+def build_edited_raw(base_raw: dict, *, entity: str, score: float, case_sensitive: bool,
+                     manual: Optional[Tuple[str, str]] = None,
+                     patterns: Sequence[str] = (), values: Sequence[str] = ()) -> dict:
+    """The raw mapping for an edited rule. Fields the edit form does not show stay as they are."""
+    if manual is not None:
+        out = ManualRule(manual[0], manual[1], entity, not case_sensitive).to_rule_yaml()
+        if "enabled" in base_raw:
+            out["enabled"] = base_raw["enabled"]
+        out["score"] = score
+        return out
+    out = copy.deepcopy(base_raw)
+    out["entity"], out["score"], out["case_sensitive"] = entity, score, case_sensitive
+    kept = {}
+    for item in base_raw.get("patterns") or []:
+        if isinstance(item, dict) and isinstance(item.get("regex"), str):
+            kept.setdefault(item["regex"], copy.deepcopy(item))
+    if patterns:
+        out["patterns"] = [kept.get(rx, rx) for rx in patterns]
+    else:
+        out.pop("patterns", None)
+    if values:
+        out["deny_list"] = list(values)
+    else:
+        out.pop("deny_list", None)
+    return out
+
+
 def delete_rule(rules_root: Path, rule: RuleDef) -> None:
     if rule_kind(rule) != "saved":
         raise RuleError("only a saved rule can be deleted")
@@ -3295,6 +3322,130 @@ if QT_OK:
                       lambda res: finish_app_update(self, res))
 
     # -----------------------------------------------------------------------
+    class RuleEditDialog(QtWidgets.QDialog):
+        """Edit one rule. The only write goes through save_rule()."""
+
+        def __init__(self, parent, rule: RuleDef, rules_root: Path, entities: Sequence[str]):
+            super().__init__(parent)
+            self.setWindowTitle(f"Edit rule: {rule.name}")
+            self.resize(560, 560)
+            self.rule, self.rules_root = rule, rules_root
+            kind = rule_kind(rule)
+            self._manual = manual_source(rule) if kind == "saved" else None
+            is_copy = kind in ("bundled", "remote") or rule.is_marker
+            self.base_raw = override_copy(rule) if is_copy else copy.deepcopy(rule.raw)
+            source_raw = rule.overrides.raw if rule.is_marker and rule.overrides is not None else rule.raw
+            dropped_wordlist = is_copy and "wordlist" in (source_raw or {})
+
+            form = QtWidgets.QFormLayout()
+            self.warning_label = QtWidgets.QLabel(
+                "This copy no longer follows changes to the original word list." if dropped_wordlist else "")
+            self.warning_label.setWordWrap(True)
+            self.warning_label.setVisible(dropped_wordlist)
+            self.ed_entity = QtWidgets.QComboBox()
+            self.ed_entity.setEditable(True)
+            cur_entity = str(self.base_raw.get("entity", rule.entity))
+            self.ed_entity.addItems([e for e in dict.fromkeys(list(entities) + [cur_entity]) if e])
+            self.ed_entity.setCurrentText(cur_entity)
+            self.ed_score = QtWidgets.QDoubleSpinBox()
+            self.ed_score.setRange(0.01, 1.0)
+            self.ed_score.setSingleStep(0.05)
+            self.ed_score.setDecimals(2)
+            self.ed_score.setValue(float(self.base_raw.get("score", rule.score)))
+            self.ed_case = QtWidgets.QCheckBox("Case sensitive")
+            self.ed_case.setChecked(bool(self.base_raw.get("case_sensitive", rule.case_sensitive)))
+            form.addRow("Entity", self.ed_entity)
+            form.addRow("Score", self.ed_score)
+            form.addRow("", self.ed_case)
+            if self._manual is not None:
+                self.ed_type = QtWidgets.QComboBox()
+                for key, label in (("exact", "Exact Match"), ("wildcard", "Wildcard"), ("regex", "Custom Regex")):
+                    self.ed_type.addItem(label, key)
+                self.ed_type.setCurrentIndex(self.ed_type.findData(self._manual[0]))
+                self.ed_pattern = QtWidgets.QLineEdit(self._manual[1])
+                form.addRow("Match type", self.ed_type)
+                form.addRow("Pattern", self.ed_pattern)
+            else:
+                pats = []
+                for item in self.base_raw.get("patterns") or []:
+                    rx = item.get("regex") if isinstance(item, dict) else item
+                    if isinstance(rx, str):
+                        pats.append(rx)
+                self.ed_patterns = _text_box("One regular expression per line")
+                self.ed_patterns.setPlainText("\n".join(pats))
+                self.ed_values = _text_box("One exact value per line")
+                self.ed_values.setPlainText("\n".join(str(v) for v in self.base_raw.get("deny_list") or []))
+                form.addRow("Patterns", self.ed_patterns)
+                form.addRow("Values", self.ed_values)
+            self.ed_sample = _text_box("Type sample text to test the rule")
+            self.ed_sample.setMaximumHeight(80)
+            self.ed_result = QtWidgets.QLabel("")
+            self.ed_result.setWordWrap(True)
+            form.addRow("Test text", self.ed_sample)
+            form.addRow("Matches", self.ed_result)
+
+            self.btn_save = _button("Save", primary=True)
+            self.btn_cancel = _button("Cancel")
+            row = QtWidgets.QHBoxLayout()
+            row.addStretch(1)
+            row.addWidget(self.btn_cancel)
+            row.addWidget(self.btn_save)
+            lay = QtWidgets.QVBoxLayout(self)
+            lay.addWidget(self.warning_label)
+            lay.addLayout(form)
+            lay.addLayout(row)
+
+            self.btn_cancel.clicked.connect(self.reject)
+            self.btn_save.clicked.connect(self._save)
+            self.ed_sample.textChanged.connect(self._run_test)
+            self.ed_case.toggled.connect(self._run_test)
+            if self._manual is not None:
+                self.ed_pattern.textChanged.connect(self._run_test)
+                self.ed_type.currentIndexChanged.connect(self._run_test)
+            else:
+                self.ed_patterns.textChanged.connect(self._run_test)
+                self.ed_values.textChanged.connect(self._run_test)
+
+        def _manual_value(self) -> Tuple[str, str]:
+            return self.ed_type.currentData(), self.ed_pattern.text().strip()
+
+        @staticmethod
+        def _lines(box) -> List[str]:
+            return [ln for ln in box.toPlainText().splitlines() if ln.strip()]
+
+        def _build(self) -> dict:
+            manual = self._manual is not None
+            return build_edited_raw(
+                self.base_raw, entity=self.ed_entity.currentText().strip(),
+                score=round(self.ed_score.value(), 2), case_sensitive=self.ed_case.isChecked(),
+                manual=self._manual_value() if manual else None,
+                patterns=[] if manual else self._lines(self.ed_patterns),
+                values=[] if manual else self._lines(self.ed_values))
+
+        def _run_test(self, *_):
+            text = self.ed_sample.toPlainText()
+            flags = 0 if self.ed_case.isChecked() else re.IGNORECASE
+            try:
+                if self._manual is not None:
+                    mt, pat = self._manual_value()
+                    pats = [ManualRule(mt, pat, "X", not self.ed_case.isChecked()).compile()] if pat else []
+                else:
+                    pats = [re.compile(rx, flags) for rx in self._lines(self.ed_patterns)]
+                    pats += [re.compile(literal_to_regex(v), flags) for v in self._lines(self.ed_values)]
+            except re.error as exc:
+                self.ed_result.setText(f"Regex error: {exc}")
+                return
+            found = [m.group(0) for rx in pats for m in rx.finditer(text) if m.group(0)]
+            self.ed_result.setText(", ".join(found) if found else "No match")
+
+        def _save(self):
+            try:
+                save_rule(self.rules_root, self.rule, self._build())
+            except RuleError as exc:
+                QtWidgets.QMessageBox.warning(self, "Save rule", str(exc))
+                return
+            self.accept()
+
     class SettingsDialog(QtWidgets.QDialog):
         def __init__(self, parent, config: AppConfig, engine: DetectionEngine):
             super().__init__(parent)

@@ -1016,5 +1016,126 @@ recognizers:
         self.assertEqual([x["name"] for x in self.recs(self.saved)][-1], "manual_new")
 
 
+class RuleEditTests(unittest.TestCase):
+    def test_build_edited_raw_manual_renames(self):
+        base = ps.ManualRule("wildcard", "*contoso*", "ORGANIZATION").to_rule_yaml()
+        new = ps.build_edited_raw(base, entity="ORGANIZATION", score=0.95, case_sensitive=False,
+                                  manual=("wildcard", "*contoso-labs*"))
+        self.assertEqual(new["name"], ps.ManualRule("wildcard", "*contoso-labs*", "ORGANIZATION").rule_name)
+
+    def test_build_edited_raw_manual_keeps_enabled(self):
+        base = dict(ps.ManualRule("exact", "contoso", "ORGANIZATION").to_rule_yaml(), enabled=False)
+        new = ps.build_edited_raw(base, entity="ORGANIZATION", score=0.8, case_sensitive=True,
+                                  manual=("exact", "contoso"))
+        self.assertIs(new["enabled"], False)
+        self.assertEqual(new["score"], 0.8)
+        self.assertTrue(new["case_sensitive"])
+
+    def test_build_edited_raw_keeps_unshown_fields(self):
+        base = {"name": "n", "entity": "HOSTNAME", "context": ["host"], "validator": "luhn",
+                "patterns": [{"name": "p1", "regex": r"\bcontoso\b", "score": 0.7}]}
+        new = ps.build_edited_raw(base, entity="HOSTNAME", score=0.9, case_sensitive=False,
+                                  patterns=[r"\bcontoso\b", r"\bexample\b"])
+        self.assertEqual(new["context"], ["host"])
+        self.assertEqual(new["validator"], "luhn")
+        self.assertEqual(new["patterns"][0], {"name": "p1", "regex": r"\bcontoso\b", "score": 0.7})
+        self.assertEqual(new["patterns"][1], r"\bexample\b")
+        self.assertNotIn("deny_list", new)
+
+    def test_build_edited_raw_values_and_input_untouched(self):
+        base = {"name": "n", "entity": "ORG", "deny_list": ["old"]}
+        new = ps.build_edited_raw(base, entity="ORG", score=0.9, case_sensitive=False,
+                                  values=["contoso", "example"])
+        self.assertEqual(new["deny_list"], ["contoso", "example"])
+        self.assertEqual(base["deny_list"], ["old"])
+        gone = ps.build_edited_raw(base, entity="ORG", score=0.9, case_sensitive=False)
+        self.assertNotIn("deny_list", gone)
+
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not available")
+class RulesManagerGuiTests(unittest.TestCase):
+    REMOTE = "recognizers:\n  - name: remote_one\n    entity: HOSTNAME\n    patterns: ['\\bcontoso-\\w+\\b']\n" \
+             "  - name: remote_wl\n    entity: ORG\n    wordlist: ../wl.txt\n"
+
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "rules"
+        (self.root / "remote").mkdir(parents=True)
+        (self.root / "local").mkdir()
+        (self.root / "wl.txt").write_text("contoso\nexample\n", "utf-8")
+        (self.root / "remote/x.yaml").write_text(self.REMOTE, "utf-8")
+        self.saved = self.root / "local/promoted_rules.yaml"
+        ps.append_rule_to_file(self.saved, ps.ManualRule("wildcard", "*contoso*", "HOSTNAME").to_rule_yaml())
+        ps.append_rule_to_file(self.saved, {"name": "plain", "entity": "HOSTNAME",
+                                            "patterns": [r"\bcontoso-\d+\b"]})
+        self.ov = self.root / "local/overrides.yaml"
+
+    def rule(self, name):
+        return next(r for r in ps.load_rules_dir(self.root).all_rules if r.name == name)
+
+    def dialog(self, name):
+        dlg = ps.RuleEditDialog(None, self.rule(name), self.root, ["HOSTNAME", "ORGANIZATION"])
+        self.addCleanup(dlg.deleteLater)
+        return dlg
+
+    def test_edit_dialog_invalid_regex_stays_open(self):
+        dlg = self.dialog("plain")
+        finished = []
+        dlg.finished.connect(finished.append)
+        before = self.saved.read_bytes()
+        dlg.ed_patterns.setPlainText("(")
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            dlg.btn_save.click()
+        warn.assert_called_once()
+        self.assertEqual(finished, [], "dialog stays open")
+        self.assertEqual(self.saved.read_bytes(), before)
+
+    def test_edit_dialog_test_box_shows_matches(self):
+        dlg = self.dialog("plain")
+        dlg.ed_patterns.setPlainText(r"\bcontoso-\d+\b")
+        dlg.ed_sample.setPlainText("host contoso-01")
+        self.assertIn("contoso-01", dlg.ed_result.text())
+        dlg.ed_sample.setPlainText("nothing here")
+        self.assertEqual(dlg.ed_result.text(), "No match")
+        dlg.ed_patterns.setPlainText("(")
+        dlg.ed_sample.setPlainText("x")
+        self.assertNotEqual(dlg.ed_result.text(), "No match")
+
+    def test_cancel_edit_copy_writes_nothing(self):
+        dlg = self.dialog("remote_one")
+        dlg.reject()
+        self.assertFalse(self.ov.exists())
+
+    def test_manual_rule_form_saves_with_new_name(self):
+        r = self.rule(ps.ManualRule("wildcard", "*contoso*", "HOSTNAME").rule_name)
+        dlg = self.dialog(r.name)
+        self.assertEqual(dlg.ed_pattern.text(), "*contoso*")
+        dlg.ed_pattern.setText("*contoso-labs*")
+        dlg.btn_save.click()
+        self.assertEqual(dlg.result(), ps.QtWidgets.QDialog.DialogCode.Accepted)
+        names = [x["name"] for x in ps.yaml.safe_load(self.saved.read_text("utf-8"))["recognizers"]]
+        self.assertIn(ps.ManualRule("wildcard", "*contoso-labs*", "HOSTNAME").rule_name, names)
+
+    def test_save_remote_copy_writes_override(self):
+        dlg = self.dialog("remote_one")
+        dlg.ed_patterns.setPlainText(r"\bexample-\w+\b")
+        dlg.btn_save.click()
+        self.assertEqual(dlg.result(), ps.QtWidgets.QDialog.DialogCode.Accepted)
+        self.assertTrue(self.ov.exists())
+
+    def test_wordlist_warning_shown(self):
+        dlg = self.dialog("remote_wl")
+        self.assertEqual(dlg.ed_values.toPlainText().splitlines(), ["contoso", "example"])
+        self.assertIn("This copy no longer follows changes to the original word list.",
+                      dlg.warning_label.text())
+        self.assertEqual(self.dialog("remote_one").warning_label.text(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
