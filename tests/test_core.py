@@ -882,6 +882,7 @@ class RuleOverrideLoaderTests(unittest.TestCase):
         self.assertEqual([r.name for r in rs.all_rules], ["ok"])
         self.assertTrue(any("bad/name!" in w for w in rs.warnings))
         self.assertTrue(any("bad/full!" in w for w in rs.warnings))
+        self.assertEqual(ps.load_rules_dir(self.root, strict=True).errors, [], "strict sync dry run passes")
 
     def test_enabled_marker_with_invalid_name_is_still_an_error(self):
         self._write("local/h.yaml", "recognizers:\n  - {name: 'bad/name!', enabled: true}\n")
