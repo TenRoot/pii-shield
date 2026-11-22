@@ -735,5 +735,18 @@ class MainWindowGuiTests(unittest.TestCase):
         self.assertEqual(sorted(clip.text().split("\n")), ["10.20.30.40", "SRV-DC01"])
 
 
+class RuleDetailsTests(unittest.TestCase):
+    def test_promoted_rule_keeps_original_pattern(self):
+        rule = ps.ManualRule("wildcard", "*contoso*", "PERSON").to_rule_yaml()
+        self.assertEqual(rule["description"], "Promoted from manual wildcard rule: *contoso*")
+
+    def test_details_show_description_regex_and_values(self):
+        r = ps.RuleDef(name="n", entity="E", description="d",
+                       patterns=[ps.PatternDef("p", r"\bx\b", 0.9)],
+                       deny_list=["a", "b", "c"], json_keys=["pw"], json_key_contains=["token"])
+        self.assertEqual(ps.rule_details(r, max_values=2),
+                         ["d", "values: a, b (+1 more)", r"regex: \bx\b", "json keys: pw, *token*"])
+
+
 if __name__ == "__main__":
     unittest.main()

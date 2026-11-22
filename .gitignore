@@ -3,3 +3,4 @@ __pycache__/
 config.json
 backups/
 rules/remote/
+rules/local/promoted_rules.yaml

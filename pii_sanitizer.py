@@ -1224,13 +1224,27 @@ class ManualRule:
         name = f"manual_{self.entity.lower()}_{hashlib.sha1(self.pattern.encode()).hexdigest()[:8]}"
         rule = {"name": name, "entity": self.entity, "score": 0.95,
                 "case_sensitive": not self.case_insensitive,
-                "description": f"Promoted from manual {self.match_type} rule"}
+                "description": f"Promoted from manual {self.match_type} rule: {self.pattern}"}
         if self.match_type == "exact":
             rule["deny_list"] = [self.pattern]
         else:
             rx = wildcard_to_regex(self.pattern) if self.match_type == "wildcard" else self.pattern
             rule["patterns"] = [{"name": name, "regex": rx, "score": 0.95}]
         return rule
+
+
+def rule_details(rule: RuleDef, max_values: int = 5) -> List[str]:
+    """Lines that tell a person what a loaded rule matches (for the Loaded Rules window)."""
+    out = [rule.description] if rule.description else []
+    if rule.deny_list:
+        shown = ", ".join(rule.deny_list[:max_values])
+        more = len(rule.deny_list) - max_values
+        out.append(f"values: {shown}" + (f" (+{more} more)" if more > 0 else ""))
+    out += [f"regex: {p.regex}" for p in rule.patterns]
+    keys = rule.json_keys + [f"*{k}*" for k in rule.json_key_contains]
+    if keys:
+        out.append("json keys: " + ", ".join(keys))
+    return out
 
 
 @dataclass
@@ -3819,7 +3833,9 @@ if QT_OK:
             rs = self.engine.ruleset
             lines = [f"Loaded {len(rs.rules)} recognizers ({rs.pattern_count} patterns/wordlists) "
                      f"from {len(rs.files)} files; allow-list: {len(rs.allow_list)} values.", ""]
-            lines += [f"  {r.entity:<22} {r.name}  [{r.source_file}]" for r in rs.rules]
+            for r in rs.rules:
+                lines.append(f"  {r.entity:<22} {r.name}  [{r.source_file}]")
+                lines += [" " * 27 + d for d in rule_details(r)]
             if rs.errors:
                 lines += ["", "ERRORS (file skipped):"] + ["  " + e for e in rs.errors]
             if rs.warnings:
