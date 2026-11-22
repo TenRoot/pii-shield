@@ -10,6 +10,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import pii_sanitizer as ps  # noqa: E402
+try:
+    from PyQt6 import sip  # noqa: E402
+except ImportError:  # pragma: no cover
+    sip = None
 
 TEMPLATE_RULES = HERE.parent / "github-repo-template" / "rules"
 
@@ -848,6 +852,41 @@ class RuleOverrideLoaderTests(unittest.TestCase):
         rs = self._load()
         self.assertEqual(next(r for r in rs.rules if r.name == "dup").source_file, "local/overrides.yaml")
 
+    def test_disabled_full_local_rule_switches_off_bundled_and_remote_rule(self):
+        bundled = {"b.yaml": "recognizers:\n  - {name: from_bundled, entity: HOSTNAME, patterns: ['\\bexample-\\w+\\b']}\n"}
+        self._write("remote/r.yaml", self.HOSTS)
+        self._write("local/mine.yaml", """recognizers:
+  - {name: from_bundled, entity: HOSTNAME, enabled: false, patterns: ['\\bfabrikam-\\w+\\b']}
+  - {name: Contoso Hosts.v2, entity: HOSTNAME, enabled: false, patterns: ['\\bfabrikam-\\w+\\b']}
+""")
+        with mock.patch.object(ps, "BUNDLED_RULES", bundled):
+            rs = ps.load_rules_dir(self.root, bundled=True)
+        active = [r.name for r in rs.rules]
+        for name, was in (("from_bundled", "bundled/b.yaml"), ("Contoso Hosts.v2", "remote/r.yaml")):
+            self.assertNotIn(name, active)
+            r = next(r for r in rs.all_rules if r.name == name)
+            self.assertFalse(r.enabled)
+            self.assertFalse(r.is_marker)
+            self.assertIsNotNone(r.overrides)
+            self.assertEqual(r.overrides.source_file, was)
+
+    def test_disabled_entry_with_invalid_name_is_skipped_with_warning(self):
+        self._write("local/h.yaml", """recognizers:
+  - {name: 'bad/name!', enabled: false}
+  - {name: 'bad/full!', entity: HOSTNAME, enabled: false, patterns: ['\\bfabrikam\\b']}
+  - {name: ok, entity: HOSTNAME, patterns: ['\\bcontoso\\b']}
+""")
+        rs = self._load()
+        self.assertEqual(rs.errors, [])
+        self.assertIn("ok", [r.name for r in rs.rules])
+        self.assertEqual([r.name for r in rs.all_rules], ["ok"])
+        self.assertTrue(any("bad/name!" in w for w in rs.warnings))
+        self.assertTrue(any("bad/full!" in w for w in rs.warnings))
+
+    def test_enabled_marker_with_invalid_name_is_still_an_error(self):
+        self._write("local/h.yaml", "recognizers:\n  - {name: 'bad/name!', enabled: true}\n")
+        self.assertTrue(self._load().errors)
+
     def test_full_copy_records_what_it_replaced(self):
         self._write("remote/c.yaml", self.HOSTS.replace("Contoso Hosts.v2", "c"))
         self._write("local/overrides.yaml", self.HOSTS.replace("Contoso Hosts.v2", "c").replace("HOSTNAME", "ORG"))
@@ -1015,6 +1054,138 @@ recognizers:
         ps.append_rule_to_file(self.saved, {"name": "manual_new", "entity": "ORG", "deny_list": ["example"]})
         self.assertEqual([x["name"] for x in self.recs(self.saved)][-1], "manual_new")
 
+    # ---- toggles decide from the file entry, not from a stale RuleDef
+    def test_stale_remote_ruledef_toggle_keeps_edited_copy(self):
+        stale = self.rule("remote_one")
+        c = ps.override_copy(stale)
+        c["patterns"] = ["\\bfabrikam-\\w+\\b"]
+        ps.save_rule(self.root, stale, c)
+        ps.set_rule_enabled(self.root, stale, False)
+        recs = self.recs(self.ov)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["patterns"], ["\\bfabrikam-\\w+\\b"])
+        self.assertIs(recs[0]["enabled"], False)
+
+    def test_stale_marker_ruledef_toggle_back_keeps_edited_copy(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        marker = self.rule("remote_one")
+        ps.save_rule(self.root, marker, {**ps.override_copy(marker), "patterns": ["\\bfabrikam-\\w+\\b"]})
+        ps.set_rule_enabled(self.root, marker, True)
+        recs = self.recs(self.ov)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["patterns"], ["\\bfabrikam-\\w+\\b"])
+        self.assertIs(recs[0]["enabled"], True)
+
+    def test_toggle_to_original_state_writes_no_marker(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), True)
+        self.assertEqual(self.recs(self.ov) if self.ov.exists() else [], [])
+
+    def test_stale_override_ruledef_after_restore_writes_marker(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        marker = self.rule("remote_one")
+        ps.restore_original(self.root, marker)
+        ps.set_rule_enabled(self.root, marker, False)
+        self.assertEqual(self.recs(self.ov), [{"name": "remote_one", "enabled": False}])
+
+    def test_remote_rule_over_disabled_bundled_rule_gets_marker(self):
+        bundled = {"b.yaml": "recognizers:\n  - {name: remote_one, entity: HOSTNAME, enabled: false, "
+                             "patterns: ['\\bexample-\\w+\\b']}\n"}
+        with mock.patch.object(ps, "BUNDLED_RULES", bundled):
+            r = next(r for r in ps.load_rules_dir(self.root, bundled=True).all_rules if r.name == "remote_one")
+            self.assertEqual(ps.rule_kind(r), "remote")
+            ps.set_rule_enabled(self.root, r, False)
+            self.assertNotIn("remote_one", [x.name for x in ps.load_rules_dir(self.root, bundled=True).rules])
+        self.assertEqual(self.recs(self.ov), [{"name": "remote_one", "enabled": False}])
+
+    # ---- a bad edit of a disabled rule is refused
+    def test_save_disabled_rule_with_bad_regex_refused(self):
+        ps.set_rule_enabled(self.root, self.rule("manual_hostname_x"), False)
+        r = self.rule("manual_hostname_x")
+        before = self.saved.read_bytes()
+        with self.assertRaises(ps.RuleError):
+            ps.save_rule(self.root, r, {**r.raw, "patterns": ["("]})
+        self.assertEqual(self.saved.read_bytes(), before)
+
+    def test_save_disabled_marker_copy_with_bad_regex_refused(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        m = self.rule("remote_one")
+        before = self.ov.read_bytes()
+        with self.assertRaises(ps.RuleError):
+            ps.save_rule(self.root, m, {**ps.override_copy(m), "patterns": ["("]})
+        self.assertEqual(self.ov.read_bytes(), before)
+
+    def test_toggle_still_accepts_disabled_broken_entry(self):
+        self.saved.write_text(self.SAVED + "  - {name: broken_off, entity: ORG, enabled: false, patterns: ['(']}\n",
+                              "utf-8")
+        ps.set_rule_enabled(self.root, self.rule("manual_org_y"), False)
+        self.assertEqual([r["name"] for r in self.recs(self.saved)][-1], "broken_off")
+
+    # ---- write failures
+    def test_os_error_on_replace_raises_rule_error_and_keeps_file(self):
+        before = self.saved.read_bytes()
+        with mock.patch.object(ps.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(ps.RuleError) as cm:
+                ps.set_rule_enabled(self.root, self.rule("manual_org_y"), False)
+        self.assertIn("cannot write", str(cm.exception))
+        self.assertEqual(self.saved.read_bytes(), before)
+        self.assertFalse(self.saved.with_suffix(".tmp").exists())
+
+
+class ReloadLockTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.tmp / "rules" / "local").mkdir(parents=True)
+        self.engine = ps.DetectionEngine(ps.AppConfig(self.tmp / "config.json"), self.tmp / "rules")
+
+    def _blocking_loader(self, gate, started):
+        results = []
+
+        def fake(root, strict=False, bundled=False):
+            rs = ps.RuleSet()
+            results.append(rs)
+            started.set()
+            if len(results) == 1:
+                gate.wait(5)
+            return rs
+        return fake, results
+
+    def test_concurrent_reloads_run_one_at_a_time(self):
+        import threading
+        gate, started = threading.Event(), threading.Event()
+        fake, results = self._blocking_loader(gate, started)
+        with mock.patch.object(ps, "load_rules_dir", side_effect=fake), mock.patch.object(ps, "PRESIDIO_OK", False):
+            a = threading.Thread(target=self.engine.reload_rules, daemon=True)
+            a.start()
+            self.assertTrue(started.wait(5))
+            b = threading.Thread(target=self.engine.reload_rules, daemon=True)
+            b.start()
+            b.join(0.3)
+            self.assertEqual(len(results), 1, "second reload waits for the first")
+            gate.set()
+            a.join(5)
+            b.join(5)
+        self.assertEqual(len(results), 2)
+        self.assertIs(self.engine.ruleset, results[1], "the newest ruleset is assigned last")
+
+    def test_initialize_during_reload_does_not_deadlock(self):
+        import threading
+        gate, started = threading.Event(), threading.Event()
+        fake, results = self._blocking_loader(gate, started)
+        with mock.patch.object(ps, "load_rules_dir", side_effect=fake), mock.patch.object(ps, "PRESIDIO_OK", False):
+            a = threading.Thread(target=self.engine.reload_rules, daemon=True)
+            a.start()
+            self.assertTrue(started.wait(5))
+            b = threading.Thread(target=self.engine.initialize, daemon=True)
+            b.start()
+            b.join(0.3)
+            gate.set()
+            a.join(5)
+            b.join(5)
+            self.assertFalse(a.is_alive() or b.is_alive(), "deadlock")
+        self.assertEqual(self.engine.mode, "lite")
+        self.assertIs(self.engine.ruleset, results[-1])
+
 
 class RuleEditTests(unittest.TestCase):
     def test_build_edited_raw_manual_renames(self):
@@ -1057,6 +1228,12 @@ class RuleEditTests(unittest.TestCase):
         self.assertEqual(base["deny_list"], ["old"])
         gone = ps.build_edited_raw(base, entity="ORG", score=0.9, case_sensitive=False)
         self.assertNotIn("deny_list", gone)
+
+    def test_build_edited_raw_scalar_pattern_mapping_is_kept(self):
+        base = {"name": "n", "entity": "HOSTNAME", "patterns": {"name": "p1", "regex": r"\bcontoso\b", "score": 0.7}}
+        new = ps.build_edited_raw(base, entity="HOSTNAME", score=0.9, case_sensitive=False,
+                                  patterns=[r"\bcontoso\b"])
+        self.assertEqual(new["patterns"], [{"name": "p1", "regex": r"\bcontoso\b", "score": 0.7}])
 
 
 @unittest.skipUnless(ps.QT_OK, "PyQt6 not available")
@@ -1144,6 +1321,13 @@ class RulesManagerGuiTests(unittest.TestCase):
         self.assertEqual(dlg.result(), ps.QtWidgets.QDialog.DialogCode.Accepted)
         self.assertTrue(self.ov.exists())
 
+    def test_edit_dialog_scalar_patterns_and_values(self):
+        ps.append_rule_to_file(self.saved, {"name": "scalar_one", "entity": "HOSTNAME",
+                                            "patterns": r"\bcontoso-\d+\b", "deny_list": "fabrikam"})
+        dlg = self.dialog("scalar_one")
+        self.assertEqual(dlg.ed_patterns.toPlainText(), r"\bcontoso-\d+\b")
+        self.assertEqual(dlg.ed_values.toPlainText(), "fabrikam")
+
     def test_wordlist_warning_shown(self):
         dlg = self.dialog("remote_wl")
         self.assertEqual(dlg.ed_values.toPlainText().splitlines(), ["contoso", "example"])
@@ -1155,7 +1339,7 @@ class RulesManagerGuiTests(unittest.TestCase):
     BUNDLED = {"b.yaml": "version: 1\nrecognizers:\n  - name: bundled_one\n    entity: HOSTNAME\n"
                          "    patterns: ['\\bexample-\\w+\\b']\n"}
 
-    def window(self):
+    def window(self, ready=True):
         patcher = mock.patch.object(ps, "BUNDLED_RULES", self.BUNDLED)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1163,6 +1347,8 @@ class RulesManagerGuiTests(unittest.TestCase):
             w = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
         self.addCleanup(w.deleteLater)
         w.engine.rules_root = self.root
+        if ready:
+            w.engine.mode = "lite"      # as after initialize(); _start_engine is patched out
         return w
 
     def manager(self, w):
@@ -1170,7 +1356,7 @@ class RulesManagerGuiTests(unittest.TestCase):
             w.show_rule_report()
         ex.assert_called_once()
         dlg = w._rules_manager
-        self.addCleanup(dlg.deleteLater)
+        self.addCleanup(lambda: None if sip.isdeleted(dlg) else dlg.deleteLater())
         return dlg
 
     def row_of(self, dlg, name):
@@ -1292,13 +1478,50 @@ class RulesManagerGuiTests(unittest.TestCase):
         self.assertEqual(dlg.table.item(self.row_of(dlg, "plain"), 0).checkState(), ps.Qt.CheckState.Checked)
 
     def test_open_before_engine_load(self):
-        w = self.window()
+        w = self.window(ready=False)
         self.assertEqual(w.engine.ruleset.all_rules, [])
+        with mock.patch.object(w.engine, "reload_rules") as reload:
+            dlg = self.manager(w)
+            self.assertGreater(dlg.table.rowCount(), 0)
+            row = self.row_of(dlg, "bundled_one")
+            dlg.table.item(row, 0).setCheckState(ps.Qt.CheckState.Unchecked)
+        reload.assert_not_called()
+        self.assertEqual(dlg.table.item(self.row_of(dlg, "bundled_one"), 0).checkState(),
+                         ps.Qt.CheckState.Unchecked)
+        self.assertNotIn("bundled_one", [r.name for r in dlg.ruleset.rules])
+        self.assertEqual(ps.yaml.safe_load(self.ov.read_text("utf-8"))["recognizers"],
+                         [{"name": "bundled_one", "enabled": False}])
+        self.assertIn("Re-analyze", w.statusBar().currentMessage())
+
+    def test_accepted_edit_updates_row(self):
+        w = self.window()
+        w.engine.reload_rules()
         dlg = self.manager(w)
-        self.assertGreater(dlg.table.rowCount(), 0)
-        row = self.row_of(dlg, "bundled_one")
-        dlg.table.item(row, 0).setCheckState(ps.Qt.CheckState.Unchecked)
-        self.assertNotIn("bundled_one", [r.name for r in w.engine.ruleset.rules])
+
+        def fake_exec(edit):
+            edit.ed_patterns.setPlainText(r"\bfabrikam-\d+\b")
+            edit.btn_save.click()
+            return edit.result()
+        with mock.patch.object(ps.RuleEditDialog, "exec", fake_exec):
+            self.act(dlg, "plain", "act_edit")
+        self.assertIn("fabrikam", dlg.table.item(self.row_of(dlg, "plain"), 4).text())
+        self.assertIn("Re-analyze", w.statusBar().currentMessage())
+
+    def test_reload_failure_after_write_shows_warning(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        with mock.patch.object(w.engine, "reload_rules", side_effect=RuntimeError("boom")), \
+                mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            dlg._changed()
+        warn.assert_called_once()
+
+    def test_manager_is_deleted_after_close(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        ps.QtCore.QCoreApplication.sendPostedEvents(None, ps.QtCore.QEvent.Type.DeferredDelete)
+        self.assertTrue(sip.isdeleted(dlg))
 
     def test_gui_saves_to_engine_rules_root(self):
         w = self.window()

@@ -171,7 +171,8 @@ PII Shield loads rules in three layers:
    files in subfolders.
 
 If two rules have the same `name`, the rule from the later layer is used. A local rule
-overrides a remote rule, and both override a bundled rule.
+overrides a remote rule, and both override a bundled rule. `rules/local/overrides.yaml`
+(written by the Rules manager) wins over every other rule file with the same rule name.
 
 After you change a file in `github-repo-template/rules/`, run `python tools/bundle_rules.py`
 to update the bundled copy. A test fails if the two copies differ.

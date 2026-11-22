@@ -489,9 +489,13 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
             continue
         name = str(r.get("name", "")).strip()
         src = str(path.relative_to(root)) if root in path.parents else path.name
+        name_ok = bool(name) and bool(RULE_NAME_RE.match(name))
         if is_marker_mapping(r):
-            if not name or not RULE_NAME_RE.match(name):
-                problems.append(f"{path.name}:{name or i + 1}: invalid or missing 'name'")
+            if not name_ok:
+                if not r["enabled"]:    # a disabled entry was skipped silently before: keep it harmless
+                    warnings.append(f"{path.name}:{name or i + 1}: disabled entry skipped: invalid or missing 'name'")
+                else:
+                    problems.append(f"{path.name}:{name or i + 1}: invalid or missing 'name'")
                 continue
             rules.append(RuleDef(name=name, entity="", enabled=bool(r["enabled"]), is_marker=True,
                                  source_file=src, raw=copy.deepcopy(r)))
@@ -500,7 +504,10 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
         rule_problems: List[str] = []      # a disabled rule's problems become a warning, not a file error
         entity = str(r.get("entity", r.get("supported_entity", ""))).strip().upper()
         where = f"{path.name}:{name or i + 1}"
-        if not name or not RULE_NAME_RE.match(name):
+        if not name_ok:
+            if disabled:
+                warnings.append(f"{where}: disabled entry skipped: invalid or missing 'name'")
+                continue
             rule_problems.append(f"{where}: invalid or missing 'name'")
         if not ENTITY_NAME_RE.match(entity):
             rule_problems.append(f"{where}: invalid 'entity' (use UPPER_SNAKE_CASE, e.g. HOSTNAME)")
@@ -1231,14 +1238,20 @@ def update_rule_file(path: Path, rules_root: Path, change: Callable[[List[dict]]
     doc = dict(doc)
     doc["recognizers"] = list(change(copy.deepcopy(recs)))
     parse_rule_document(doc, path, rules_root)  # raises RuleError before anything is written
-    path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
     tmp = path.with_suffix(".tmp")
     try:
-        tmp.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), "utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(text, "utf-8")
         os.replace(tmp, path)
+    except OSError as exc:
+        raise RuleError(f"{path.name}: cannot write ({exc}); file left unchanged") from exc
     finally:
-        if tmp.exists():
-            tmp.unlink()
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _upsert(recs: List[dict], entry: dict) -> List[dict]:
@@ -1273,19 +1286,26 @@ def set_rule_enabled(rules_root: Path, rule: RuleDef, enabled: bool) -> None:
                     r["enabled"] = enabled
             return recs
         update_rule_file(_saved_path(rules_root), rules_root, change)
-    elif kind == "override":
+    else:  # bundled, remote or override: decide from the overrides.yaml entry, not from `rule`,
+        # which can be stale (the entry may have become a copy, or gone, since the rules loaded).
+        if kind == "override":
+            original = rule.overrides
+        else:
+            original = rule        # its own state; rule.overrides may be a bundled rule it replaced
+        own_state = None if original is None else original.raw.get("enabled", True) is not False
+
         def change(recs):
-            for i, r in enumerate(recs):
-                if isinstance(r, dict) and r.get("name") == rule.name:
-                    if rule.is_marker and rule.overrides is not None \
-                            and enabled == rule.overrides.raw.get("enabled", True):
-                        return _without(recs, rule.name)
-                    r["enabled"] = enabled
+            entries = [r for r in recs if isinstance(r, dict) and r.get("name") == rule.name]
+            if not entries:
+                if own_state is None or enabled == own_state:
+                    return recs        # a marker would change nothing
+                return recs + [{"name": rule.name, "enabled": enabled}]
+            if own_state is not None and enabled == own_state and all(is_marker_mapping(r) for r in entries):
+                return _without(recs, rule.name)
+            for r in entries:
+                r["enabled"] = enabled    # keeps the user's edits in a copy
             return recs
         update_rule_file(_overrides_path(rules_root), rules_root, change)
-    else:  # bundled or remote: a marker that switches the rule
-        update_rule_file(_overrides_path(rules_root), rules_root,
-                         lambda recs: _upsert(recs, {"name": rule.name, "enabled": enabled}))
 
 
 def override_copy(rule: RuleDef) -> dict:
@@ -1310,6 +1330,13 @@ def save_rule(rules_root: Path, rule: RuleDef, new_raw: dict) -> None:
     new_raw = copy.deepcopy(new_raw)
     if kind in ("saved", "override") and not rule.is_marker:
         path = _saved_path(rules_root) if kind == "saved" else _overrides_path(rules_root)
+    else:
+        path = _overrides_path(rules_root)
+        new_raw["name"] = rule.name
+    # An edit must be a working rule even when it is off: parse_rule_document only warns about a
+    # disabled rule's problems, so check the entry as if it were on. Raises before any write.
+    parse_rule_document({"recognizers": [{**new_raw, "enabled": True}]}, path, Path(rules_root))
+    if kind in ("saved", "override") and not rule.is_marker:
         new_name = new_raw.get("name", rule.name)
         if new_name != rule.name and kind == "override":
             raise RuleError("a copy of a rule must keep the name of the rule it replaces")
@@ -1324,8 +1351,7 @@ def save_rule(rules_root: Path, rule: RuleDef, new_raw: dict) -> None:
             raise RuleError(f"rule '{rule.name}' not found in {path.name}")
         update_rule_file(path, rules_root, change)
     else:  # bundled, remote or marker: write the edited copy to overrides.yaml
-        new_raw["name"] = rule.name
-        update_rule_file(_overrides_path(rules_root), rules_root, lambda recs: _upsert(recs, new_raw))
+        update_rule_file(path, rules_root, lambda recs: _upsert(recs, new_raw))
 
 
 def build_edited_raw(base_raw: dict, *, entity: str, score: float, case_sensitive: bool,
@@ -1344,7 +1370,7 @@ def build_edited_raw(base_raw: dict, *, entity: str, score: float, case_sensitiv
     out = copy.deepcopy(base_raw)
     out["entity"], out["score"], out["case_sensitive"] = entity, score, case_sensitive
     kept = {}
-    for item in base_raw.get("patterns") or []:
+    for item in _as_list(base_raw.get("patterns")):
         if isinstance(item, dict) and isinstance(item.get("regex"), str):
             kept.setdefault(item["regex"], copy.deepcopy(item))
     if patterns:
@@ -1492,7 +1518,7 @@ def manual_source(rule: RuleDef) -> Optional[Tuple[str, str]]:
 
 
 def rule_details(rule: RuleDef, max_values: int = 5) -> List[str]:
-    """Lines that tell a person what a loaded rule matches (for the Loaded Rules window)."""
+    """Lines that tell a person what a loaded rule matches (for the Rules manager window)."""
     out = [rule.description] if rule.description else []
     src = manual_source(rule)
     if src:
@@ -1870,6 +1896,9 @@ class DetectionEngine:
         self.config = config
         self.rules_root = rules_root
         self.lock = threading.RLock()
+        # Serializes reload_rules() so an older ruleset can never be assigned after a newer one.
+        # Lock order: _reload_lock before lock (initialize() follows it too).
+        self._reload_lock = threading.Lock()
         self.nlp_engine = None
         self.analyzer = None
         self.model_name: Optional[str] = None
@@ -1878,13 +1907,19 @@ class DetectionEngine:
         self.builtin_supported: List[str] = []
         self.last_ner_skipped = False     # True when the last analyze() dropped NER findings on log input
 
+    @property
+    def ready(self) -> bool:
+        """True once initialize() has picked a mode. Before that, reload_rules() can block on the
+        model load, so the GUI thread must not call it."""
+        return self.mode != "uninitialized"
+
     # ---- lifecycle
     def initialize(self, progress: Callable[[str], None] = lambda s: None) -> str:
-        with self.lock:
+        with self._reload_lock, self.lock:
             if not PRESIDIO_OK:
                 self.mode = "lite"
                 progress(f"Presidio not available ({PRESIDIO_ERR}); regex-only lite mode")
-                self.reload_rules()
+                self._reload_rules_locked()
                 return self.mode
             ecfg = self.config["engine"]
             wanted = ecfg.get("spacy_model") or "en_core_web_lg"
@@ -1923,7 +1958,7 @@ class DetectionEngine:
                 self.mode = "presidio-regex-only"
                 progress("No spaCy model installed - NER (names/locations) disabled. "
                          "Run: python -m spacy download en_core_web_lg")
-            self.reload_rules()
+            self._reload_rules_locked()
             return self.mode
 
     def _build_registry(self, rs: RuleSet):
@@ -1955,7 +1990,12 @@ class DetectionEngine:
         return rs
 
     def reload_rules(self) -> RuleSet:
-        """Hot reload: re-read rule files and atomically swap the analyzer."""
+        """Hot reload: re-read rule files and atomically swap the analyzer. One reload at a time."""
+        with self._reload_lock:
+            return self._reload_rules_locked()
+
+    def _reload_rules_locked(self) -> RuleSet:
+        """reload_rules() body; the caller holds _reload_lock."""
         rs = load_rules_dir(self.rules_root, bundled=True)
         if PRESIDIO_OK and self.nlp_engine is not None:
             registry = self._build_registry(rs)
@@ -3377,14 +3417,14 @@ if QT_OK:
                 form.addRow("", self.name_hint)
             else:
                 pats = []
-                for item in self.base_raw.get("patterns") or []:
+                for item in _as_list(self.base_raw.get("patterns")):
                     rx = item.get("regex") if isinstance(item, dict) else item
                     if isinstance(rx, str):
                         pats.append(rx)
                 self.ed_patterns = _text_box("One regular expression per line")
                 self.ed_patterns.setPlainText("\n".join(pats))
                 self.ed_values = _text_box("One exact value per line")
-                self.ed_values.setPlainText("\n".join(str(v) for v in self.base_raw.get("deny_list") or []))
+                self.ed_values.setPlainText("\n".join(str(v) for v in _as_list(self.base_raw.get("deny_list"))))
                 form.addRow("Patterns", self.ed_patterns)
                 form.addRow("Values", self.ed_values)
             self.ed_sample = _text_box("Type sample text to test the rule")
@@ -3471,8 +3511,14 @@ if QT_OK:
             self.resize(980, 560)
             self._rows: List[RuleDef] = []
             engine = parent.engine
-            if not engine.ruleset.all_rules and not engine.ruleset.files:
-                parent._update_rules_badge(engine.reload_rules())   # engine not loaded yet
+            if not engine.ready:
+                # The engine is still loading its model; reload_rules() would block the GUI.
+                # Show the files from disk; the engine reads them itself when it is ready.
+                self.ruleset = load_rules_dir(engine.rules_root, bundled=True)
+            else:
+                if not engine.ruleset.all_rules and not engine.ruleset.files:
+                    parent._update_rules_badge(engine.reload_rules())
+                self.ruleset = engine.ruleset
 
             self.filter_text = QtWidgets.QLineEdit()
             self.filter_text.setPlaceholderText("Filter by entity, name or matches")
@@ -3526,7 +3572,7 @@ if QT_OK:
             return text + {"changed": " (original changed)", "removed": " (original removed)"}.get(status, "")
 
         def refresh(self):
-            rs = self.win.engine.ruleset
+            rs = self.ruleset
             needle = self.filter_text.text().strip().casefold()
             want = self.filter_source.currentText()
             self._rows = []
@@ -3589,8 +3635,18 @@ if QT_OK:
 
         def _changed(self):
             """Reload the rules after a write, then refresh the table and the chip."""
-            rs = self.win.engine.reload_rules()
-            self.win._update_rules_badge(rs)
+            engine = self.win.engine
+            try:
+                if engine.ready:
+                    self.ruleset = engine.reload_rules()
+                    self.win._update_rules_badge(self.ruleset)
+                else:       # display only; the engine loads the new files when it is ready
+                    self.ruleset = load_rules_dir(engine.rules_root, bundled=True)
+            except Exception as exc:    # an exception in a Qt slot would abort the app
+                log.exception("rules reload after a change failed")
+                QtWidgets.QMessageBox.warning(self, "Rules", f"The change was saved, but reloading the rules "
+                                              f"failed: {exc.__class__.__name__}: {exc}")
+                return
             self.refresh()
             self.win.statusBar().showMessage(self.CHANGED_MSG)
 
@@ -4400,6 +4456,7 @@ if QT_OK:
         def show_rule_report(self):
             self._rules_manager = RulesManagerDialog(self)
             self._rules_manager.exec()
+            self._rules_manager.deleteLater()   # one window per open; free it after it closes
 
         def open_sync(self):
             dlg = SyncDialog(self, self.config, self.secrets, self.engine)
@@ -4724,9 +4781,15 @@ if QT_OK:
                         f.enabled = False
                 self.reload_rules()
             elif act is a_rule:
-                for f in sel:
-                    mr = ManualRule("exact", f.text, f.entity, True)
-                    append_rule_to_file(self.engine.rules_root / "local" / SAVED_RULES_FILE_NAME, mr.to_rule_yaml())
+                try:
+                    for f in sel:
+                        mr = ManualRule("exact", f.text, f.entity, True)
+                        append_rule_to_file(self.engine.rules_root / "local" / SAVED_RULES_FILE_NAME,
+                                            mr.to_rule_yaml())
+                except RuleError as exc:
+                    self.reload_rules()     # load any rules saved before the failure
+                    QtWidgets.QMessageBox.warning(self, "Save as rule", str(exc))
+                    return
                 self.reload_rules()
                 self.statusBar().showMessage(f"Saved {len(sel)} rule(s) to {MANUAL_RULES_FILE.name}", 5000)
                 return
