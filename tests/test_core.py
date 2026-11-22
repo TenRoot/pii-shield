@@ -1151,6 +1151,165 @@ class RulesManagerGuiTests(unittest.TestCase):
                       dlg.warning_label.text())
         self.assertEqual(self.dialog("remote_one").warning_label.text(), "")
 
+    # ---- rules manager window
+    BUNDLED = {"b.yaml": "version: 1\nrecognizers:\n  - name: bundled_one\n    entity: HOSTNAME\n"
+                         "    patterns: ['\\bexample-\\w+\\b']\n"}
+
+    def window(self):
+        patcher = mock.patch.object(ps, "BUNDLED_RULES", self.BUNDLED)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with mock.patch.object(ps.MainWindow, "_start_engine"):
+            w = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
+        self.addCleanup(w.deleteLater)
+        w.engine.rules_root = self.root
+        return w
+
+    def manager(self, w):
+        with mock.patch.object(ps.QtWidgets.QDialog, "exec", return_value=0) as ex:
+            w.show_rule_report()
+        ex.assert_called_once()
+        dlg = w._rules_manager
+        self.addCleanup(dlg.deleteLater)
+        return dlg
+
+    def row_of(self, dlg, name):
+        for r in range(dlg.table.rowCount()):
+            if dlg.table.item(r, 2).text() == name:
+                return r
+        self.fail(f"no row {name}")
+
+    def act(self, dlg, name, button):
+        dlg.table.cellWidget(self.row_of(dlg, name), 5).findChild(ps.QtWidgets.QPushButton, button).click()
+
+    def test_chip_opens_manager(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        self.assertIsInstance(dlg, ps.RulesManagerDialog)
+        self.assertEqual(dlg.table.rowCount(), len(w.engine.ruleset.all_rules))
+        self.assertEqual([dlg.table.horizontalHeaderItem(i).text() for i in range(6)],
+                         ["On", "Entity", "Name", "Source", "Matches", "Actions"])
+
+    def test_uncheck_bundled_rule_drops_active_count(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        before = len(w.engine.ruleset.rules)
+        row = self.row_of(dlg, "bundled_one")
+        self.assertEqual(dlg.table.item(row, 3).text(), "bundled")
+        dlg.table.item(row, 0).setCheckState(ps.Qt.CheckState.Unchecked)
+        self.assertEqual(len(w.engine.ruleset.rules), before - 1)
+        self.assertIn("Re-analyze", w.statusBar().currentMessage())
+        self.assertTrue(self.ov.exists())
+
+    def test_hand_edited_row_is_read_only(self):
+        (self.root / "local/mine.yaml").write_text(
+            "recognizers:\n  - name: hand_one\n    entity: ORG\n    patterns: ['\\bfabrikam\\b']\n", "utf-8")
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        row = self.row_of(dlg, "hand_one")
+        item = dlg.table.item(row, 0)
+        self.assertFalse(item.flags() & ps.Qt.ItemFlag.ItemIsEnabled)
+        self.assertIn("Edit this file by hand", item.toolTip())
+        self.assertIsNone(dlg.table.cellWidget(row, 5))
+
+    def test_delete_saved_rule_after_confirm(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        yes = ps.QtWidgets.QMessageBox.StandardButton.Yes
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=yes):
+            self.act(dlg, "plain", "act_delete")
+        self.assertNotIn("plain", [r.name for r in w.engine.ruleset.all_rules])
+        self.assertNotIn("plain", [dlg.table.item(r, 2).text() for r in range(dlg.table.rowCount())])
+        self.assertIn("Re-analyze", w.statusBar().currentMessage())
+
+    def test_delete_declined_changes_nothing(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        before = self.saved.read_bytes()
+        no = ps.QtWidgets.QMessageBox.StandardButton.No
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=no):
+            self.act(dlg, "plain", "act_delete")
+        self.assertEqual(self.saved.read_bytes(), before)
+
+    def test_delete_last_saved_rule_leaves_empty_list(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        yes = ps.QtWidgets.QMessageBox.StandardButton.Yes
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=yes):
+            for name in [r.name for r in w.engine.ruleset.all_rules if ps.rule_kind(r) == "saved"]:
+                self.act(dlg, name, "act_delete")
+        self.assertIn("recognizers: []", self.saved.read_text("utf-8"))
+
+    def test_filter_by_source(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        dlg.filter_source.setCurrentText("saved")
+        saved = [r for r in w.engine.ruleset.all_rules if ps.rule_kind(r) == "saved"]
+        self.assertEqual(dlg.table.rowCount(), len(saved))
+        dlg.filter_source.setCurrentText("All")
+        dlg.filter_text.setText("remote_one")
+        self.assertEqual(dlg.table.rowCount(), 1)
+
+    def test_edit_copy_opens_dialog(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        with mock.patch.object(ps.RuleEditDialog, "exec",
+                               return_value=ps.QtWidgets.QDialog.DialogCode.Rejected) as ex:
+            self.act(dlg, "remote_one", "act_edit")
+        ex.assert_called_once()
+        self.assertFalse(self.ov.exists())
+
+    def test_restore_original_after_confirm(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        dlg.table.item(self.row_of(dlg, "bundled_one"), 0).setCheckState(ps.Qt.CheckState.Unchecked)
+        self.assertEqual(dlg.table.item(self.row_of(dlg, "bundled_one"), 3).text(), "override of bundled")
+        yes = ps.QtWidgets.QMessageBox.StandardButton.Yes
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question", return_value=yes) as q:
+            self.act(dlg, "bundled_one", "act_restore")
+        self.assertEqual(q.call_args[0][2], "Delete your copy and use the original rule?")
+        self.assertEqual(dlg.table.item(self.row_of(dlg, "bundled_one"), 3).text(), "bundled")
+        self.assertIn("recognizers: []", self.ov.read_text("utf-8"))
+
+    def test_rule_error_shows_warning_and_changes_nothing(self):
+        w = self.window()
+        w.engine.reload_rules()
+        dlg = self.manager(w)
+        row = self.row_of(dlg, "plain")
+        with mock.patch.object(ps, "set_rule_enabled", side_effect=ps.RuleError("boom")), \
+                mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            dlg.table.item(row, 0).setCheckState(ps.Qt.CheckState.Unchecked)
+        warn.assert_called_once()
+        self.assertEqual(dlg.table.item(self.row_of(dlg, "plain"), 0).checkState(), ps.Qt.CheckState.Checked)
+
+    def test_open_before_engine_load(self):
+        w = self.window()
+        self.assertEqual(w.engine.ruleset.all_rules, [])
+        dlg = self.manager(w)
+        self.assertGreater(dlg.table.rowCount(), 0)
+        row = self.row_of(dlg, "bundled_one")
+        dlg.table.item(row, 0).setCheckState(ps.Qt.CheckState.Unchecked)
+        self.assertNotIn("bundled_one", [r.name for r in w.engine.ruleset.rules])
+
+    def test_gui_saves_to_engine_rules_root(self):
+        w = self.window()
+        w.engine.reload_rules()
+        mr = ps.ManualRule("exact", "contoso-host", "HOSTNAME", True)
+        w._selected_manual = lambda: [mr]
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "information"), \
+                mock.patch.object(ps, "append_rule_to_file") as app:
+            w.promote_manual_rules()
+        self.assertEqual(app.call_args[0][0], self.saved)
+
 
 if __name__ == "__main__":
     unittest.main()

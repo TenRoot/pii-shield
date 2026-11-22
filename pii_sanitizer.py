@@ -3456,6 +3456,181 @@ if QT_OK:
                 return
             self.accept()
 
+    class RulesManagerDialog(QtWidgets.QDialog):
+        """All rules in one table: switch on or off, edit, delete, restore. Writes only through the
+        rule file helpers; every change reloads the rules and refreshes the table."""
+
+        COLUMNS = ["On", "Entity", "Name", "Source", "Matches", "Actions"]
+        SOURCES = ["All", "saved", "override", "bundled", "remote", "hand-edited"]
+        CHANGED_MSG = "Rules changed. Re-analyze to apply them to the current text."
+
+        def __init__(self, parent):
+            super().__init__(parent)
+            self.win = parent
+            self.setWindowTitle("Rules")
+            self.resize(980, 560)
+            self._rows: List[RuleDef] = []
+            engine = parent.engine
+            if not engine.ruleset.all_rules and not engine.ruleset.files:
+                parent._update_rules_badge(engine.reload_rules())   # engine not loaded yet
+
+            self.filter_text = QtWidgets.QLineEdit()
+            self.filter_text.setPlaceholderText("Filter by entity, name or matches")
+            self.filter_text.setClearButtonEnabled(True)
+            self.filter_source = QtWidgets.QComboBox()
+            self.filter_source.addItems(self.SOURCES)
+            top = QtWidgets.QHBoxLayout()
+            top.addWidget(self.filter_text, 1)
+            top.addWidget(QtWidgets.QLabel("Source"))
+            top.addWidget(self.filter_source)
+
+            self.table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+            self.table.setHorizontalHeaderLabels(self.COLUMNS)
+            self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.table.verticalHeader().setVisible(False)
+            hdr = self.table.horizontalHeader()
+            hdr.setStretchLastSection(False)
+            hdr.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeMode.Stretch)
+            for col in (0, 1, 2, 3, 5):
+                hdr.setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+            self.notes = _text_box(read_only=True)
+            self.notes.setMaximumHeight(110)
+            lay = QtWidgets.QVBoxLayout(self)
+            lay.addLayout(top)
+            lay.addWidget(self.table, 1)
+            lay.addWidget(self.notes)
+
+            self.filter_text.textChanged.connect(lambda _t: self.refresh())
+            self.filter_source.currentIndexChanged.connect(lambda _i: self.refresh())
+            self.table.itemChanged.connect(self._on_item_changed)
+            self.refresh()
+
+        @staticmethod
+        def _matches(rule: RuleDef) -> Tuple[str, str]:
+            """(cell text, tooltip) for the Matches column."""
+            lines = rule_details(rule)
+            tip = "\n".join(lines)
+            if rule.broken:
+                return "(has errors)", tip
+            body = [ln for ln in lines if ln != rule.description]
+            return (body[0] if body else ""), tip
+
+        @staticmethod
+        def _source_text(rule: RuleDef) -> str:
+            kind = rule_kind(rule)
+            if kind != "override":
+                return kind
+            text = "override" + (f" of {rule_kind(rule.overrides)}" if rule.overrides is not None else "")
+            status = override_status(rule)
+            return text + {"changed": " (original changed)", "removed": " (original removed)"}.get(status, "")
+
+        def refresh(self):
+            rs = self.win.engine.ruleset
+            needle = self.filter_text.text().strip().casefold()
+            want = self.filter_source.currentText()
+            self._rows = []
+            self.table.blockSignals(True)
+            try:
+                self.table.setRowCount(0)
+                for rule in rs.all_rules:
+                    kind = rule_kind(rule)
+                    if want != "All" and kind != want:
+                        continue
+                    match, tip = self._matches(rule)
+                    if needle and needle not in f"{rule.entity} {rule.name} {match}".casefold():
+                        continue
+                    row = self.table.rowCount()
+                    self.table.insertRow(row)
+                    self._rows.append(rule)
+                    on = QtWidgets.QTableWidgetItem()
+                    flags = Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                    if kind == "hand-edited":
+                        flags = Qt.ItemFlag.NoItemFlags
+                        on.setToolTip(f"Edit this file by hand: {rule.source_file}")
+                    on.setFlags(flags)
+                    on.setCheckState(Qt.CheckState.Checked if rule.enabled else Qt.CheckState.Unchecked)
+                    self.table.setItem(row, 0, on)
+                    for col, text in ((1, rule.entity), (2, rule.name), (3, self._source_text(rule)), (4, match)):
+                        item = QtWidgets.QTableWidgetItem(text)
+                        item.setToolTip(tip if col == 4 else
+                                        (f"Edit this file by hand: {rule.source_file}" if kind == "hand-edited" else ""))
+                        self.table.setItem(row, col, item)
+                    actions = self._action_widget(rule, kind)
+                    if actions is not None:
+                        self.table.setCellWidget(row, 5, actions)
+            finally:
+                self.table.blockSignals(False)
+            notes = []
+            if rs.errors:
+                notes += ["ERRORS (file skipped):"] + ["  " + e for e in rs.errors]
+            if rs.warnings:
+                notes += ["Warnings:"] + ["  " + w for w in rs.warnings]
+            self.notes.setPlainText("\n".join(notes))
+            self.notes.setVisible(bool(notes))
+
+        def _action_widget(self, rule: RuleDef, kind: str):
+            specs = {"saved": [("Edit", "act_edit", self._edit), ("Delete", "act_delete", self._delete)],
+                     "bundled": [("Edit copy", "act_edit", self._edit)],
+                     "remote": [("Edit copy", "act_edit", self._edit)],
+                     "override": [("Edit", "act_edit", self._edit),
+                                  ("Restore original", "act_restore", self._restore)]}.get(kind)
+            if not specs:
+                return None
+            box = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(box)
+            h.setContentsMargins(4, 0, 4, 0)
+            for label, name, fn in specs:
+                b = QtWidgets.QPushButton(label)
+                b.setObjectName(name)
+                b.clicked.connect(lambda _c=False, r=rule, f=fn: f(r))
+                h.addWidget(b)
+            return box
+
+        def _changed(self):
+            """Reload the rules after a write, then refresh the table and the chip."""
+            rs = self.win.engine.reload_rules()
+            self.win._update_rules_badge(rs)
+            self.refresh()
+            self.win.statusBar().showMessage(self.CHANGED_MSG)
+
+        def _write(self, action: Callable[[], None]) -> bool:
+            try:
+                action()
+            except RuleError as exc:
+                QtWidgets.QMessageBox.warning(self, "Rules", str(exc))
+                return False
+            self._changed()
+            return True
+
+        def _on_item_changed(self, item):
+            if item.column() != 0 or not 0 <= item.row() < len(self._rows):
+                return
+            rule = self._rows[item.row()]
+            enabled = item.checkState() == Qt.CheckState.Checked
+            if not self._write(lambda: set_rule_enabled(self.win.engine.rules_root, rule, enabled)):
+                self.refresh()      # put the checkbox back
+
+        def _edit(self, rule: RuleDef):
+            entities = [self.win.m_entity.itemText(i) for i in range(self.win.m_entity.count())]
+            dlg = RuleEditDialog(self, rule, self.win.engine.rules_root, entities)
+            if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+                self._changed()
+
+        def _confirm(self, title: str, text: str) -> bool:
+            Btn = QtWidgets.QMessageBox.StandardButton
+            return QtWidgets.QMessageBox.question(self, title, text, Btn.Yes | Btn.No, Btn.No) == Btn.Yes
+
+        def _delete(self, rule: RuleDef):
+            if self._confirm("Delete rule", f"Delete the saved rule '{rule.name}'?"):
+                self._write(lambda: delete_rule(self.win.engine.rules_root, rule))
+
+        def _restore(self, rule: RuleDef):
+            text = ("Delete your copy and use the original rule?" if rule.overrides is not None
+                    else "The original rule no longer exists. This deletes the rule.")
+            if self._confirm("Restore original", text):
+                self._write(lambda: restore_original(self.win.engine.rules_root, rule))
+
     class SettingsDialog(QtWidgets.QDialog):
         def __init__(self, parent, config: AppConfig, engine: DetectionEngine):
             super().__init__(parent)
@@ -4223,23 +4398,8 @@ if QT_OK:
             self.m_entity.setCurrentText(cur)
 
         def show_rule_report(self):
-            rs = self.engine.ruleset
-            lines = [f"Loaded {len(rs.rules)} recognizers ({rs.pattern_count} patterns/wordlists) "
-                     f"from {len(rs.files)} files; allow-list: {len(rs.allow_list)} values.", ""]
-            for r in rs.rules:
-                lines.append(f"  {r.entity:<22} {r.name}  [{r.source_file}]")
-                lines += [" " * 27 + d for d in rule_details(r)]
-            if rs.errors:
-                lines += ["", "ERRORS (file skipped):"] + ["  " + e for e in rs.errors]
-            if rs.warnings:
-                lines += ["", "Warnings:"] + ["  " + w for w in rs.warnings]
-            dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("Loaded Rules")
-            dlg.resize(760, 520)
-            box = _text_box(read_only=True)
-            box.setPlainText("\n".join(lines))
-            QtWidgets.QVBoxLayout(dlg).addWidget(box)
-            dlg.exec()
+            self._rules_manager = RulesManagerDialog(self)
+            self._rules_manager.exec()
 
         def open_sync(self):
             dlg = SyncDialog(self, self.config, self.secrets, self.engine)
@@ -4566,7 +4726,7 @@ if QT_OK:
             elif act is a_rule:
                 for f in sel:
                     mr = ManualRule("exact", f.text, f.entity, True)
-                    append_rule_to_file(MANUAL_RULES_FILE, mr.to_rule_yaml())
+                    append_rule_to_file(self.engine.rules_root / "local" / SAVED_RULES_FILE_NAME, mr.to_rule_yaml())
                 self.reload_rules()
                 self.statusBar().showMessage(f"Saved {len(sel)} rule(s) to {MANUAL_RULES_FILE.name}", 5000)
                 return
@@ -4656,7 +4816,7 @@ if QT_OK:
                 return
             try:
                 for r in rules:
-                    append_rule_to_file(MANUAL_RULES_FILE, r.to_rule_yaml())
+                    append_rule_to_file(self.engine.rules_root / "local" / SAVED_RULES_FILE_NAME, r.to_rule_yaml())
             except Exception as exc:
                 QtWidgets.QMessageBox.warning(self, "Save rules", str(exc))
                 return

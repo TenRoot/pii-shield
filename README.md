@@ -180,8 +180,14 @@ PII Shield writes these files in `rules/local/` from the GUI:
 
 - `promoted_rules.yaml` — manual rules that you save with **Save to Local Rules**.
 - `allow_list.yaml` — values that you add to the allow list.
+- `overrides.yaml` — your changes to bundled and remote rules. Git ignores it.
 
 `rules/local/local_rules.yaml` is an example local rule. It is disabled.
+
+Click the Rules chip in the status bar to open the Rules manager window. It lists every rule.
+You can switch rules on or off, edit them, and delete your saved rules. A change to a bundled
+or remote rule goes into `overrides.yaml`, so a sync or an app update keeps it. "Restore
+original" removes your change. Rules in other local files are read only. Edit those files by hand.
 
 ### Rule format
 

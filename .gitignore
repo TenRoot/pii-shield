@@ -4,3 +4,4 @@ config.json
 backups/
 rules/remote/
 rules/local/promoted_rules.yaml
+rules/local/overrides.yaml
