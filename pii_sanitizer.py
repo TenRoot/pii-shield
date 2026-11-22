@@ -1429,11 +1429,16 @@ class ManualRule:
             rx = self.pattern
         return re.compile(rx, re.IGNORECASE if self.case_insensitive else 0)
 
+    @property
+    def rule_name(self) -> str:
+        return f"manual_{self.entity.lower()}_{hashlib.sha1(self.pattern.encode()).hexdigest()[:8]}"
+
     def to_rule_yaml(self) -> Dict:
-        name = f"manual_{self.entity.lower()}_{hashlib.sha1(self.pattern.encode()).hexdigest()[:8]}"
+        name = self.rule_name
         rule = {"name": name, "entity": self.entity, "score": 0.95,
                 "case_sensitive": not self.case_insensitive,
-                "description": f"Promoted from manual {self.match_type} rule: {self.pattern}"}
+                "description": f"Promoted from manual {self.match_type} rule: {self.pattern}",
+                "metadata": {"manual": {"match_type": self.match_type, "pattern": self.pattern}}}
         if self.match_type == "exact":
             rule["deny_list"] = [self.pattern]
         else:
@@ -1442,14 +1447,32 @@ class ManualRule:
         return rule
 
 
+_PROMOTED_DESC_RE = re.compile(r"^Promoted from manual (exact|wildcard|regex) rule: (.+)$")
+
+
+def manual_source(rule: RuleDef) -> Optional[Tuple[str, str]]:
+    """(match_type, pattern) a saved manual rule came from, or None for any other rule."""
+    meta = (rule.raw or {}).get("metadata")
+    man = meta.get("manual") if isinstance(meta, dict) else None
+    if isinstance(man, dict) and man.get("match_type") in ("exact", "wildcard", "regex") \
+            and isinstance(man.get("pattern"), str) and man["pattern"]:
+        return man["match_type"], man["pattern"]
+    m = _PROMOTED_DESC_RE.match(rule.description or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
 def rule_details(rule: RuleDef, max_values: int = 5) -> List[str]:
     """Lines that tell a person what a loaded rule matches (for the Loaded Rules window)."""
     out = [rule.description] if rule.description else []
-    if rule.deny_list:
+    src = manual_source(rule)
+    if src:
+        out.append(f"{src[0]}: {src[1]}")
+    elif rule.deny_list:
         shown = ", ".join(rule.deny_list[:max_values])
         more = len(rule.deny_list) - max_values
         out.append(f"values: {shown}" + (f" (+{more} more)" if more > 0 else ""))
-    out += [f"regex: {p.regex}" for p in rule.patterns]
+    if not src:
+        out += [f"regex: {p.regex}" for p in rule.patterns]
     keys = rule.json_keys + [f"*{k}*" for k in rule.json_key_contains]
     if keys:
         out.append("json keys: " + ", ".join(keys))

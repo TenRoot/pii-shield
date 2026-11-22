@@ -747,6 +747,36 @@ class RuleDetailsTests(unittest.TestCase):
         self.assertEqual(ps.rule_details(r, max_values=2),
                          ["d", "values: a, b (+1 more)", r"regex: \bx\b", "json keys: pw, *token*"])
 
+    def _saved_rule(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = tmp / "rules"
+        (root / "local").mkdir(parents=True)
+        ps.append_rule_to_file(root / "local" / "promoted_rules.yaml",
+                               ps.ManualRule("wildcard", "*contoso*", "ORGANIZATION").to_rule_yaml())
+        rs = ps.load_rules_dir(root, bundled=False)
+        return rs, rs.rules[0]
+
+    def test_saved_rule_metadata_round_trip(self):
+        y = ps.ManualRule("wildcard", "*contoso*", "ORGANIZATION").to_rule_yaml()
+        self.assertEqual(y["metadata"], {"manual": {"match_type": "wildcard", "pattern": "*contoso*"}})
+        self.assertEqual(y["name"], ps.ManualRule("wildcard", "*contoso*", "ORGANIZATION").rule_name)
+        rs, r = self._saved_rule()
+        self.assertEqual(ps.manual_source(r), ("wildcard", "*contoso*"))
+        self.assertEqual(rs.warnings, [])
+
+    def test_manual_source_from_old_description(self):
+        r = ps.RuleDef("n", "E", description="Promoted from manual exact rule: contoso", raw={})
+        self.assertEqual(ps.manual_source(r), ("exact", "contoso"))
+        r = ps.RuleDef("n", "E", description="Promoted from manual regex rule: a b+", raw={})
+        self.assertEqual(ps.manual_source(r), ("regex", "a b+"))
+        self.assertIsNone(ps.manual_source(ps.RuleDef("n", "E", description="other", raw={})))
+
+    def test_details_prefer_the_original_pattern(self):
+        _, r = self._saved_rule()
+        self.assertEqual(ps.rule_details(r)[0:2], [r.description, "wildcard: *contoso*"])
+        self.assertEqual(len(ps.rule_details(r)), 2)
+
 
 class RuleOverrideLoaderTests(unittest.TestCase):
     def setUp(self):
