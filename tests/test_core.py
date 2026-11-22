@@ -826,5 +826,165 @@ class RuleOverrideLoaderTests(unittest.TestCase):
         self.assertFalse(r.is_marker)
 
 
+class RuleWriteTests(unittest.TestCase):
+    REMOTE = """recognizers:
+  - name: remote_one
+    entity: HOSTNAME
+    patterns: ['\\bcontoso-\\w+\\b']
+  - name: Contoso Hosts.v2
+    entity: HOSTNAME
+    patterns: ['\\bexample-\\w+\\b']
+  - name: remote_wordlist
+    entity: ORG
+    wordlist: ../wl.txt
+  - name: remote_json
+    entity: SECRET
+    json_keys: [password]
+"""
+    SAVED = """version: 1
+allow_list: [keepme]
+recognizers:
+  - name: manual_hostname_x
+    entity: HOSTNAME
+    patterns: ['\\bcontoso\\b']
+  - name: manual_org_y
+    entity: ORG
+    deny_list: [example]
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "rules"
+        (self.root / "remote").mkdir(parents=True)
+        (self.root / "local").mkdir()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        (self.root / "wl.txt").write_text("contoso\nexample\n", "utf-8")
+        (self.root / "remote/x.yaml").write_text(self.REMOTE, "utf-8")
+        self.saved = self.root / "local/promoted_rules.yaml"
+        self.saved.write_text(self.SAVED, "utf-8")
+        self.ov = self.root / "local/overrides.yaml"
+
+    def rule(self, name):
+        return next(r for r in ps.load_rules_dir(self.root).all_rules if r.name == name)
+
+    def recs(self, path):
+        return ps.yaml.safe_load(path.read_text("utf-8"))["recognizers"]
+
+    def test_kinds(self):
+        self.assertEqual(ps.rule_kind(self.rule("remote_one")), "remote")
+        self.assertEqual(ps.rule_kind(self.rule("manual_org_y")), "saved")
+        self.assertEqual(ps.rule_kind(ps.RuleDef("a", "B", source_file="bundled/hosts.yaml")), "bundled")
+        self.assertEqual(ps.rule_kind(ps.RuleDef("a", "B", source_file="local/zz.yaml")), "hand-edited")
+
+    def test_disable_and_enable_remote_rule_writes_then_removes_marker(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        self.assertEqual(self.recs(self.ov), [{"name": "remote_one", "enabled": False}])
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), True)
+        self.assertEqual(self.recs(self.ov), [])
+
+    def test_disable_saved_rule_sets_flag_in_place(self):
+        ps.set_rule_enabled(self.root, self.rule("manual_org_y"), False)
+        recs = self.recs(self.saved)
+        self.assertEqual([r.get("enabled", True) for r in recs], [True, False])
+        self.assertEqual(ps.yaml.safe_load(self.saved.read_text("utf-8"))["allow_list"], ["keepme"])
+
+    def test_hand_edited_rule_refused(self):
+        (self.root / "local/zz.yaml").write_text(
+            "recognizers:\n  - {name: hand, entity: ORG, deny_list: [example]}\n", "utf-8")
+        with self.assertRaises(ps.RuleError):
+            ps.set_rule_enabled(self.root, self.rule("hand"), False)
+
+    def test_delete_last_saved_rule_keeps_valid_empty_file(self):
+        ps.delete_rule(self.root, self.rule("manual_hostname_x"))
+        ps.delete_rule(self.root, self.rule("manual_org_y"))
+        self.assertEqual(self.recs(self.saved), [])
+        self.assertEqual(ps.load_rules_dir(self.root).errors, [])
+
+    def test_invalid_edit_leaves_file_unchanged(self):
+        r = self.rule("manual_hostname_x")
+        before = self.saved.read_bytes()
+        with self.assertRaises(ps.RuleError):
+            ps.save_rule(self.root, r, {**r.raw, "patterns": ["("]})
+        self.assertEqual(self.saved.read_bytes(), before)
+        self.assertFalse(self.saved.with_suffix(".tmp").exists())
+
+    def test_broken_yaml_file_is_not_overwritten(self):
+        self.ov.write_text("recognizers: [", "utf-8")
+        with self.assertRaises(ps.RuleError):
+            ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        self.assertEqual(self.ov.read_text("utf-8"), "recognizers: [")
+
+    def test_refuses_files_the_app_does_not_own(self):
+        with self.assertRaises(ps.RuleError):
+            ps.update_rule_file(self.root / "remote/x.yaml", self.root, lambda r: r)
+        with self.assertRaises(ps.RuleError):
+            ps.update_rule_file(self.root / "local/zz.yaml", self.root, lambda r: r)
+
+    def test_override_copy_inlines_wordlist(self):
+        c = ps.override_copy(self.rule("remote_wordlist"))
+        self.assertNotIn("wordlist", c)
+        self.assertEqual(sorted(c["deny_list"]), ["contoso", "example"])
+
+    def test_override_copy_keeps_json_keys_without_generated_patterns(self):
+        c = ps.override_copy(self.rule("remote_json"))
+        self.assertEqual((c["json_keys"], c.get("patterns")), (["password"], None))
+
+    def test_override_status_changed_and_removed(self):
+        orig = self.rule("remote_one")
+        c = ps.override_copy(orig)
+        c["entity"] = "ORG"
+        ps.save_rule(self.root, orig, c)
+        r = self.rule("remote_one")
+        self.assertEqual(ps.rule_kind(r), "override")
+        self.assertIsNone(ps.override_status(r))
+        (self.root / "remote/x.yaml").write_text(self.REMOTE.replace("contoso-", "fabrikam-"), "utf-8")
+        self.assertEqual(ps.override_status(self.rule("remote_one")), "changed")
+        (self.root / "remote/x.yaml").write_text(self.REMOTE.replace("name: remote_one", "name: gone"), "utf-8")
+        self.assertEqual(ps.override_status(self.rule("remote_one")), "removed")
+
+    def test_override_status_none_for_marker(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        self.assertIsNone(ps.override_status(self.rule("remote_one")))
+
+    def test_restore_original_removes_copy(self):
+        orig = self.rule("remote_one")
+        c = ps.override_copy(orig)
+        c["entity"] = "ORG"
+        ps.save_rule(self.root, orig, c)
+        ps.restore_original(self.root, self.rule("remote_one"))
+        self.assertEqual(self.recs(self.ov), [])
+        self.assertEqual(self.rule("remote_one").entity, "HOSTNAME")
+
+    def test_save_edit_of_saved_rule_in_place_and_rename(self):
+        r = self.rule("manual_hostname_x")
+        ps.save_rule(self.root, r, {**r.raw, "name": "renamed", "entity": "ORG"})
+        self.assertEqual([x["name"] for x in self.recs(self.saved)], ["renamed", "manual_org_y"])
+
+    def test_saved_rule_rename_collision_refused(self):
+        r = self.rule("manual_hostname_x")
+        before = self.saved.read_bytes()
+        with self.assertRaises(ps.RuleError):
+            ps.save_rule(self.root, r, {**r.raw, "name": "manual_org_y"})
+        self.assertEqual(self.saved.read_bytes(), before)
+
+    def test_edit_of_marker_rule_replaces_marker_with_full_copy(self):
+        ps.set_rule_enabled(self.root, self.rule("remote_one"), False)
+        m = self.rule("remote_one")
+        c = ps.override_copy(m)
+        self.assertFalse(c["enabled"])
+        ps.save_rule(self.root, m, c)
+        recs = self.recs(self.ov)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["patterns"], ["\\bcontoso-\\w+\\b"])
+
+    def test_marker_matches_name_with_spaces_and_dots(self):
+        ps.set_rule_enabled(self.root, self.rule("Contoso Hosts.v2"), False)
+        self.assertNotIn("Contoso Hosts.v2", [r.name for r in ps.load_rules_dir(self.root).rules])
+
+    def test_append_rule_to_file_still_works(self):
+        ps.append_rule_to_file(self.saved, {"name": "manual_new", "entity": "ORG", "deny_list": ["example"]})
+        self.assertEqual([x["name"] for x in self.recs(self.saved)][-1], "manual_new")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1168,16 +1168,181 @@ adm-jdoe
 # END BUNDLED RULES
 
 
-def append_rule_to_file(path: Path, rule: Dict) -> None:
-    """Persist a rule (e.g. a promoted manual rule) into a local YAML file."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc = {"version": 1, "recognizers": []}
+SAVED_RULES_FILE_NAME = "promoted_rules.yaml"   # the rules manager's "saved" rules (local/)
+
+
+def rule_kind(rule: RuleDef) -> str:
+    """Where a rule lives: bundled, remote, saved, override, or hand-edited (read only)."""
+    src = rule.source_file.replace("\\", "/")
+    if src.startswith(BUNDLED_LABEL):
+        return "bundled"
+    if src.startswith("remote/"):
+        return "remote"
+    if src == f"local/{SAVED_RULES_FILE_NAME}":
+        return "saved"
+    if src == f"local/{OVERRIDES_FILE_NAME}":
+        return "override"
+    return "hand-edited"
+
+
+def raw_fingerprint(raw: dict) -> str:
+    """12 hex chars that identify the content of a rule mapping."""
+    text = json.dumps(raw, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def override_status(rule: RuleDef) -> Optional[str]:
+    """For a copy of another rule: None (original unchanged), "changed" or "removed"."""
+    if rule_kind(rule) != "override" or rule.is_marker:
+        return None
+    sha = (rule.raw.get("metadata") or {}).get("original_sha")
+    if not sha:
+        return None
+    if rule.overrides is None:
+        return "removed"
+    return None if sha == raw_fingerprint(rule.overrides.raw) else "changed"
+
+
+def update_rule_file(path: Path, rules_root: Path, change: Callable[[List[dict]], List[dict]]) -> None:
+    """Apply `change` to the recognizer list of a writable rule file. Validates the whole new
+    document, then replaces the file atomically. Raises RuleError and leaves the file as it was
+    on bad existing YAML or a failed validation."""
+    path, rules_root = Path(path), Path(rules_root)
+    if path.name not in (SAVED_RULES_FILE_NAME, OVERRIDES_FILE_NAME) \
+            or path.parent.resolve() != (rules_root / "local").resolve():
+        raise RuleError(f"{path.name}: the app does not write this file")
+    doc: dict = {"version": 1, "recognizers": []}
     if path.exists():
-        doc = _read_structured(path) or doc
-        doc.setdefault("recognizers", [])
-    doc["recognizers"] = [r for r in doc["recognizers"] if r.get("name") != rule["name"]] + [rule]
-    parse_rule_document(doc, path, path.parent)  # validate before writing
-    path.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), "utf-8")
+        if yaml is None:
+            raise RuleError("PyYAML is not installed")
+        try:
+            loaded = yaml.safe_load(path.read_text("utf-8-sig"))
+        except (yaml.YAMLError, UnicodeDecodeError, OSError) as exc:
+            raise RuleError(f"{path.name}: cannot read ({exc.__class__.__name__}); file left unchanged")
+        if isinstance(loaded, list):
+            loaded = {"version": 1, "recognizers": loaded}
+        if loaded is not None:
+            if not isinstance(loaded, dict):
+                raise RuleError(f"{path.name}: top level must be a mapping; file left unchanged")
+            doc = loaded
+    recs = doc.get("recognizers") or []
+    if not isinstance(recs, list):
+        raise RuleError(f"{path.name}: 'recognizers' must be a list; file left unchanged")
+    doc = dict(doc)
+    doc["recognizers"] = list(change(copy.deepcopy(recs)))
+    parse_rule_document(doc, path, rules_root)  # raises RuleError before anything is written
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(yaml.safe_dump(doc, sort_keys=False, allow_unicode=True), "utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
+def _upsert(recs: List[dict], entry: dict) -> List[dict]:
+    """Replace the entry with the same name in place, or append."""
+    for i, r in enumerate(recs):
+        if isinstance(r, dict) and r.get("name") == entry["name"]:
+            recs[i] = entry
+            return recs
+    return recs + [entry]
+
+
+def _without(recs: List[dict], name: str) -> List[dict]:
+    return [r for r in recs if not (isinstance(r, dict) and r.get("name") == name)]
+
+
+def _saved_path(rules_root: Path) -> Path:
+    return Path(rules_root) / "local" / SAVED_RULES_FILE_NAME
+
+
+def _overrides_path(rules_root: Path) -> Path:
+    return Path(rules_root) / "local" / OVERRIDES_FILE_NAME
+
+
+def set_rule_enabled(rules_root: Path, rule: RuleDef, enabled: bool) -> None:
+    kind = rule_kind(rule)
+    if kind == "hand-edited":
+        raise RuleError("hand-edited rule")
+    if kind == "saved":
+        def change(recs):
+            for r in recs:
+                if isinstance(r, dict) and r.get("name") == rule.name:
+                    r["enabled"] = enabled
+            return recs
+        update_rule_file(_saved_path(rules_root), rules_root, change)
+    elif kind == "override":
+        def change(recs):
+            for i, r in enumerate(recs):
+                if isinstance(r, dict) and r.get("name") == rule.name:
+                    if rule.is_marker and rule.overrides is not None \
+                            and enabled == rule.overrides.raw.get("enabled", True):
+                        return _without(recs, rule.name)
+                    r["enabled"] = enabled
+            return recs
+        update_rule_file(_overrides_path(rules_root), rules_root, change)
+    else:  # bundled or remote: a marker that switches the rule
+        update_rule_file(_overrides_path(rules_root), rules_root,
+                         lambda recs: _upsert(recs, {"name": rule.name, "enabled": enabled}))
+
+
+def override_copy(rule: RuleDef) -> dict:
+    """An editable full copy of a bundled or remote rule (or of the original behind a marker)."""
+    original = rule.overrides if rule.is_marker and rule.overrides is not None else rule
+    out = copy.deepcopy(original.raw)
+    if "wordlist" in out:
+        del out["wordlist"]
+        out["deny_list"] = list(rule.deny_list)
+    meta = dict(out.get("metadata") or {})
+    meta["original_sha"] = raw_fingerprint(original.raw)
+    out["metadata"] = meta
+    if rule.is_marker:
+        out["enabled"] = rule.enabled
+    return out
+
+
+def save_rule(rules_root: Path, rule: RuleDef, new_raw: dict) -> None:
+    kind = rule_kind(rule)
+    if kind == "hand-edited":
+        raise RuleError("hand-edited rule")
+    new_raw = copy.deepcopy(new_raw)
+    if kind in ("saved", "override") and not rule.is_marker:
+        path = _saved_path(rules_root) if kind == "saved" else _overrides_path(rules_root)
+        new_name = new_raw.get("name", rule.name)
+        if new_name != rule.name and kind == "override":
+            raise RuleError("a copy of a rule must keep the name of the rule it replaces")
+
+        def change(recs):
+            if new_name != rule.name and any(isinstance(r, dict) and r.get("name") == new_name for r in recs):
+                raise RuleError(f"a rule named '{new_name}' already exists in {path.name}")
+            for i, r in enumerate(recs):
+                if isinstance(r, dict) and r.get("name") == rule.name:
+                    recs[i] = new_raw
+                    return recs
+            raise RuleError(f"rule '{rule.name}' not found in {path.name}")
+        update_rule_file(path, rules_root, change)
+    else:  # bundled, remote or marker: write the edited copy to overrides.yaml
+        new_raw["name"] = rule.name
+        update_rule_file(_overrides_path(rules_root), rules_root, lambda recs: _upsert(recs, new_raw))
+
+
+def delete_rule(rules_root: Path, rule: RuleDef) -> None:
+    if rule_kind(rule) != "saved":
+        raise RuleError("only a saved rule can be deleted")
+    update_rule_file(_saved_path(rules_root), rules_root, lambda recs: _without(recs, rule.name))
+
+
+def restore_original(rules_root: Path, rule: RuleDef) -> None:
+    if rule_kind(rule) != "override":
+        raise RuleError("only a copy or switch can be restored")
+    update_rule_file(_overrides_path(rules_root), rules_root, lambda recs: _without(recs, rule.name))
+
+
+def append_rule_to_file(path: Path, rule: Dict) -> None:
+    """Persist a rule (e.g. a promoted manual rule) into local/promoted_rules.yaml."""
+    update_rule_file(path, path.parent.parent, lambda recs: _without(recs, rule["name"]) + [rule])
 
 
 def add_to_allow_list(values: Iterable[str], path: Path = ALLOW_LIST_FILE) -> int:
