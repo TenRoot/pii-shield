@@ -748,5 +748,83 @@ class RuleDetailsTests(unittest.TestCase):
                          ["d", "values: a, b (+1 more)", r"regex: \bx\b", "json keys: pw, *token*"])
 
 
+class RuleOverrideLoaderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "rules"
+        (self.root / "remote").mkdir(parents=True)
+        (self.root / "local").mkdir()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _write(self, rel, text):
+        (self.root / rel).write_text(text, "utf-8")
+
+    def _load(self):
+        return ps.load_rules_dir(self.root, bundled=False)
+
+    HOSTS = """recognizers:
+  - name: Contoso Hosts.v2
+    entity: HOSTNAME
+    patterns: ['\\bcontoso-\\w+\\b']
+"""
+
+    def test_marker_switches_off_remote_rule(self):
+        self._write("remote/r.yaml", self.HOSTS)
+        self._write("local/overrides.yaml", "recognizers:\n  - {name: Contoso Hosts.v2, enabled: false}\n")
+        rs = self._load()
+        self.assertNotIn("Contoso Hosts.v2", [r.name for r in rs.rules])
+        r = next(r for r in rs.all_rules if r.name == "Contoso Hosts.v2")
+        self.assertEqual((r.enabled, r.is_marker, r.entity), (False, True, "HOSTNAME"))
+        self.assertEqual(r.overrides.source_file, "remote/r.yaml")
+        self.assertTrue(r.patterns, "marker keeps the original's patterns")
+
+    def test_marker_switches_on_rule_that_is_off_in_its_file(self):
+        self._write("remote/r.yaml", self.HOSTS.replace("    entity", "    enabled: false\n    entity"))
+        self.assertNotIn("Contoso Hosts.v2", [r.name for r in self._load().rules])
+        self._write("local/overrides.yaml", "recognizers:\n  - {name: Contoso Hosts.v2, enabled: true}\n")
+        self.assertIn("Contoso Hosts.v2", [r.name for r in self._load().rules])
+
+    def test_marker_without_original_warns(self):
+        self._write("local/overrides.yaml", "recognizers:\n  - {name: nothing_here, enabled: false}\n")
+        rs = self._load()
+        self.assertIn("marker 'nothing_here' in local/overrides.yaml has no rule to change", rs.warnings)
+        self.assertNotIn("nothing_here", [r.name for r in rs.all_rules])
+
+    def test_disabled_rule_with_broken_regex_is_not_a_file_error(self):
+        self._write("local/a.yaml", """recognizers:
+  - {name: valid_one, entity: HOSTNAME, patterns: ['\\bcontoso\\b']}
+  - {name: 'off', entity: X, enabled: false, patterns: ['(']}
+""")
+        rs = self._load()
+        self.assertEqual(rs.errors, [])
+        self.assertTrue(next(r for r in rs.all_rules if r.name == "off").broken)
+        self.assertTrue(any("disabled rule 'off' in" in w for w in rs.warnings))
+        self.assertIn("valid_one", [r.name for r in rs.rules])
+
+    def test_marker_cannot_switch_on_broken_rule(self):
+        self._write("remote/r.yaml", "recognizers:\n  - {name: 'off', entity: X, enabled: false, patterns: ['(']}\n")
+        self._write("local/overrides.yaml", "recognizers:\n  - {name: 'off', enabled: true}\n")
+        rs = self._load()
+        self.assertIn("cannot switch on 'off': the rule has errors", rs.warnings)
+        self.assertNotIn("off", [r.name for r in rs.rules])
+
+    def test_enabled_rule_without_patterns_is_still_an_error(self):
+        self._write("local/a.yaml", "recognizers:\n  - {name: n, entity: HOSTNAME}\n")
+        self.assertTrue(self._load().errors)
+
+    def test_overrides_file_loads_after_other_local_files(self):
+        self._write("local/zz_hand.yaml", "recognizers:\n  - {name: dup, entity: AAA, patterns: ['\\bone\\b']}\n")
+        self._write("local/overrides.yaml", "recognizers:\n  - {name: dup, entity: BBB, patterns: ['\\btwo\\b']}\n")
+        rs = self._load()
+        self.assertEqual(next(r for r in rs.rules if r.name == "dup").source_file, "local/overrides.yaml")
+
+    def test_full_copy_records_what_it_replaced(self):
+        self._write("remote/c.yaml", self.HOSTS.replace("Contoso Hosts.v2", "c"))
+        self._write("local/overrides.yaml", self.HOSTS.replace("Contoso Hosts.v2", "c").replace("HOSTNAME", "ORG"))
+        r = next(r for r in self._load().rules if r.name == "c")
+        self.assertEqual(r.overrides.source_file, "remote/c.yaml")
+        self.assertFalse(r.is_marker)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,6 +47,7 @@ import threading
 import traceback
 import uuid
 from collections import OrderedDict, defaultdict
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -86,6 +87,7 @@ ALLOW_LIST_FILE = LOCAL_RULES_DIR / "allow_list.yaml"
 SYNC_MANIFEST = ".sync_manifest.json"
 
 RULE_EXTENSIONS = {".yaml", ".yml", ".json"}
+OVERRIDES_FILE_NAME = "overrides.yaml"   # local/overrides.yaml holds the rules manager's markers and copies
 WORDLIST_EXTENSIONS = {".txt", ".lst", ".csv"}
 SYNC_EXTENSIONS = RULE_EXTENSIONS | WORDLIST_EXTENSIONS
 
@@ -389,6 +391,11 @@ class RuleDef:
     source_file: str = ""
     json_keys: List[str] = field(default_factory=list)          # mask JSON / dict values by key name
     json_key_contains: List[str] = field(default_factory=list)
+    enabled: bool = True
+    raw: dict = field(default_factory=dict)            # deep copy of the recognizer mapping
+    overrides: Optional["RuleDef"] = None              # the rule this one replaced or switched
+    is_marker: bool = False                            # a local {name, enabled} entry
+    broken: bool = False                               # a disabled rule that has errors
 
     @property
     def flags(self) -> int:
@@ -398,7 +405,8 @@ class RuleDef:
 
 @dataclass
 class RuleSet:
-    rules: List[RuleDef] = field(default_factory=list)
+    rules: List[RuleDef] = field(default_factory=list)       # active rules only
+    all_rules: List[RuleDef] = field(default_factory=list)   # active and disabled, in load order
     allow_list: set = field(default_factory=set)       # casefolded literal values never to mask
     files: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)    # per-file problems (file skipped)
@@ -446,6 +454,14 @@ def _safe_child(base: Path, rel: str, root: Path) -> Path:
     return p
 
 
+_FULL_RULE_KEYS = ("entity", "supported_entity", "patterns", "deny_list", "wordlist", "json_keys", "json_key_contains")
+
+
+def is_marker_mapping(r: dict) -> bool:
+    """A marker has a name and 'enabled' and nothing that defines what to match."""
+    return "name" in r and "enabled" in r and not any(k in r for k in _FULL_RULE_KEYS)
+
+
 def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set, List[str]]:
     """Validate one YAML/JSON document. Raises RuleError with all problems listed."""
     problems: List[str] = []
@@ -471,45 +487,53 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
         if not isinstance(r, dict):
             problems.append(f"{where}: recognizer must be a mapping")
             continue
-        if r.get("enabled", True) is False:
-            continue
         name = str(r.get("name", "")).strip()
+        src = str(path.relative_to(root)) if root in path.parents else path.name
+        if is_marker_mapping(r):
+            if not name or not RULE_NAME_RE.match(name):
+                problems.append(f"{path.name}:{name or i + 1}: invalid or missing 'name'")
+                continue
+            rules.append(RuleDef(name=name, entity="", enabled=bool(r["enabled"]), is_marker=True,
+                                 source_file=src, raw=copy.deepcopy(r)))
+            continue
+        disabled = r.get("enabled", True) is False
+        rule_problems: List[str] = []      # a disabled rule's problems become a warning, not a file error
         entity = str(r.get("entity", r.get("supported_entity", ""))).strip().upper()
         where = f"{path.name}:{name or i + 1}"
         if not name or not RULE_NAME_RE.match(name):
-            problems.append(f"{where}: invalid or missing 'name'")
+            rule_problems.append(f"{where}: invalid or missing 'name'")
         if not ENTITY_NAME_RE.match(entity):
-            problems.append(f"{where}: invalid 'entity' (use UPPER_SNAKE_CASE, e.g. HOSTNAME)")
+            rule_problems.append(f"{where}: invalid 'entity' (use UPPER_SNAKE_CASE, e.g. HOSTNAME)")
         try:
             score = float(r.get("score", 0.85))
             if not 0 < score <= 1:
                 raise ValueError
         except (TypeError, ValueError):
-            problems.append(f"{where}: 'score' must be in (0, 1]")
+            rule_problems.append(f"{where}: 'score' must be in (0, 1]")
             score = 0.85
         validator = r.get("validator")
         if validator and validator not in VALIDATORS:
-            problems.append(f"{where}: unknown validator '{validator}' (have: {', '.join(VALIDATORS)})")
+            rule_problems.append(f"{where}: unknown validator '{validator}' (have: {', '.join(VALIDATORS)})")
         case_sensitive = bool(r.get("case_sensitive", False))
         rd = RuleDef(name=name, entity=entity, score=score, case_sensitive=case_sensitive,
                      validator=validator or None, description=str(r.get("description", "")),
                      context=[str(c) for c in _as_list(r.get("context"))],
-                     source_file=str(path.relative_to(root)) if root in path.parents else path.name)
+                     source_file=src, enabled=not disabled, raw=copy.deepcopy(r))
 
         for j, p in enumerate(_as_list(r.get("patterns"))):
             if isinstance(p, str):
                 p = {"regex": p}
             if not isinstance(p, dict) or "regex" not in p:
-                problems.append(f"{where}: pattern #{j + 1} needs a 'regex'")
+                rule_problems.append(f"{where}: pattern #{j + 1} needs a 'regex'")
                 continue
             rx = str(p["regex"])
             try:
                 compiled = re.compile(rx, rd.flags)
             except re.error as exc:
-                problems.append(f"{where}: pattern #{j + 1} invalid regex: {exc}")
+                rule_problems.append(f"{where}: pattern #{j + 1} invalid regex: {exc}")
                 continue
             if compiled.search("") is not None and compiled.fullmatch("") is not None:
-                problems.append(f"{where}: pattern #{j + 1} matches the empty string")
+                rule_problems.append(f"{where}: pattern #{j + 1} matches the empty string")
                 continue
             if _NESTED_QUANT_RE.search(rx):
                 warnings.append(f"{where}: pattern #{j + 1} has nested quantifiers (possible ReDoS)")
@@ -518,7 +542,7 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
                 if not 0 < pscore <= 1:
                     raise ValueError
             except (TypeError, ValueError):
-                problems.append(f"{where}: pattern #{j + 1} score must be in (0, 1]")
+                rule_problems.append(f"{where}: pattern #{j + 1} score must be in (0, 1]")
                 continue
             rd.patterns.append(PatternDef(str(p.get("name", f"{name}_{j + 1}")), rx, pscore))
 
@@ -527,24 +551,30 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
             try:
                 wl_path = _safe_child(path.parent, str(wl), root)
                 if not wl_path.exists():
-                    problems.append(f"{where}: wordlist not found: {wl}")
+                    rule_problems.append(f"{where}: wordlist not found: {wl}")
                     continue
                 deny.extend(_read_wordlist(wl_path))
             except RuleError as exc:
-                problems.append(f"{where}: {exc}")
+                rule_problems.append(f"{where}: {exc}")
         rd.deny_list = sorted(set(deny), key=lambda s: (-len(s), s))
 
         rd.json_keys = [str(k).strip() for k in _as_list(r.get("json_keys")) if str(k).strip()]
         rd.json_key_contains = [str(k).strip() for k in _as_list(r.get("json_key_contains")) if str(k).strip()]
         bad_keys = [k for k in rd.json_keys + rd.json_key_contains if not JSON_KEY_RE.match(k)]
         if bad_keys:
-            problems.append(f"{where}: invalid JSON key names {bad_keys} (letters, digits, - _ . $ @ and space)")
+            rule_problems.append(f"{where}: invalid JSON key names {bad_keys} (letters, digits, - _ . $ @ and space)")
         elif rd.json_keys or rd.json_key_contains:
             for pname, rx in json_key_patterns(rd.json_keys, rd.json_key_contains):
                 rd.patterns.append(PatternDef(f"{name}_{pname}", rx, score))
 
         if not rd.patterns and not rd.deny_list:
-            problems.append(f"{where}: needs at least one of 'patterns', 'deny_list', 'wordlist', 'json_keys'")
+            rule_problems.append(f"{where}: needs at least one of 'patterns', 'deny_list', 'wordlist', 'json_keys'")
+        if disabled:
+            if rule_problems:
+                warnings.append(f"disabled rule '{name}' in {src} has errors: {'; '.join(rule_problems)}")
+                rd.patterns, rd.deny_list, rd.broken = [], [], True
+        else:
+            problems.extend(rule_problems)
         rules.append(rd)
 
     if problems:
@@ -569,6 +599,18 @@ def _load_rule_files(root: Path, files: List[Path], rs: RuleSet,
         for r in rules:
             r.source_file = label + r.source_file
             old = by_name.pop(r.name, None)
+            if r.is_marker:
+                if old is None:
+                    rs.warnings.append(f"marker '{r.name}' in {r.source_file} has no rule to change")
+                elif r.enabled and old.broken:
+                    rs.warnings.append(f"cannot switch on '{r.name}': the rule has errors")
+                    by_name[r.name] = old
+                else:
+                    by_name[r.name] = dataclasses.replace(
+                        old, enabled=r.enabled, is_marker=True, raw=r.raw,
+                        source_file=r.source_file, overrides=old)
+                continue
+            r.overrides = old
             if old and not old.source_file.startswith(BUNDLED_LABEL):  # overriding a default is expected
                 rs.warnings.append(f"rule '{r.name}' from {r.source_file} overrides {old.source_file}")
             by_name[r.name] = r
@@ -592,9 +634,11 @@ def load_rules_dir(root: Path, strict: bool = False, bundled: bool = False) -> R
         files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in RULE_EXTENSIONS
                  and not p.name.startswith(".")]
         remote = root / "remote"
-        files.sort(key=lambda p: (0 if remote in p.parents else 1, str(p)))
+        local_overrides = root / "local" / OVERRIDES_FILE_NAME
+        files.sort(key=lambda p: (0 if remote in p.parents else 2 if p == local_overrides else 1, str(p)))
         _load_rule_files(root, files, rs, by_name)
-    rs.rules = list(by_name.values())
+    rs.all_rules = list(by_name.values())
+    rs.rules = [r for r in rs.all_rules if r.enabled]
     if strict and rs.errors:
         raise RuleError("\n".join(rs.errors))
     return rs
