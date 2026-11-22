@@ -1023,6 +1023,13 @@ class RuleEditTests(unittest.TestCase):
                                   manual=("wildcard", "*contoso-labs*"))
         self.assertEqual(new["name"], ps.ManualRule("wildcard", "*contoso-labs*", "ORGANIZATION").rule_name)
 
+    def test_build_edited_raw_manual_score_applies_to_patterns(self):
+        base = ps.ManualRule("wildcard", "*contoso*", "ORGANIZATION").to_rule_yaml()
+        new = ps.build_edited_raw(base, entity="ORGANIZATION", score=0.5, case_sensitive=False,
+                                  manual=("wildcard", "*contoso*"))
+        self.assertEqual(new["score"], 0.5)
+        self.assertEqual(new["patterns"][0]["score"], 0.5)
+
     def test_build_edited_raw_manual_keeps_enabled(self):
         base = dict(ps.ManualRule("exact", "contoso", "ORGANIZATION").to_rule_yaml(), enabled=False)
         new = ps.build_edited_raw(base, entity="ORGANIZATION", score=0.8, case_sensitive=True,
@@ -1083,6 +1090,14 @@ class RulesManagerGuiTests(unittest.TestCase):
         dlg = ps.RuleEditDialog(None, self.rule(name), self.root, ["HOSTNAME", "ORGANIZATION"])
         self.addCleanup(dlg.deleteLater)
         return dlg
+
+    def test_edit_dialog_shows_read_only_name(self):
+        self.assertEqual(self.dialog("plain").ed_name.text(), "plain")
+        manual = next(r.name for r in ps.load_rules_dir(self.root).all_rules if r.name != "plain"
+                      and ps.rule_kind(r) == "saved")
+        dlg = self.dialog(manual)
+        self.assertEqual(dlg.ed_name.text(), manual)
+        self.assertTrue(dlg.name_hint.text())
 
     def test_edit_dialog_invalid_regex_stays_open(self):
         dlg = self.dialog("plain")

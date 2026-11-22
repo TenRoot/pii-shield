@@ -1337,6 +1337,9 @@ def build_edited_raw(base_raw: dict, *, entity: str, score: float, case_sensitiv
         if "enabled" in base_raw:
             out["enabled"] = base_raw["enabled"]
         out["score"] = score
+        for item in out.get("patterns") or []:
+            if isinstance(item, dict):
+                item["score"] = score
         return out
     out = copy.deepcopy(base_raw)
     out["entity"], out["score"], out["case_sensitive"] = entity, score, case_sensitive
@@ -3354,6 +3357,9 @@ if QT_OK:
             self.ed_score.setValue(float(self.base_raw.get("score", rule.score)))
             self.ed_case = QtWidgets.QCheckBox("Case sensitive")
             self.ed_case.setChecked(bool(self.base_raw.get("case_sensitive", rule.case_sensitive)))
+            self.ed_name = QtWidgets.QLabel(rule.name)
+            self.ed_name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            form.addRow("Name", self.ed_name)
             form.addRow("Entity", self.ed_entity)
             form.addRow("Score", self.ed_score)
             form.addRow("", self.ed_case)
@@ -3365,6 +3371,10 @@ if QT_OK:
                 self.ed_pattern = QtWidgets.QLineEdit(self._manual[1])
                 form.addRow("Match type", self.ed_type)
                 form.addRow("Pattern", self.ed_pattern)
+                self.name_hint = QtWidgets.QLabel(
+                    "Changing the pattern or entity gives this rule a new name.")
+                self.name_hint.setWordWrap(True)
+                form.addRow("", self.name_hint)
             else:
                 pats = []
                 for item in self.base_raw.get("patterns") or []:
