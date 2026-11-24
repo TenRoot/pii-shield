@@ -143,6 +143,13 @@ DEFAULT_CONFIG: Dict = {
         "offline_mode": False,           # True = no network at all: no GitHub sync, no update checks
         "git_scan_last_repo": "",        # last folder used in Scan Git Repo
     },
+    "pdf": {
+        "ocr_enabled": True,             # read scanned pages with Tesseract
+        "tesseract_path": "",            # empty = look in the bundle, then on PATH
+        "ocr_languages": "heb+eng",
+        "ocr_dpi": 300,
+        "ocr_timeout": 120,              # seconds per page
+    },
 }
 
 
@@ -3126,6 +3133,144 @@ def is_readable(text: str) -> bool:
     return good / len(chars) >= 0.5
 
 
+class PdfError(Exception):
+    """A PDF cannot be read. The message is safe to show to the user."""
+
+
+@dataclass
+class OcrSettings:
+    enabled: bool = True
+    tesseract_path: str = ""
+    languages: str = "heb+eng"
+    dpi: int = 300
+    timeout: int = 120
+
+    @classmethod
+    def from_config(cls, cfg: "AppConfig") -> "OcrSettings":
+        d = DEFAULT_CONFIG["pdf"]
+        c = cfg.data.get("pdf") or {}
+        g = lambda k: c.get(k, d[k])  # noqa: E731
+        return cls(enabled=bool(g("ocr_enabled")), tesseract_path=str(g("tesseract_path") or ""),
+                   languages=str(g("ocr_languages")), dpi=int(g("ocr_dpi")), timeout=int(g("ocr_timeout")))
+
+
+@dataclass
+class PdfPage:
+    number: int
+    method: str  # "text" | "ocr" | "skipped" | "partial"
+    reason: str = ""
+    text: str = ""
+    header: str = ""
+
+
+@dataclass
+class PdfExtraction:
+    pages: List[PdfPage]
+    text: str
+
+    @property
+    def ocr_count(self) -> int:
+        return sum(1 for p in self.pages if p.method == "ocr")
+
+    @property
+    def skipped_count(self) -> int:
+        return sum(1 for p in self.pages if p.method in ("skipped", "partial"))
+
+    @property
+    def all_skipped(self) -> bool:
+        return not any(p.text.strip() for p in self.pages)
+
+
+def classify_page(text: str, image_ratio: float) -> str:
+    """Return "scanned", "mostly_image", "unreadable" or "text" (in that priority)."""
+    if sum(1 for c in text if not c.isspace()) < 20:
+        return "scanned"
+    if image_ratio >= 0.5:
+        return "mostly_image"
+    if not is_readable(text):
+        return "unreadable"
+    return "text"
+
+
+def _finish_page(number: int, layer_text: str, kind: str, ocr_text: Optional[str],
+                 reason: str, ocr_note: str = "") -> PdfPage:
+    """Build a PdfPage with the right method and header from the class and the OCR result."""
+    if ocr_text is not None and ocr_text.strip():
+        note = f", {ocr_note}" if ocr_note else ""
+        return PdfPage(number, "ocr", "", ocr_text, f"--- page {number} (OCR{note}) ---")
+    if kind == "text":
+        return PdfPage(number, "text", "", layer_text, f"--- page {number} ---")
+    if kind == "scanned":
+        return PdfPage(number, "skipped", reason, "", f"--- page {number} (scanned, skipped: {reason}) ---")
+    label = "mostly image, image text not read" if kind == "mostly_image" else "unreadable text, not read"
+    method = "partial" if layer_text.strip() else "skipped"
+    return PdfPage(number, method, reason, layer_text, f"--- page {number} ({label}: {reason}) ---")
+
+
+def _image_ratio(page) -> float:
+    """Share of the page area covered by images, from 0.0 to 1.0."""
+    width, height = page.get_size()
+    area = width * height
+    if area <= 0:
+        return 0.0
+    covered = 0.0
+    for obj in page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE], max_depth=5):
+        left, bottom, right, top = obj.get_bounds()
+        w = min(right, width) - max(left, 0)
+        h = min(top, height) - max(bottom, 0)
+        if w > 0 and h > 0:
+            covered += w * h
+    return min(covered / area, 1.0)
+
+
+def _layer_text(page) -> str:
+    textpage = page.get_textpage()
+    try:
+        raw = clean_bidi(textpage.get_text_bounded())
+    finally:
+        textpage.close()
+    return "\n".join(fix_visual_order(line) for line in raw.split("\n")).rstrip()
+
+
+def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[str], None]] = None,
+                     cancel: Optional[Callable[[], bool]] = None) -> PdfExtraction:
+    """Read a PDF page by page. Pages that need OCR are marked, not read (OCR comes in a later step)."""
+    if pdfium is None:
+        raise PdfError("PDF support needs the pypdfium2 package.")
+    try:
+        doc = pdfium.PdfDocument(str(path))
+    except pdfium.PdfiumError as exc:
+        if getattr(exc, "err_code", None) == pdfium.raw.FPDF_ERR_PASSWORD:
+            raise PdfError("This PDF is password protected. PII Shield cannot open it.") from exc
+        raise PdfError(f"Cannot open this PDF: {exc}") from exc
+    pages: List[PdfPage] = []
+    try:
+        total = len(doc)
+        for i in range(total):
+            if cancel and cancel():
+                break
+            n = i + 1
+            page = doc[i]
+            try:
+                layer = _layer_text(page)
+                kind = classify_page(layer, _image_ratio(page))
+            finally:
+                page.close()
+            needs_ocr = kind != "text"
+            if progress:
+                progress(f"PDF: page {n} of {total}" + (" (OCR)" if needs_ocr and ocr.enabled else ""))
+            reason = "" if not needs_ocr else ("Tesseract not installed" if ocr.enabled else "OCR turned off")
+            done = _finish_page(n, layer, kind, None, reason)
+            pages.append(done)
+            log.info("PDF page %d: %s%s", n, done.method, f" ({done.reason})" if done.reason else "")
+    except pdfium.PdfiumError as exc:
+        raise PdfError(f"Cannot read this PDF: {exc}") from exc
+    finally:
+        doc.close()
+    text = "\n\n".join(p.header + "\n" + p.text for p in pages)
+    return PdfExtraction(pages, text)
+
+
 # ===========================================================================
 # 8. GUI (PyQt6)
 # ===========================================================================
@@ -3161,7 +3306,7 @@ if QT_OK:
                 self.signals.done.emit(self.fn(*self.args, **self.kwargs))
             except Exception as exc:
                 log.debug(traceback.format_exc())
-                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision, GitScanError)) else str(exc))
+                self.signals.error.emit(f"{exc.__class__.__name__}: {exc}" if not isinstance(exc, (SyncError, RuleError, TokenCollision, GitScanError, PdfError)) else str(exc))
 
     def _mono_font() -> QtGui.QFont:
         f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
