@@ -3183,8 +3183,16 @@ class OcrSettings:
         d = DEFAULT_CONFIG["pdf"]
         c = cfg.data.get("pdf") or {}
         g = lambda k: c.get(k, d[k])  # noqa: E731
+
+        def num(k: str) -> int:
+            # Called from a GUI slot: a bad value ("abc", null) must not raise. Use the default.
+            try:
+                return int(g(k))
+            except (TypeError, ValueError):
+                log.warning("Config pdf.%s is not a number; using %s", k, d[k])
+                return int(d[k])
         return cls(enabled=bool(g("ocr_enabled")), tesseract_path=str(g("tesseract_path") or ""),
-                   languages=str(g("ocr_languages")), dpi=int(g("ocr_dpi")), timeout=int(g("ocr_timeout")))
+                   languages=str(g("ocr_languages")), dpi=num("ocr_dpi"), timeout=num("ocr_timeout"))
 
 
 @dataclass
@@ -3363,8 +3371,10 @@ def find_tesseract(configured: str = "") -> Optional[Path]:
 
 
 def _run_tesseract(args: List[str], timeout: int, data: Optional[bytes] = None) -> "subprocess.CompletedProcess[bytes]":
-    return subprocess.run(args, capture_output=True, timeout=timeout, shell=False, input=data,
-                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    # With no data, give Tesseract an empty stdin so it never waits on the app's console.
+    stdin = {"input": data} if data is not None else {"stdin": subprocess.DEVNULL}
+    return subprocess.run(args, capture_output=True, timeout=timeout, shell=False,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **stdin)
 
 
 def tesseract_info(exe: Path) -> Tuple[str, Set[str]]:
@@ -3382,21 +3392,26 @@ def tesseract_info(exe: Path) -> Tuple[str, Set[str]]:
     return (version[0].strip() if version else ""), {x.strip() for x in lines if x.strip()}
 
 
-def ocr_image(exe: Path, image: bytes, languages: str, timeout: int) -> str:
+def ocr_image(exe: Path, image: bytes, languages: str, timeout: int, dpi: int = 300) -> str:
     """Run Tesseract on one image (PGM bytes, sent on stdin) and return the cleaned text.
 
-    Raises PdfError on failure. No temp file is written: Windows Tesseract builds
-    mishandle non-ASCII temp paths.
+    Raises PdfError("OCR failed") or PdfError("OCR timed out"). The message goes into the
+    page header and so to the LLM, so the detail (it can hold a user path) goes to the log only.
+    No temp file is written: Windows Tesseract builds mishandle non-ASCII temp paths.
+    PGM carries no resolution, so --dpi tells Tesseract the render DPI.
     """
     try:
-        r = _run_tesseract([str(exe), "stdin", "stdout", "-l", languages], timeout, image)
+        r = _run_tesseract([str(exe), "stdin", "stdout", "--dpi", str(dpi), "-l", languages], timeout, image)
     except subprocess.TimeoutExpired as exc:
+        log.warning("OCR timed out after %s s", timeout)
         raise PdfError("OCR timed out") from exc
     except OSError as exc:
-        raise PdfError(f"OCR failed: {exc}") from exc
+        log.warning("OCR failed: %s", exc)
+        raise PdfError("OCR failed") from exc
     if r.returncode != 0:
         err = r.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise PdfError(f"OCR failed: {err[0].strip() if err else f'exit code {r.returncode}'}")
+        log.warning("OCR failed: %s", err[0].strip() if err else f"exit code {r.returncode}")
+        raise PdfError("OCR failed")
     return clean_bidi(r.stdout.decode("utf-8", "replace"))
 
 
@@ -3489,7 +3504,7 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                     exe, langs, ocr_note, reason = engine
                     if exe is not None and langs:
                         try:
-                            ocr_text = ocr_image(exe, _render_pgm(page, ocr.dpi), langs, ocr.timeout)
+                            ocr_text = ocr_image(exe, _render_pgm(page, ocr.dpi), langs, ocr.timeout, ocr.dpi)
                             if not ocr_text.strip():
                                 reason = "OCR found no text"
                         except PdfError as exc:
@@ -5005,7 +5020,8 @@ if QT_OK:
             QtCore.QThreadPool.globalInstance().start(task)
 
         def _on_pdf_progress(self, msg: str):
-            # A bound method of the window, so Qt queues the call to the GUI thread (a lambda would run in the worker).
+            # Connect bound methods of the window, not lambdas: a lambda has no receiver object, so
+            # Qt cannot drop a queued call when the window is deleted, and the call runs on a dead window.
             if not self._closing:
                 self.statusBar().showMessage(msg)
 

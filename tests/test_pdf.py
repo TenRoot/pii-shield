@@ -403,13 +403,17 @@ class OcrTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("qpdf"), "qpdf needed")
     def test_ocr_failure_on_one_page_continues(self):
-        r = ps.extract_pdf_text(two_scan_pdf(self.tmp), self.settings(fake_tesseract(self.tmp, fail_on_call=1)))
+        with self.assertLogs(ps.log, "WARNING") as logs:
+            r = ps.extract_pdf_text(two_scan_pdf(self.tmp), self.settings(fake_tesseract(self.tmp, fail_on_call=1)))
         self.assertEqual([p.method for p in r.pages], ["skipped", "ocr"])
-        self.assertIn("--- page 1 (scanned, skipped: OCR failed: boom) ---", r.text)
+        self.assertIn("--- page 1 (scanned, skipped: OCR failed) ---", r.text)
+        self.assertNotIn("boom", r.text)
+        self.assertTrue(any("OCR failed: boom" in m for m in logs.output), logs.output)
 
     def test_timeout(self):
         s = self.settings(fake_tesseract(self.tmp, sleep=3)); s.timeout = 1
-        r = ps.extract_pdf_text(FIX / "he_scan.pdf", s)
+        with self.assertLogs(ps.log, "WARNING"):
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", s)
         self.assertIn("--- page 1 (scanned, skipped: OCR timed out) ---", r.text)
 
     def test_cancel_stops_between_pages_and_cleans_up(self):
@@ -444,6 +448,46 @@ class OcrTests(unittest.TestCase):
         self.assertIn("(mostly image, image text not read: OCR found no text) ---", r.pages[0].header)
 
 
+class TesseractCallTests(unittest.TestCase):
+    def done(self, rc=0, out=b"", err=b""):
+        return subprocess.CompletedProcess([], rc, out, err)
+
+    def test_ocr_passes_dpi(self):
+        with mock.patch.object(ps, "_run_tesseract", return_value=self.done(out=b"hello")) as run:
+            self.assertEqual(ps.ocr_image(Path("/x/tesseract"), b"P5", "eng", 5, dpi=200), "hello")
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--dpi") + 1], "200")
+
+    def test_failure_detail_goes_to_log_only(self):
+        user_path = "C:\\Users\\example\\tessdata"
+        cases = [mock.patch.object(ps, "_run_tesseract", side_effect=OSError(f"cannot run {user_path}")),
+                 mock.patch.object(ps, "_run_tesseract", return_value=self.done(1, err=f"no {user_path}\n".encode()))]
+        for patch in cases:
+            with patch, self.assertLogs(ps.log, "WARNING") as logs, self.assertRaises(ps.PdfError) as cm:
+                ps.ocr_image(Path("/x/tesseract"), b"P5", "eng", 5)
+            self.assertEqual(str(cm.exception), "OCR failed")
+            self.assertTrue(any(user_path in m for m in logs.output), logs.output)
+        timeout = subprocess.TimeoutExpired(["tesseract"], 5)
+        with mock.patch.object(ps, "_run_tesseract", side_effect=timeout), self.assertLogs(ps.log, "WARNING"), \
+                self.assertRaises(ps.PdfError) as cm:
+            ps.ocr_image(Path("/x/tesseract"), b"P5", "eng", 5)
+        self.assertEqual(str(cm.exception), "OCR timed out")
+
+    def test_version_and_langs_get_empty_stdin(self):
+        with mock.patch.object(ps.subprocess, "run", return_value=self.done(out=b"tesseract 5\n")) as run:
+            ps.tesseract_info(Path("/x/tesseract"))
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            self.assertIs(call.kwargs.get("stdin"), subprocess.DEVNULL)
+            self.assertNotIn("input", call.kwargs)
+
+    def test_ocr_call_sends_image_on_stdin(self):
+        with mock.patch.object(ps.subprocess, "run", return_value=self.done(out=b"x")) as run:
+            ps.ocr_image(Path("/x/tesseract"), b"P5 data", "eng", 5)
+        self.assertEqual(run.call_args.kwargs.get("input"), b"P5 data")
+        self.assertNotIn("stdin", run.call_args.kwargs)
+
+
 class OcrSettingsTests(unittest.TestCase):
     def test_defaults_and_config(self):
         d = ps.OcrSettings()
@@ -455,6 +499,18 @@ class OcrSettingsTests(unittest.TestCase):
         s = ps.OcrSettings.from_config(cfg)
         self.assertFalse(s.enabled)
         self.assertEqual(s.dpi, 200)
+
+    def test_bad_numbers_fall_back_to_defaults(self):
+        cfg = ps.AppConfig(Path(tempfile.mkdtemp()) / "c.json")
+        self.addCleanup(shutil.rmtree, cfg.path.parent, True)
+        for bad in ("abc", None, [1], "12.5"):
+            cfg.data["pdf"].update(ocr_dpi=bad, ocr_timeout=bad)
+            with self.assertLogs(ps.log, "WARNING"):
+                s = ps.OcrSettings.from_config(cfg)
+            self.assertEqual((s.dpi, s.timeout), (300, 120), bad)
+        cfg.data["pdf"].update(ocr_dpi="150", ocr_timeout=60)
+        s = ps.OcrSettings.from_config(cfg)
+        self.assertEqual((s.dpi, s.timeout), (150, 60))
 
 
 def _qapp():

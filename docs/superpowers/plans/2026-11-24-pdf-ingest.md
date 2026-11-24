@@ -28,7 +28,7 @@
   - little-text page (fewer than 20 characters) with some text layer and no OCR text: `--- page N (little text, image text not read: <reason>) ---` (the text layer is kept)
   - any header above, when the page's form fields or notes cannot be read: ` (form fields or notes not read)` goes before the closing ` ---`. Read values go under the page text after a `[form fields and notes]` line, one per line.
   - mostly-image or unreadable page kept as text layer: `--- page N (mostly image, image text not read: <reason>) ---` / `--- page N (unreadable text, not read: <reason>) ---`
-- Reasons, exact strings: `Tesseract not installed`, `OCR turned off`, `Hebrew language data missing`, `English language data missing`, `no OCR language data`, `OCR failed: <detail>`, `OCR timed out`.
+- Reasons, exact strings: `Tesseract not installed`, `OCR turned off`, `Hebrew language data missing`, `English language data missing`, `no OCR language data`, `OCR failed`, `OCR timed out`, `OCR found no text`. The OCR failure detail (OSError text or the first stderr line) goes to the Log tab only, never into the header.
 - Classification thresholds: fewer than `20` non-space characters → scanned; image area ≥ `0.5` of page area → mostly image; fewer than `0.5` of non-space characters readable → unreadable.
 - Config defaults (exact): `"pdf": {"ocr_enabled": True, "tesseract_path": "", "ocr_languages": "heb+eng", "ocr_dpi": 300, "ocr_timeout": 120}`.
 - Error messages (exact): `PDF support needs the pypdfium2 package.` / `This PDF is password protected. PII Shield cannot open it.`
@@ -273,7 +273,7 @@ git commit -m "PDF ingest: text extraction, page classification and PDF fixtures
 - Produces:
   - `find_tesseract(configured: str = "") -> Optional[Path]` — order: configured path (if it is a file), `APP_DIR / "tesseract" / ("tesseract.exe" if os.name == "nt" else "tesseract")`, `shutil.which("tesseract")`, and on Windows `Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")`.
   - `tesseract_info(exe: Path) -> Tuple[str, Set[str]]` — version (first line of `--version`) and the language set from `--list-langs` (skip the header line).
-  - `ocr_image(exe: Path, image: Path, languages: str, timeout: int) -> str` — runs `[exe, image, "stdout", "-l", languages]`, returns `clean_bidi(stdout)`; raises `PdfError("OCR failed: <stderr first line or exit code>")` or `PdfError("OCR timed out")`.
+  - `ocr_image(exe: Path, image: Path, languages: str, timeout: int) -> str` — runs `[exe, image, "stdout", "-l", languages]`, returns `clean_bidi(stdout)`; raises `PdfError("OCR failed")` or `PdfError("OCR timed out")`; the detail (stderr first line or exit code) goes to `log.warning` only.
   - `extract_pdf_text` now runs OCR for `scanned`, `mostly_image` and `unreadable` pages.
 
 - [ ] **Step 1: Write the failing tests**
@@ -336,7 +336,7 @@ class OcrTests(unittest.TestCase):
                         "--", str(doc)], check=True)
         r = ps.extract_pdf_text(doc, self.settings(fake_tesseract(self.tmp, fail_on_call=1)))
         self.assertEqual([p.method for p in r.pages], ["skipped", "ocr"])
-        self.assertIn("--- page 1 (scanned, skipped: OCR failed: boom) ---", r.text)
+        self.assertIn("--- page 1 (scanned, skipped: OCR failed) ---", r.text)
 
     def test_timeout(self):
         s = self.settings(fake_tesseract(self.tmp, sleep=3)); s.timeout = 1
