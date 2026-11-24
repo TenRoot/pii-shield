@@ -105,6 +105,50 @@ class ExtractTextTests(unittest.TestCase):
         self.assertEqual(page.text.strip(), "page 7")
         self.assertFalse(r.all_skipped)
 
+    def test_form_field_value_and_note_are_read(self):
+        r = ps.extract_pdf_text(FIX / "form_filled.pdf", self.off())
+        page = r.pages[0]
+        self.assertEqual(page.header, "--- page 1 ---")
+        self.assertEqual(page.method, "text")
+        self.assertIn("Application form for the customer account\n[form fields and notes]\n", page.text)
+        lines = page.text.split("[form fields and notes]\n", 1)[1].splitlines()
+        self.assertEqual(lines, ["test@example.com", "ID 123456782"])
+        self.assertIn("--- page 1 ---\nApplication form", r.text)
+
+    def test_annot_values_without_form_env_reads_v(self):
+        doc = ps.pdfium.PdfDocument(str(FIX / "form_filled.pdf"))
+        try:
+            page = doc[0]
+            self.assertEqual(ps._annot_values(page, None), ["test@example.com", "ID 123456782"])
+            page.close()
+        finally:
+            doc.close()
+
+    def test_no_form_block_without_annotations(self):
+        r = ps.extract_pdf_text(FIX / "he_text.pdf", self.off())
+        self.assertNotIn("[form fields and notes]", r.text)
+
+    def test_form_values_on_skipped_page(self):
+        with mock.patch.object(ps, "_annot_values", return_value=["test@example.com"]):
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.off())
+        page = r.pages[0]
+        self.assertEqual(page.header, "--- page 1 (scanned, skipped: OCR turned off) ---")
+        self.assertEqual(page.text, "[form fields and notes]\ntest@example.com")
+
+    def test_annotation_read_failure_marks_header(self):
+        with mock.patch.object(ps, "_annot_values", side_effect=RuntimeError("bad annot")), \
+                self.assertLogs(ps.log, "WARNING"):
+            r = ps.extract_pdf_text(FIX / "form_filled.pdf", self.off())
+        page = r.pages[0]
+        self.assertEqual(page.header, "--- page 1 (form fields or notes not read) ---")
+        self.assertIn("Application form", page.text)
+        self.assertNotIn("[form fields and notes]", page.text)
+        with mock.patch.object(ps, "_annot_values", side_effect=RuntimeError("bad annot")), \
+                self.assertLogs(ps.log, "WARNING"):
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.off())
+        self.assertEqual(r.pages[0].header,
+                         "--- page 1 (scanned, skipped: OCR turned off) (form fields or notes not read) ---")
+
     def test_password_pdf_raises_pdf_error(self):
         with self.assertRaises(ps.PdfError) as cm:
             ps.extract_pdf_text(FIX / "he_password.pdf", self.off())

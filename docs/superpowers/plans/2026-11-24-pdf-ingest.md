@@ -26,6 +26,7 @@
   - OCR with a missing language: `--- page N (OCR, English only: Hebrew language data missing) ---` (or `Hebrew only: English language data missing`)
   - skipped scanned page: `--- page N (scanned, skipped: <reason>) ---`
   - little-text page (fewer than 20 characters) with some text layer and no OCR text: `--- page N (little text, image text not read: <reason>) ---` (the text layer is kept)
+  - any header above, when the page's form fields or notes cannot be read: ` (form fields or notes not read)` goes before the closing ` ---`. Read values go under the page text after a `[form fields and notes]` line, one per line.
   - mostly-image or unreadable page kept as text layer: `--- page N (mostly image, image text not read: <reason>) ---` / `--- page N (unreadable text, not read: <reason>) ---`
 - Reasons, exact strings: `Tesseract not installed`, `OCR turned off`, `Hebrew language data missing`, `English language data missing`, `no OCR language data`, `OCR failed: <detail>`, `OCR timed out`.
 - Classification thresholds: fewer than `20` non-space characters → scanned; image area ≥ `0.5` of page area → mostly image; fewer than `0.5` of non-space characters readable → unreadable.

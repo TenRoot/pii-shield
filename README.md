@@ -102,6 +102,10 @@ The GUI has five tabs:
 header line, for example `--- page 1 ---`. The text is read on your computer only. The app
 makes no network call.
 
+The app also reads filled form fields and notes (for example "Fill & Sign" text). It
+writes their values under the page text, after a `[form fields and notes]` line, one value
+per line. If the app cannot read them, the page line says `(form fields or notes not read)`.
+
 Scanned pages have no text layer. The app sends them to Tesseract (OCR) with Hebrew and
 English data. Pages that are mostly an image, or whose text is unreadable, also go to OCR.
 The page line then reads `--- page 2 (OCR) ---`.

@@ -33,6 +33,7 @@ import argparse
 import base64
 import bisect
 import copy
+import ctypes
 import datetime as _dt
 import hashlib
 import json
@@ -3261,6 +3262,68 @@ def _layer_text(page) -> str:
     return "\n".join(fix_visual_order(line) for line in raw.split("\n")).rstrip()
 
 
+FORM_NOTES_LINE = "[form fields and notes]"
+FORM_NOTES_FAILED = " (form fields or notes not read)"
+
+
+def _utf16_value(fn, *args) -> str:
+    """Call a pdfium getter that fills a UTF-16LE buffer (size query first, then the read)."""
+    size = fn(*args, None, 0)
+    if size <= 2:
+        return ""
+    buf = ctypes.create_string_buffer(size)
+    fn(*args, ctypes.cast(buf, ctypes.POINTER(pdfium.raw.FPDF_WCHAR)), size)
+    return buf.raw[:size].decode("utf-16-le", "replace").rstrip("\x00")
+
+
+# Widget types whose value is a state name, not text the user typed.
+_NON_TEXT_FIELDS = {1, 2, 3, 7}  # push button, check box, radio button, signature
+
+
+def _annot_values(page, formenv=None) -> List[str]:
+    """Return the form-field values and annotation notes on a page, in annotation order.
+
+    pdfium's text page reads only the page content, so a filled form field (/V) and a
+    note such as a FreeText "Fill & Sign" entry (/Contents) are not in the text layer.
+    """
+    raw = pdfium.raw
+    values: List[str] = []
+    for i in range(raw.FPDFPage_GetAnnotCount(page.raw)):
+        annot = raw.FPDFPage_GetAnnot(page.raw, i)
+        if not annot:
+            raise PdfError("cannot read annotation")
+        try:
+            subtype = raw.FPDFAnnot_GetSubtype(annot)
+            if subtype == raw.FPDF_ANNOT_POPUP:
+                continue  # a popup repeats the note of its parent annotation
+            if subtype == raw.FPDF_ANNOT_WIDGET:
+                if formenv is not None:
+                    if raw.FPDFAnnot_GetFormFieldType(formenv.raw, annot) in _NON_TEXT_FIELDS:
+                        continue
+                    # Reads /V also when the widget inherits it from a parent field.
+                    value = _utf16_value(raw.FPDFAnnot_GetFormFieldValue, formenv.raw, annot)
+                else:
+                    value = _utf16_value(raw.FPDFAnnot_GetStringValue, annot, b"V")
+            else:
+                value = _utf16_value(raw.FPDFAnnot_GetStringValue, annot, b"Contents")
+        finally:
+            raw.FPDFPage_CloseAnnot(annot)
+        value = clean_bidi(value).strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _add_annot_values(done: PdfPage, values: List[str], failed: bool) -> PdfPage:
+    """Append form-field values and notes under the page text; mark the header if they were not read."""
+    if values:
+        block = FORM_NOTES_LINE + "\n" + "\n".join(values)
+        done.text = (done.text.rstrip() + "\n" + block) if done.text.strip() else block
+    if failed:
+        done.header = done.header[:-len(" ---")] + FORM_NOTES_FAILED + " ---"
+    return done
+
+
 def find_tesseract(configured: str = "") -> Optional[Path]:
     """Find the Tesseract program: configured path, bundled copy, PATH, then the Windows default."""
     if configured and Path(configured).is_file():
@@ -3372,6 +3435,11 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
     pages: List[PdfPage] = []
     engine = None  # (exe, languages, note, reason), set at the first page that needs OCR
     try:
+        try:
+            # Before any page loads: rendered pages for OCR then show the form fields.
+            doc.init_forms()
+        except Exception as exc:  # noqa: BLE001 - a PDF without usable forms still reads
+            log.warning("PDF forms not loaded: %s", exc)
         total = len(doc)
         for i in range(total):
             if cancel and cancel():
@@ -3380,6 +3448,11 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
             page = doc[i]
             ocr_text, ocr_note, reason = None, "", ""
             try:
+                try:
+                    values, values_failed = _annot_values(page, getattr(doc, "formenv", None)), False
+                except Exception as exc:  # noqa: BLE001 - never fail the page for its annotations
+                    values, values_failed = [], True
+                    log.warning("PDF page %d: form fields or notes not read: %s", n, type(exc).__name__)
                 layer = _layer_text(page)
                 kind = classify_page(layer, _image_ratio(page))
                 needs_ocr = kind != "text"
@@ -3402,7 +3475,7 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                             reason = str(exc)
             finally:
                 page.close()
-            done = _finish_page(n, layer, kind, ocr_text, reason, ocr_note)
+            done = _add_annot_values(_finish_page(n, layer, kind, ocr_text, reason, ocr_note), values, values_failed)
             pages.append(done)
             log.info("PDF page %d: %s%s", n, done.method, f" ({done.reason})" if done.reason else "")
     except pdfium.PdfiumError as exc:
