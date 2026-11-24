@@ -2005,6 +2005,8 @@ class DetectionEngine:
         self.ruleset = RuleSet()
         self.builtin_supported: List[str] = []
         self.last_ner_skipped = False     # True when the last analyze() dropped NER findings on log input
+        self.hebrew_model: Optional["HebrewNerModel"] = None
+        self.hebrew_status = "off"        # loaded | not installed | off | failed: <reason>
 
     @property
     def ready(self) -> bool:
@@ -2057,8 +2059,27 @@ class DetectionEngine:
                 self.mode = "presidio-regex-only"
                 progress("No spaCy model installed - NER (names/locations) disabled. "
                          "Run: python -m spacy download en_core_web_lg")
+            self._load_hebrew(ecfg, progress)
             self._reload_rules_locked()
             return self.mode
+
+    def _load_hebrew(self, ecfg, progress: Callable[[str], None]) -> None:
+        """Load the Hebrew NER model once. A failure never stops the engine."""
+        self.hebrew_model = None
+        if not ecfg.get("hebrew_ner"):
+            self.hebrew_status = "off"
+            return
+        folder = find_hebrew_model()
+        if folder is None:
+            self.hebrew_status = "not installed"
+            return
+        progress("Loading Hebrew NER model...")
+        try:
+            self.hebrew_model = load_hebrew_model(folder)
+            self.hebrew_status = "loaded"
+        except Exception as exc:
+            log.warning("Hebrew NER model failed to load: %s", exc)
+            self.hebrew_status = f"failed: {exc}"
 
     def _build_registry(self, rs: RuleSet):
         registry = RecognizerRegistry(supported_languages=["en"])
@@ -2068,6 +2089,9 @@ class DetectionEngine:
             for rec in list(registry.recognizers):
                 if rec.__class__.__name__ in NER_RECOGNIZERS:
                     registry.recognizers.remove(rec)
+        if self.hebrew_model is not None and self.config["engine"].get("hebrew_ner"):
+            registry.add_recognizer(HebrewNerRecognizer(
+                self.hebrew_model, organizations=bool(self.config["engine"].get("detect_organizations"))))
         for r in rs.rules:
             kw = dict(supported_entity=r.entity, name=r.name, supported_language="en",
                       context=r.context or None, global_regex_flags=r.flags)
@@ -2148,9 +2172,10 @@ class DetectionEngine:
                                        score_threshold=threshold)
             for r in results:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
-                if skip_ner and rname in NER_RECOGNIZERS:
+                if skip_ner and (rname in NER_RECOGNIZERS or rname == HEBREW_RECOGNIZER):
                     continue
-                src = "custom" if rname in custom_names else "presidio"
+                src = ("custom" if rname in custom_names
+                       else "hebrew_ner" if rname == HEBREW_RECOGNIZER else "presidio")
                 found.append(Finding(r.start, r.end, text[r.start:r.end], r.entity_type,
                                      float(r.score), src, rname))
         else:
@@ -3101,7 +3126,11 @@ def presidio_update_hint(newer: Sequence[Dict], frozen: bool) -> str:
     return "Presidio update available - close the app and run: pip install -U " + " ".join(r["package"] for r in newer)
 
 
-def self_test(engine: Optional[DetectionEngine] = None) -> Tuple[bool, List[str]]:
+HEBREW_SELF_TEST_TEXT = "דנה כהן נפגשה עם משה לוי בחיפה."
+
+
+def self_test(engine: Optional[DetectionEngine] = None,
+              require_hebrew: bool = False) -> Tuple[bool, List[str]]:
     """Load the real NLP engine with only the bundled rules and analyze a known sentence.
     Catches a build that is missing the spaCy model, Presidio config or rule data."""
     tmp = Path(tempfile.mkdtemp(prefix="pii_shield_selftest_"))
@@ -3117,6 +3146,12 @@ def self_test(engine: Optional[DetectionEngine] = None) -> Tuple[bool, List[str]
                   ("PERSON John Smith (spaCy NER)", ("PERSON", "John Smith") in found),
                   ("HOSTNAME SRV-DC01 (bundled rule)", ("HOSTNAME", "SRV-DC01") in found),
                   ("USERNAME CORP\\jsmith (bundled rule)", ("USERNAME", "CORP\\jsmith") in found)]
+        if engine.hebrew_status == "loaded":
+            he = engine.analyze(HEBREW_SELF_TEST_TEXT, [], SessionVault())
+            checks.append(("PERSON (Hebrew NER)",
+                           any(f.entity == "PERSON" and f.source == "hebrew_ner" for f in he)))
+        if require_hebrew:
+            checks.append(("Hebrew model loaded", engine.hebrew_status == "loaded"))
         lines = [f"{'ok  ' if ok else 'FAIL'}  {name}" for name, ok in checks]
         ok = all(ok for _, ok in checks)
         lines.append(f"{APP_NAME} {__version__} self-test: {'PASS' if ok else 'FAIL'} "
@@ -3728,6 +3763,34 @@ def load_hebrew_model(model_dir: Path) -> HebrewNerModel:
     session = ort.InferenceSession(str(model_dir / "model_quantized.onnx"), sess_options=opts,
                                    providers=["CPUExecutionProvider"])
     return HebrewNerModel(tokenizer, session, id2label)
+
+
+HEBREW_RECOGNIZER = "HebrewNerRecognizer"
+
+if PRESIDIO_OK:
+    class HebrewNerRecognizer(EntityRecognizer):
+        """Presidio recognizer over HebrewNerModel. It sits in the English registry; the model
+        only reads lines that hold Hebrew letters, so English text is left to spaCy."""
+
+        def __init__(self, model: "HebrewNerModel", organizations: bool = True):
+            entities = ["PERSON", "LOCATION"] + (["ORGANIZATION"] if organizations else [])
+            super().__init__(supported_entities=entities, supported_language="en", name=HEBREW_RECOGNIZER)
+            self.model = model
+
+        def load(self) -> None:  # the model arrives ready; nothing to load
+            pass
+
+        def analyze(self, text, entities, nlp_artifacts=None):
+            wanted = set(entities or self.supported_entities) & set(self.supported_entities)
+            results = []
+            for sp in self.model.predict(text):
+                if sp.entity not in wanted:
+                    continue
+                results.append(RecognizerResult(
+                    entity_type=sp.entity, start=sp.start, end=sp.end, score=float(sp.score),
+                    recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name,
+                                          RecognizerResult.RECOGNIZER_IDENTIFIER_KEY: self.id}))
+            return results
 
 
 # ===========================================================================
@@ -4370,6 +4433,13 @@ if QT_OK:
             self.skip_ner_logs = QtWidgets.QCheckBox("Turn off spaCy NER (names, organizations, places) "
                                                      "when the input looks like log lines")
             self.skip_ner_logs.setChecked(bool(e.get("skip_ner_on_logs")))
+            self.has_hebrew_model = find_hebrew_model() is not None
+            label = "Hebrew name detection (DictaBERT NER)"
+            self.chk_hebrew = QtWidgets.QCheckBox(
+                label if self.has_hebrew_model else f"{label} \u2014 Hebrew model not installed")
+            self.chk_hebrew.setToolTip("Model: DictaBERT NER by Dicta, CC BY 4.0.")
+            self.chk_hebrew.setChecked(bool(e.get("hebrew_ner")))
+            self.chk_hebrew.setEnabled(self.has_hebrew_model)
             self.entities = QtWidgets.QListWidget()
             known = sorted(set(engine.builtin_supported) | set(DEFAULT_BUILTIN_ENTITIES) |
                            set(e.get("builtin_entities", [])) | ({"ORGANIZATION"} if e.get("detect_organizations") else set()))
@@ -4383,6 +4453,7 @@ if QT_OK:
             f1.addRow("Score threshold", self.threshold)
             f1.addRow("", self.orgs)
             f1.addRow("", self.skip_ner_logs)
+            f1.addRow("", self.chk_hebrew)
             f1.addRow(QtWidgets.QLabel("Built-in Presidio entities (custom-rule entities are always on):"))
             f1.addRow(self.entities)
             tabs.addTab(w1, "Detection")
@@ -4477,11 +4548,15 @@ if QT_OK:
             e, b = self.config["engine"], self.config["behavior"]
             model = self.model.currentText()
             self.needs_engine_restart = (model != e.get("spacy_model") or
-                                         self.orgs.isChecked() != bool(e.get("detect_organizations")))
+                                         self.orgs.isChecked() != bool(e.get("detect_organizations")) or
+                                         (self.has_hebrew_model and
+                                          self.chk_hebrew.isChecked() != bool(e.get("hebrew_ner"))))
             e["spacy_model"] = model
             e["score_threshold"] = round(self.threshold.value(), 2)
             e["detect_organizations"] = self.orgs.isChecked()
             e["skip_ner_on_logs"] = self.skip_ner_logs.isChecked()
+            if self.has_hebrew_model:       # a disabled box must not erase the saved choice
+                e["hebrew_ner"] = self.chk_hebrew.isChecked()
             ents = [self.entities.item(i).text() for i in range(self.entities.count())
                     if self.entities.item(i).checkState() == Qt.CheckState.Checked]
             if self.orgs.isChecked() and "ORGANIZATION" not in ents:
@@ -5873,6 +5948,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="pii_sanitizer", description=f"{APP_NAME} - local PII sanitizer")
     ap.add_argument("--validate-rules", metavar="DIR", help="validate a rules folder and exit (for CI)")
     ap.add_argument("--self-test", action="store_true", help="load the NLP engine, analyze a sample and exit")
+    ap.add_argument("--require-hebrew", action="store_true",
+                    help="with --self-test: fail unless the Hebrew NER model is loaded")
     ap.add_argument("--version", action="store_true")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--log-file", metavar="FILE", help="write console output to FILE (the .exe has no console)")
@@ -5899,7 +5976,7 @@ def _main(args, argv=None) -> int:
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", stream=sys.stderr, force=True)
     if args.self_test:
-        ok, lines = self_test()
+        ok, lines = self_test(require_hebrew=args.require_hebrew)
         print("\n".join(lines))
         return 0 if ok else 1
     if args.version:

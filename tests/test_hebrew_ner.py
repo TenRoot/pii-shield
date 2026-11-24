@@ -190,5 +190,197 @@ class HebrewNerCoreTests(unittest.TestCase):
                 ps.load_hebrew_model(Path("/nonexistent"))
 
 
+TEMPLATE_RULES = HERE.parent / "github-repo-template" / "rules"
+HE_TEXT = "דנה כהן נפגשה בחיפה עם אקמה"
+HE_TABLE = {"דנה": "B-PER", "כהן": "I-PER", "בחיפה": "B-GPE", "אקמה": "B-ORG",
+            "משה": "B-PER", "לוי": "I-PER"}
+
+
+def fake_model():
+    return build(HE_TABLE)[0]
+
+
+def make_engine(tmp: Path, *, hebrew=True, orgs=True, model="fake", allow=None):
+    """Build an engine with a fake Hebrew model. model: 'fake', 'none' (not installed), 'fail'."""
+    rules = tmp / "rules"
+    shutil.copytree(TEMPLATE_RULES, rules / "remote")
+    (rules / "local").mkdir()
+    cfg = ps.AppConfig(tmp / "config.json")
+    cfg["engine"]["hebrew_ner"] = hebrew
+    cfg["engine"]["detect_organizations"] = orgs
+    folder = tmp / "he-model" if model != "none" else None
+    loader = mock.Mock(side_effect=RuntimeError("boom")) if model == "fail" \
+        else mock.Mock(return_value=fake_model())
+    eng = ps.DetectionEngine(cfg, rules)
+    with mock.patch.object(ps, "find_hebrew_model", return_value=folder), \
+         mock.patch.object(ps, "load_hebrew_model", loader):
+        eng.initialize()
+    return eng, loader
+
+
+def hebrew_findings(eng, text=HE_TEXT, vault=None):
+    return eng.analyze(text, [], vault or ps.SessionVault())
+
+
+class HebrewEngineTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.engine, _ = make_engine(cls.tmp)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_hebrew_person_found_with_source(self):
+        self.assertEqual(self.engine.hebrew_status, "loaded")
+        fs = hebrew_findings(self.engine)
+        person = [f for f in fs if f.entity == "PERSON" and f.text == "דנה כהן"]
+        self.assertEqual(len(person), 1)
+        self.assertEqual(person[0].source, "hebrew_ner")
+        self.assertEqual(person[0].recognizer, "HebrewNerRecognizer")
+        loc = [f for f in fs if f.entity == "LOCATION" and f.text == "בחיפה"]
+        self.assertEqual(loc[0].source, "hebrew_ner")
+
+    def test_allow_list_applies_to_hebrew(self):
+        with mock.patch.object(self.engine.ruleset, "allow_list", {"דנה כהן"}):
+            fs = hebrew_findings(self.engine)
+        self.assertFalse([f for f in fs if f.text == "דנה כהן"])
+
+    def test_threshold_applies_to_hebrew(self):
+        fs = self.engine.analyze(HE_TEXT, [], ps.SessionVault(), threshold=1.01)
+        self.assertFalse([f for f in fs if f.source == "hebrew_ner"])
+
+    def test_skip_ner_on_logs_drops_hebrew(self):
+        fs = self.engine.analyze(HE_TEXT, [], ps.SessionVault(), skip_ner=True)
+        self.assertFalse([f for f in fs if f.source == "hebrew_ner"])
+
+    def test_recognizer_filters_requested_entities(self):
+        rec = ps.HebrewNerRecognizer(fake_model())
+        res = rec.analyze(HE_TEXT, ["LOCATION"])
+        self.assertEqual({r.entity_type for r in res}, {"LOCATION"})
+        self.assertEqual(rec.name, "HebrewNerRecognizer")
+        self.assertEqual(rec.supported_language, "en")
+
+
+class HebrewEngineVariantTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_setting_off_skips_model(self):
+        eng, loader = make_engine(self.tmp, hebrew=False)
+        self.assertEqual(eng.hebrew_status, "off")
+        self.assertIsNone(eng.hebrew_model)
+        loader.assert_not_called()
+        self.assertFalse([f for f in hebrew_findings(eng) if f.source == "hebrew_ner"])
+
+    def test_detect_organizations_off_drops_hebrew_org(self):
+        eng, _ = make_engine(self.tmp, orgs=False)
+        self.assertEqual(eng.hebrew_status, "loaded")
+        fs = hebrew_findings(eng)
+        self.assertFalse([f for f in fs if f.entity == "ORGANIZATION"])
+        self.assertTrue([f for f in fs if f.entity == "PERSON" and f.source == "hebrew_ner"])
+        rec = ps.HebrewNerRecognizer(fake_model(), organizations=False)
+        self.assertNotIn("ORGANIZATION", rec.supported_entities)
+        self.assertFalse([r for r in rec.analyze(HE_TEXT, ["PERSON", "ORGANIZATION"])
+                          if r.entity_type == "ORGANIZATION"])
+
+    def test_load_failure_keeps_engine_running(self):
+        eng, _ = make_engine(self.tmp, model="fail")
+        self.assertTrue(eng.hebrew_status.startswith("failed"))
+        self.assertIn("boom", eng.hebrew_status)
+        self.assertIsNone(eng.hebrew_model)
+        fs = eng.analyze("John Smith logged in from 10.20.30.40", [], ps.SessionVault())
+        self.assertIn("PERSON", {f.entity for f in fs})
+        self.assertIn("INTERNAL_IP", {f.entity for f in fs})
+
+    def test_not_installed_status(self):
+        eng, loader = make_engine(self.tmp, model="none")
+        self.assertEqual(eng.hebrew_status, "not installed")
+        self.assertIsNone(eng.hebrew_model)
+        loader.assert_not_called()
+
+
+class HebrewSelfTestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_self_test_require_hebrew_fails_without_model(self):
+        eng, _ = make_engine(self.tmp, model="none")
+        ok, lines = ps.self_test(eng, require_hebrew=True)
+        self.assertFalse(ok)
+        self.assertTrue(any("FAIL" in l and "Hebrew model loaded" in l for l in lines))
+        self.assertFalse(any("PERSON (Hebrew NER)" in l for l in lines))
+
+    def test_self_test_without_require_ignores_missing_model(self):
+        eng, _ = make_engine(self.tmp, model="none")
+        _, lines = ps.self_test(eng)
+        self.assertFalse(any("Hebrew" in l for l in lines))
+
+    def test_self_test_hebrew_check_passes_with_fake_model(self):
+        eng, _ = make_engine(self.tmp)
+        _, lines = ps.self_test(eng, require_hebrew=True)
+        self.assertTrue(any(l.startswith("ok") and "PERSON (Hebrew NER)" in l for l in lines))
+        self.assertTrue(any(l.startswith("ok") and "Hebrew model loaded" in l for l in lines))
+
+    def test_cli_flag_passes_require_hebrew(self):
+        with mock.patch.object(ps, "self_test", return_value=(True, ["x"])) as st:
+            rc = ps.main(["--self-test", "--require-hebrew"])
+        self.assertEqual(rc, 0)
+        st.assert_called_once_with(require_hebrew=True)
+
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+class HebrewSettingsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        cls.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = ps.AppConfig(self.tmp / "config.json")
+
+    def dialog(self, model):
+        with mock.patch.object(ps, "find_hebrew_model", return_value=model):
+            dlg = ps.SettingsDialog(None, self.cfg, mock.Mock(builtin_supported=[]))
+        self.addCleanup(dlg.deleteLater)
+        return dlg
+
+    def test_settings_checkbox_disabled_without_model(self):
+        dlg = self.dialog(None)
+        self.assertFalse(dlg.chk_hebrew.isEnabled())
+        self.assertIn("Hebrew model not installed", dlg.chk_hebrew.text())
+        self.assertIn("Hebrew name detection (DictaBERT NER)", dlg.chk_hebrew.text())
+
+    def test_settings_checkbox_enabled_with_model_and_tooltip(self):
+        dlg = self.dialog(self.tmp)
+        self.assertTrue(dlg.chk_hebrew.isEnabled())
+        self.assertEqual(dlg.chk_hebrew.text(), "Hebrew name detection (DictaBERT NER)")
+        self.assertEqual(dlg.chk_hebrew.toolTip(), "Model: DictaBERT NER by Dicta, CC BY 4.0.")
+
+    def test_settings_checkbox_saves(self):
+        dlg = self.dialog(self.tmp)
+        self.assertTrue(dlg.chk_hebrew.isChecked())
+        dlg.chk_hebrew.setChecked(False)
+        dlg._accept()
+        self.assertFalse(self.cfg.data["engine"]["hebrew_ner"])
+        self.assertTrue(dlg.needs_engine_restart)
+
+    def test_unchanged_checkbox_needs_no_restart(self):
+        dlg = self.dialog(self.tmp)
+        dlg._accept()
+        self.assertFalse(dlg.needs_engine_restart)
+
+    def test_disabled_checkbox_keeps_saved_value(self):
+        self.cfg["engine"]["hebrew_ner"] = True
+        dlg = self.dialog(None)
+        dlg._accept()
+        self.assertTrue(self.cfg.data["engine"]["hebrew_ner"])
+
+
 if __name__ == "__main__":
     unittest.main()
