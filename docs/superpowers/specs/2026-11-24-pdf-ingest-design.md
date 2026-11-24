@@ -163,6 +163,11 @@ The app does two things to each extracted line:
    This is the reverse of how a viewer draws a right-to-left line. It is a simple
    form of the Unicode bidi rules, and it is enough for one-line runs of text.
 
+Spike result (pypdfium2 5.15.2): pdfium already reorders most Hebrew lines into
+logical order when it extracts text. A LibreOffice PDF came out in correct logical
+order, with `\r\n` line ends and no bidi control characters. So the visual-order
+fix is a fallback only. It must not change a line that is already in logical order.
+
 The builder confirms this with fixture PDFs: one in logical order (made with
 LibreOffice) and one in visual order. Both must give the same text. A value such as
 `123456782` or `test@example.com` must come out whole and in the correct order.
@@ -178,8 +183,12 @@ LibreOffice) and one in visual order. Both must give the same text. A value such
   visual-order fix to OCR text.
 - **Find Tesseract** in this order:
   1. The `pdf.tesseract_path` setting.
-  2. `shutil.which("tesseract")`.
-  3. On Windows: `C:\Program Files\Tesseract-OCR\tesseract.exe`.
+  2. A bundled copy: `tesseract/tesseract.exe` (Windows) or `tesseract/tesseract`
+     next to the app executable or `pii_sanitizer.py`. The small build has no such
+     folder. The later big build (bundled Tesseract and Hebrew NER, separate design)
+     puts it there.
+  3. `shutil.which("tesseract")`.
+  4. On Windows: `C:\Program Files\Tesseract-OCR\tesseract.exe`.
 - **Check languages** once per run with `tesseract --list-langs`. The app uses the
   languages from `pdf.ocr_languages` that are installed. If one is missing, OCR
   runs with the others, and each OCR header says so, for example
