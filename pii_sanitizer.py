@@ -41,6 +41,7 @@ import math
 import re
 import shutil
 import stat
+import string
 import sys
 import tempfile
 import threading
@@ -57,6 +58,11 @@ try:
     import yaml  # PyYAML
 except ImportError:  # pragma: no cover
     yaml = None
+
+try:
+    import pypdfium2 as pdfium  # PDF text extraction + page rendering (optional)
+except ImportError:  # pragma: no cover
+    pdfium = None
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -3072,6 +3078,52 @@ def mask_value(v: str) -> str:
 def py_to_qt_index(text: str, idx: int) -> int:
     """Qt positions count UTF-16 code units; Python counts code points."""
     return idx + sum(1 for c in text[:idx] if ord(c) > 0xFFFF)
+
+
+# ---- PDF ingest ----
+
+BIDI_CONTROLS = "\u200e\u200f\u061c\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+_BIDI_RE = re.compile(f"[{BIDI_CONTROLS}]")
+_HE = "\u05d0-\u05ea"
+_HE_WORD_RE = re.compile(f"[{_HE}]+")
+_RUN_RE = re.compile(rf"[A-Za-z0-9](?:[^{_HE}]*[A-Za-z0-9])?|[{_HE}]+|.", re.S)
+_HE_FINALS = "\u05da\u05dd\u05df\u05e3\u05e5"
+_READABLE_EXTRA = "\u05be\u05f3\u05f4\u2013\u2014\u2019\u201c\u201d\u2022"
+_READABLE_RE = re.compile(rf"[{_HE}A-Za-z0-9{re.escape(string.punctuation + _READABLE_EXTRA)}]")
+
+
+def clean_bidi(text: str) -> str:
+    """Remove bidi control characters and normalize line endings to \\n."""
+    return _BIDI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def is_visual_order(line: str) -> bool:
+    """True when Hebrew words look reversed (final letters at word starts, not ends)."""
+    starts = ends = 0
+    for w in _HE_WORD_RE.findall(line):
+        if w[0] in _HE_FINALS:
+            starts += 1
+        if w[-1] in _HE_FINALS:
+            ends += 1
+    return starts > ends
+
+
+def fix_visual_order(line: str) -> str:
+    """Turn a visual-order line into logical order; other lines are returned unchanged."""
+    if not is_visual_order(line):
+        return line
+    runs = _RUN_RE.findall(line)
+    he = re.compile(f"[{_HE}]+")
+    return "".join(r[::-1] if he.fullmatch(r) else r for r in reversed(runs))
+
+
+def is_readable(text: str) -> bool:
+    """False when most non-space characters are not Hebrew, ASCII or common punctuation."""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return True
+    good = sum(1 for c in chars if _READABLE_RE.match(c))
+    return good / len(chars) >= 0.5
 
 
 # ===========================================================================
