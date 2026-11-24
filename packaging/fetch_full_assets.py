@@ -62,10 +62,11 @@ TESSDATA_FILES = [
 # copies only the DLLs that tesseract.exe loads (see needed_dlls). A needed DLL that is not in
 # this table stops the script, so an installer update cannot ship an unlisted DLL.
 # DLL file name (lower case) -> (project, SPDX license, URL, extra duty or "")
-LGPL_DUTY = ("LGPL: the license text and the library source must be available. Get both from "
-             "the project URL; replace the DLL with your own build of the same version if you like.")
-GPL_DUTY = ("GPL: the license text and the complete source must be available. Get both from "
-            "the project URL.")
+LGPL_DUTY = ("LGPL: the license text and the library source must be available. The full license "
+             "text, the source link and the source offer are at the end of this file. You can "
+             "replace the DLL with your own build of the same version.")
+GPL_DUTY = ("GPL: the license text and the complete source must be available. The full license "
+            "text, the source link and the source offer are at the end of this file.")
 GCC_DUTY = ("Covered by the GCC Runtime Library Exception 3.1: no source duty for programs "
             "that use it.")
 DLL_LICENSES: Dict[str, Tuple[str, str, str, str]] = {
@@ -115,6 +116,24 @@ DLL_LICENSES: Dict[str, Tuple[str, str, str, str]] = {
     "libwinpthread-1.dll": ("mingw-w64 winpthreads", "MIT AND BSD-3-Clause",
                             "https://www.mingw-w64.org/", ""),
 }
+
+# GPL and LGPL DLLs: (source URL, vendored license text files in packaging/licenses/).
+# The texts are the FSF texts (GPL-3.0 and LGPL-3.0 match gnu.org byte for byte; GPL-2.0 and
+# LGPL-2.1 are the Debian common-licenses copies with the current FSF address). LGPL-3.0 adds
+# permissions to GPL-3.0, so the GPL-3.0 text ships with it. Every DLL with a GPL or LGPL duty
+# above must have an entry here (check_copyleft_sources).
+LICENSES_DIR = Path(__file__).resolve().parent / "licenses"
+COPYLEFT_SOURCES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
+    "libjbig-0.dll": ("https://www.cl.cam.ac.uk/~mgk25/jbigkit/download/jbigkit-2.1.tar.gz",
+                      ("GPL-2.0.txt",)),
+    "libiconv-2.dll": ("https://ftp.gnu.org/gnu/libiconv/", ("LGPL-2.1.txt",)),
+    "libintl-8.dll": ("https://ftp.gnu.org/gnu/gettext/", ("LGPL-2.1.txt",)),
+    "libidn2-0.dll": ("https://ftp.gnu.org/gnu/libidn/", ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt")),
+    "libunistring-5.dll": ("https://ftp.gnu.org/gnu/libunistring/",
+                           ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt")),
+}
+SOURCE_OFFER = ("The source code of these components is available at the URLs above; on request "
+                "we provide it for at least three years.")
 
 TIMEOUT = 60
 CHUNK = 1 << 20
@@ -344,8 +363,39 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         lines += ["", f"  {d}", f"    Project: {project}", f"    License: {spdx}", f"    URL: {url}"]
         if duty:
             lines.append(f"    Note: {duty}")
-    lines += ["", "Tesseract license text", "----------------------", tesseract_license.strip(), ""]
-    return "\n".join(lines)
+    lines += ["", "Tesseract license text", "----------------------", tesseract_license.strip()]
+    lines += copyleft_section(dlls)
+    return "\n".join(lines + [""])
+
+
+def check_copyleft_sources() -> None:
+    missing = sorted(d for d, (_, _, _, duty) in DLL_LICENSES.items()
+                     if duty in (GPL_DUTY, LGPL_DUTY) and d not in COPYLEFT_SOURCES)
+    if missing:
+        raise AssetError("GPL or LGPL DLL without a source link and license text: " +
+                         ", ".join(missing) + ". Add each one to COPYLEFT_SOURCES.")
+
+
+def copyleft_section(dlls: List[str]) -> List[str]:
+    """Source links, the written source offer and the full license texts for the GPL and LGPL
+    DLLs in dlls. Empty when there are none."""
+    check_copyleft_sources()
+    present = sorted((d for d in dlls if d.lower() in COPYLEFT_SOURCES), key=str.lower)
+    if not present:
+        return []
+    lines = ["", "GPL and LGPL components: source code", "------------------------------------"]
+    texts: List[str] = []
+    for d in present:
+        project, spdx, _, _ = DLL_LICENSES[d.lower()]
+        url, files = COPYLEFT_SOURCES[d.lower()]
+        lines += [f"  {d} ({project}, {spdx})", f"    Source: {url}"]
+        texts += [f for f in files if f not in texts]
+    lines += ["", SOURCE_OFFER]
+    for name in texts:
+        title = "License text: " + name[:-len(".txt")]
+        lines += ["", title, "-" * len(title),
+                  (LICENSES_DIR / name).read_text(encoding="utf-8").strip()]
+    return lines
 
 
 def fetch_tesseract(dest: Path, downloader: Downloader = http_download) -> Path:

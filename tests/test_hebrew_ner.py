@@ -529,6 +529,42 @@ class FetchAssetsTests(unittest.TestCase):
         jbig = text[text.index("libjbig-0.dll"):text.index("zlib1.dll")]
         self.assertIn("GPL: the license text and the complete source", jbig)
 
+    def test_notices_hold_gpl_texts_source_links_and_offer(self):
+        text = fa.thirdparty_notices(["zlib1.dll", "libjbig-0.dll", "libiconv-2.dll"], "Apache")
+        self.assertIn("https://www.cl.cam.ac.uk/~mgk25/jbigkit/download/jbigkit-2.1.tar.gz", text)
+        self.assertIn("https://ftp.gnu.org/gnu/libiconv/", text)
+        self.assertIn("The source code of these components is available at the URLs above; on "
+                      "request we provide it for at least three years.", text)
+        # full texts, each once: GPL-2.0 for JBIG-KIT, LGPL-2.1 for libiconv
+        self.assertEqual(text.count("GNU GENERAL PUBLIC LICENSE\n                       Version 2, June 1991"), 1)
+        self.assertEqual(text.count("Version 2.1, February 1999"), 1)
+        self.assertIn("END OF TERMS AND CONDITIONS", text)
+        self.assertNotIn("Version 3, 29 June 2007", text)
+        # the DLL -> SPDX table stays
+        self.assertIn("License: GPL-2.0-or-later", text)
+
+    def test_lgpl3_component_ships_gpl3_text(self):
+        text = fa.thirdparty_notices(["libidn2-0.dll"], "")
+        self.assertIn("GNU LESSER GENERAL PUBLIC LICENSE\n                       Version 3", text)
+        self.assertIn("GNU GENERAL PUBLIC LICENSE\n                       Version 3", text)
+
+    def test_no_copyleft_section_without_copyleft_dlls(self):
+        text = fa.thirdparty_notices(["zlib1.dll"], "")
+        self.assertNotIn("source code of these components", text)
+        self.assertNotIn("GNU GENERAL PUBLIC LICENSE", text)
+
+    def test_every_gpl_and_lgpl_dll_has_source_and_vendored_text(self):
+        fa.check_copyleft_sources()
+        for dll, (url, files) in fa.COPYLEFT_SOURCES.items():
+            self.assertIn(dll, fa.DLL_LICENSES)
+            self.assertTrue(url.startswith("https://"))
+            for f in files:
+                self.assertTrue((fa.LICENSES_DIR / f).is_file(), f)
+        with mock.patch.dict(fa.COPYLEFT_SOURCES, clear=True):
+            with self.assertRaises(fa.AssetError) as cm:
+                fa.thirdparty_notices(["libjbig-0.dll"], "")
+        self.assertIn("libjbig-0.dll", str(cm.exception))
+
     def test_notices_with_unlisted_dll_fail(self):
         with self.assertRaises(fa.AssetError) as cm:
             fa.thirdparty_notices(["zlib1.dll", "libnew-9.dll"], "")
