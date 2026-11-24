@@ -42,6 +42,7 @@ import re
 import shutil
 import stat
 import string
+import subprocess
 import sys
 import tempfile
 import threading
@@ -51,7 +52,7 @@ from collections import OrderedDict, defaultdict
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import urlparse, quote
 
 try:
@@ -3236,9 +3237,105 @@ def _layer_text(page) -> str:
     return "\n".join(fix_visual_order(line) for line in raw.split("\n")).rstrip()
 
 
+def find_tesseract(configured: str = "") -> Optional[Path]:
+    """Find the Tesseract program: configured path, bundled copy, PATH, then the Windows default."""
+    if configured and Path(configured).is_file():
+        return Path(configured)
+    bundled = APP_DIR / "tesseract" / ("tesseract.exe" if os.name == "nt" else "tesseract")
+    if bundled.is_file():
+        return bundled
+    found = shutil.which("tesseract")
+    if found:
+        return Path(found)
+    if os.name == "nt":
+        default = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+        if default.is_file():
+            return default
+    return None
+
+
+def _run_tesseract(args: List[str], timeout: int) -> "subprocess.CompletedProcess[bytes]":
+    return subprocess.run(args, capture_output=True, timeout=timeout, shell=False,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def tesseract_info(exe: Path) -> Tuple[str, Set[str]]:
+    """Return the Tesseract version line and the set of installed language codes."""
+    try:
+        v = _run_tesseract([str(exe), "--version"], 30)
+        l = _run_tesseract([str(exe), "--list-langs"], 30)
+    except (OSError, subprocess.SubprocessError):
+        return "", set()
+    version = (v.stdout or v.stderr).decode("utf-8", "replace").strip().splitlines()
+    langs = l.stdout.decode("utf-8", "replace").splitlines()[1:]
+    return (version[0].strip() if version else ""), {x.strip() for x in langs if x.strip()}
+
+
+def ocr_image(exe: Path, image: Path, languages: str, timeout: int) -> str:
+    """Run Tesseract on one image and return the cleaned text. Raises PdfError on failure."""
+    try:
+        r = _run_tesseract([str(exe), str(image), "stdout", "-l", languages], timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise PdfError("OCR timed out") from exc
+    except OSError as exc:
+        raise PdfError(f"OCR failed: {exc}") from exc
+    if r.returncode != 0:
+        err = r.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise PdfError(f"OCR failed: {err[0].strip() if err else f'exit code {r.returncode}'}")
+    return clean_bidi(r.stdout.decode("utf-8", "replace"))
+
+
+_LANG_NAMES = {"heb": "Hebrew", "eng": "English"}
+
+
+def _ocr_languages(wanted: str, installed: Set[str]) -> Tuple[str, str]:
+    """Return (languages to use, note). Languages is "" when none is installed."""
+    codes = [c for c in wanted.split("+") if c]
+    have = [c for c in codes if c in installed]
+    if not have:
+        return "", ""
+    if len(have) == len(codes):
+        return "+".join(have), ""
+    missing = " and ".join(_LANG_NAMES.get(c, c) for c in codes if c not in installed)
+    used = " and ".join(_LANG_NAMES.get(c, c) for c in have)
+    return "+".join(have), f"{used} only: {missing} language data missing"
+
+
+def _render_pgm(page, dpi: int) -> Path:
+    """Render a page to a temporary binary PGM file. The caller deletes the file."""
+    bitmap = page.render(scale=dpi / 72, grayscale=True)
+    try:
+        w, h, stride = bitmap.width, bitmap.height, bitmap.stride
+        buf = memoryview(bitmap.buffer).cast("B")
+        fd, name = tempfile.mkstemp(suffix=".pgm")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(f"P5 {w} {h} 255\n".encode("ascii"))
+                for y in range(h):
+                    f.write(buf[y * stride:y * stride + w])
+        except BaseException:
+            Path(name).unlink(missing_ok=True)
+            raise
+        return Path(name)
+    finally:
+        bitmap.close()
+
+
+def _prepare_ocr(ocr: OcrSettings) -> Tuple[Optional[Path], str, str, str]:
+    """Find Tesseract and pick languages. Returns (exe, languages, note, skip reason)."""
+    exe = find_tesseract(ocr.tesseract_path)
+    if exe is None:
+        return None, "", "", "Tesseract not installed"
+    _version, installed = tesseract_info(exe)
+    langs, note = _ocr_languages(ocr.languages, installed)
+    if not langs:
+        return exe, "", "", "no OCR language data"
+    return exe, langs, note, ""
+
+
 def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[str], None]] = None,
                      cancel: Optional[Callable[[], bool]] = None) -> PdfExtraction:
-    """Read a PDF page by page. Pages that need OCR are marked, not read (OCR comes in a later step)."""
+    """Read a PDF page by page. Pages with no usable text layer go through Tesseract when OCR is on."""
     if pdfium is None:
         raise PdfError("PDF support needs the pypdfium2 package.")
     try:
@@ -3248,6 +3345,7 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
             raise PdfError("This PDF is password protected. PII Shield cannot open it.") from exc
         raise PdfError(f"Cannot open this PDF: {exc}") from exc
     pages: List[PdfPage] = []
+    engine = None  # (exe, languages, note, reason), set at the first page that needs OCR
     try:
         total = len(doc)
         for i in range(total):
@@ -3255,16 +3353,34 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                 break
             n = i + 1
             page = doc[i]
+            ocr_text, ocr_note, reason = None, "", ""
             try:
                 layer = _layer_text(page)
                 kind = classify_page(layer, _image_ratio(page))
+                needs_ocr = kind != "text"
+                if progress:
+                    progress(f"PDF: page {n} of {total}" + (" (OCR)" if needs_ocr and ocr.enabled else ""))
+                if not needs_ocr:
+                    pass
+                elif not ocr.enabled:
+                    reason = "OCR turned off"
+                else:
+                    if engine is None:
+                        engine = _prepare_ocr(ocr)
+                    exe, langs, ocr_note, reason = engine
+                    if exe is not None and langs:
+                        image = None
+                        try:
+                            image = _render_pgm(page, ocr.dpi)
+                            ocr_text = ocr_image(exe, image, langs, ocr.timeout)
+                        except PdfError as exc:
+                            reason = str(exc)
+                        finally:
+                            if image is not None:
+                                image.unlink(missing_ok=True)
             finally:
                 page.close()
-            needs_ocr = kind != "text"
-            if progress:
-                progress(f"PDF: page {n} of {total}" + (" (OCR)" if needs_ocr and ocr.enabled else ""))
-            reason = "" if not needs_ocr else ("Tesseract not installed" if ocr.enabled else "OCR turned off")
-            done = _finish_page(n, layer, kind, None, reason)
+            done = _finish_page(n, layer, kind, ocr_text, reason, ocr_note)
             pages.append(done)
             log.info("PDF page %d: %s%s", n, done.method, f" ({done.reason})" if done.reason else "")
     except pdfium.PdfiumError as exc:

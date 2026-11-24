@@ -1,5 +1,7 @@
 """PDF ingest tests:  python -m unittest discover -s tests -v"""
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,8 +65,15 @@ class ExtractTextTests(unittest.TestCase):
         self.assertTrue(r.all_skipped)
 
     def test_scan_pdf_reason_when_ocr_on_but_missing(self):
-        r = ps.extract_pdf_text(FIX / "he_scan.pdf", ps.OcrSettings(enabled=True))
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", ps.OcrSettings(enabled=True))
         self.assertIn("skipped: Tesseract not installed", r.text)
+
+    def test_ocr_off_never_looks_for_tesseract(self):
+        with mock.patch.object(ps, "find_tesseract") as find:
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.off())
+        find.assert_not_called()
+        self.assertIn("skipped: OCR turned off", r.text)
 
     def test_mixed_pdf_keeps_page_order(self):
         r = ps.extract_pdf_text(FIX / "he_mixed.pdf", self.off())
@@ -175,6 +184,130 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(p.header, "--- page 3 (unreadable text, not read: OCR turned off) ---")
         p = ps._finish_page(3, "  ", "mostly_image", None, "OCR turned off")
         self.assertEqual(p.method, "skipped")
+
+
+FAKE_TESSERACT = """#!{python}
+import sys, time
+from pathlib import Path
+here = Path(__file__).resolve().parent
+args = sys.argv[1:]
+if args[:1] == ["--version"]:
+    print("tesseract 5.0.0-fake"); print(" fake build"); sys.exit(0)
+if args[:1] == ["--list-langs"]:
+    print("List of available languages in \\"/fake\\" ({nlangs}):")
+    for l in {langs!r}: print(l)
+    sys.exit(0)
+calls = here / "calls.txt"
+with calls.open("a") as f: f.write(args[0] + "\\n")
+n = len(calls.read_text().splitlines())
+time.sleep({sleep})
+if {fail_on_call!r} == n:
+    sys.stderr.write("boom\\nsecond line\\n"); sys.exit(1)
+sys.stdout.write({text!r})
+"""
+
+
+def fake_tesseract(dirpath: Path, langs=("eng", "heb", "osd"), text="שם: ישראל ישראלי\nת.ז 123456782",
+                   fail_on_call=None, sleep=0) -> Path:
+    """Write an executable fake tesseract. --version, --list-langs, and OCR (prints text to stdout).
+    fail_on_call=N: the Nth OCR call exits 1 with 'boom' on stderr. sleep=S: each OCR call sleeps S seconds
+    first (--version and --list-langs never sleep). Writes each OCR image path to calls.txt in dirpath."""
+    exe = dirpath / "fake-tesseract"
+    exe.write_text(FAKE_TESSERACT.format(python=sys.executable, langs=tuple(langs), nlangs=len(langs),
+                                         sleep=sleep, fail_on_call=fail_on_call, text=text), encoding="utf-8")
+    exe.chmod(0o755)
+    return exe
+
+
+@unittest.skipIf(ps.pdfium is None, "pypdfium2 not installed")
+@unittest.skipIf(os.name == "nt", "fake tesseract is a POSIX script")
+class OcrTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def settings(self, exe):
+        return ps.OcrSettings(enabled=True, tesseract_path=str(exe), timeout=5)
+
+    def test_find_tesseract_order(self):
+        exe = fake_tesseract(self.tmp)
+        self.assertEqual(ps.find_tesseract(str(exe)), exe)
+        with mock.patch.object(ps.shutil, "which", return_value=None), \
+             mock.patch.object(ps, "APP_DIR", self.tmp / "none"), mock.patch.object(ps.os, "name", "posix"):
+            self.assertIsNone(ps.find_tesseract(""))
+        bundled = self.tmp / "app" / "tesseract"; bundled.mkdir(parents=True)
+        shutil.copy(exe, bundled / "tesseract")
+        with mock.patch.object(ps, "APP_DIR", self.tmp / "app"):
+            self.assertEqual(ps.find_tesseract(""), bundled / "tesseract")
+
+    def test_tesseract_info(self):
+        version, langs = ps.tesseract_info(fake_tesseract(self.tmp, langs=("eng", "heb")))
+        self.assertEqual(version, "tesseract 5.0.0-fake")
+        self.assertEqual(langs, {"eng", "heb"})
+
+    def test_scan_page_ocr(self):
+        r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.settings(fake_tesseract(self.tmp)))
+        self.assertEqual(r.pages[0].method, "ocr")
+        self.assertIn("--- page 1 (OCR) ---\nשם: ישראל ישראלי\nת.ז 123456782", r.text)
+        self.assertEqual(r.ocr_count, 1)
+
+    def test_image_text_page_uses_ocr_text(self):
+        r = ps.extract_pdf_text(FIX / "he_image_text.pdf", self.settings(fake_tesseract(self.tmp)))
+        self.assertEqual(r.pages[0].method, "ocr")
+        self.assertTrue(r.pages[0].header.startswith("--- page 1 (OCR"))
+
+    def test_availability_checked_once_and_lazily(self):
+        exe = fake_tesseract(self.tmp)
+        with mock.patch.object(ps, "find_tesseract", wraps=ps.find_tesseract) as find, \
+             mock.patch.object(ps, "tesseract_info", wraps=ps.tesseract_info) as info:
+            ps.extract_pdf_text(FIX / "he_text.pdf", self.settings(exe))
+            find.assert_not_called()
+            doc = self.tmp / "two_scans.pdf"
+            subprocess.run(["qpdf", "--empty", "--pages", str(FIX / "he_scan.pdf"), "1", str(FIX / "he_scan.pdf"), "1",
+                            "--", str(doc)], check=True)
+            ps.extract_pdf_text(doc, self.settings(exe))
+        self.assertEqual((find.call_count, info.call_count), (1, 1))
+
+    def test_missing_hebrew_runs_english_only(self):
+        r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.settings(fake_tesseract(self.tmp, langs=("eng",))))
+        self.assertIn("--- page 1 (OCR, English only: Hebrew language data missing) ---", r.text)
+
+    def test_no_language_data_skips(self):
+        r = ps.extract_pdf_text(FIX / "he_scan.pdf", self.settings(fake_tesseract(self.tmp, langs=("osd",))))
+        self.assertIn("--- page 1 (scanned, skipped: no OCR language data) ---", r.text)
+
+    def test_not_installed(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            r = ps.extract_pdf_text(FIX / "he_scan.pdf", ps.OcrSettings())
+        self.assertIn("--- page 1 (scanned, skipped: Tesseract not installed) ---", r.text)
+
+    @unittest.skipUnless(shutil.which("qpdf"), "qpdf needed")
+    def test_ocr_failure_on_one_page_continues(self):
+        doc = self.tmp / "two_scans.pdf"
+        subprocess.run(["qpdf", "--empty", "--pages", str(FIX / "he_scan.pdf"), "1", str(FIX / "he_scan.pdf"), "1",
+                        "--", str(doc)], check=True)
+        r = ps.extract_pdf_text(doc, self.settings(fake_tesseract(self.tmp, fail_on_call=1)))
+        self.assertEqual([p.method for p in r.pages], ["skipped", "ocr"])
+        self.assertIn("--- page 1 (scanned, skipped: OCR failed: boom) ---", r.text)
+
+    def test_timeout(self):
+        s = self.settings(fake_tesseract(self.tmp, sleep=3)); s.timeout = 1
+        r = ps.extract_pdf_text(FIX / "he_scan.pdf", s)
+        self.assertIn("--- page 1 (scanned, skipped: OCR timed out) ---", r.text)
+
+    def test_cancel_stops_between_pages_and_cleans_up(self):
+        calls = []
+        with mock.patch.object(ps.tempfile, "tempdir", str(self.tmp)):
+            r = ps.extract_pdf_text(FIX / "he_mixed.pdf", self.settings(fake_tesseract(self.tmp)),
+                                    cancel=lambda: (calls.append(1), len(calls) > 2)[1])
+        self.assertEqual(len(r.pages), 2)
+        self.assertEqual([p for p in self.tmp.rglob("*") if p.suffix in (".pgm", ".png")], [])
+
+    def test_temp_images_removed_after_ocr(self):
+        exe = fake_tesseract(self.tmp)
+        ps.extract_pdf_text(FIX / "he_scan.pdf", self.settings(exe))
+        used = [Path(l) for l in (self.tmp / "calls.txt").read_text().splitlines()]
+        self.assertTrue(used)
+        self.assertFalse(any(p.exists() for p in used))
 
 
 class OcrSettingsTests(unittest.TestCase):
