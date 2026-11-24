@@ -40,6 +40,20 @@ class BidiTests(unittest.TestCase):
         self.assertTrue(ps.is_readable("שם: ישראל ישראלי, test@example.com"))
         self.assertFalse(ps.is_readable("�� ab"))
 
+    def test_is_readable_other_scripts(self):
+        # Invented placeholder text, no real names.
+        russian = "Иванов Иван, паспорт 123456782, г. Пример"
+        arabic = "هذا نص تجريبي للاختبار فقط، رقم 123456782"
+        self.assertTrue(ps.is_readable(russian))
+        self.assertTrue(ps.is_readable(arabic))
+        self.assertEqual(ps.classify_page(russian, 0.0), "text")
+        self.assertEqual(ps.classify_page(arabic, 0.0), "text")
+
+    def test_is_readable_rejects_private_use_and_replacement(self):
+        self.assertFalse(ps.is_readable("\ue001\ue002\ue003 ab"))
+        self.assertFalse(ps.is_readable("\ufffd\ufffd\ufffd ab"))
+        self.assertTrue(ps.is_readable("\u2022 \u20aa 100 \u00a9"))
+
 
 FIX = HERE / "fixtures"
 

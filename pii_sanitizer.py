@@ -41,12 +41,12 @@ import math
 import re
 import shutil
 import stat
-import string
 import subprocess
 import sys
 import tempfile
 import threading
 import traceback
+import unicodedata
 import uuid
 from collections import OrderedDict, defaultdict
 import dataclasses
@@ -3096,8 +3096,6 @@ _HE = "\u05d0-\u05ea"
 _HE_WORD_RE = re.compile(f"[{_HE}]+")
 _RUN_RE = re.compile(rf"[A-Za-z0-9](?:[^{_HE}]*[A-Za-z0-9])?|[{_HE}]+|.", re.S)
 _HE_FINALS = "\u05da\u05dd\u05df\u05e3\u05e5"
-_READABLE_EXTRA = "\u05be\u05f3\u05f4\u2013\u2014\u2019\u201c\u201d\u2022"
-_READABLE_RE = re.compile(rf"[{_HE}A-Za-z0-9{re.escape(string.punctuation + _READABLE_EXTRA)}]")
 
 
 def clean_bidi(text: str) -> str:
@@ -3125,12 +3123,24 @@ def fix_visual_order(line: str) -> str:
     return "".join(r[::-1] if he.fullmatch(r) else r for r in reversed(runs))
 
 
+def _is_readable_char(c: str) -> bool:
+    """A letter, digit, punctuation mark or symbol in any script; not private-use, surrogate or U+FFFD."""
+    if c == "\ufffd":
+        return False
+    cat = unicodedata.category(c)
+    return cat[0] in "LNPS" and cat not in ("Co", "Cs")
+
+
 def is_readable(text: str) -> bool:
-    """False when most non-space characters are not Hebrew, ASCII or common punctuation."""
+    """False when most non-space characters are private-use, replacement or control characters.
+
+    Any script counts as readable (Hebrew, Latin, Cyrillic, Arabic and so on). A broken
+    font map gives private-use or U+FFFD characters, which do not count.
+    """
     chars = [c for c in text if not c.isspace()]
     if not chars:
         return True
-    good = sum(1 for c in chars if _READABLE_RE.match(c))
+    good = sum(1 for c in chars if _is_readable_char(c))
     return good / len(chars) >= 0.5
 
 
