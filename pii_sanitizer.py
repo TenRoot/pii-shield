@@ -4091,7 +4091,7 @@ if QT_OK:
             row_tess.addWidget(self.ed_tesseract)
             row_tess.addWidget(btn_tess)
             self.lbl_tesseract = QtWidgets.QLabel()
-            self.ed_tesseract.textChanged.connect(self._update_tesseract_label)
+            self.ed_tesseract.editingFinished.connect(self._update_tesseract_label)
             f3.addRow("", self.chk_ocr)
             f3.addRow("Tesseract program", row_tess)
             f3.addRow("", self.lbl_tesseract)
@@ -4111,6 +4111,7 @@ if QT_OK:
             p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Tesseract program", self.ed_tesseract.text())
             if p:
                 self.ed_tesseract.setText(p)
+                self._update_tesseract_label()
 
         def _update_tesseract_label(self, *_):
             try:
@@ -4118,6 +4119,9 @@ if QT_OK:
                 if exe is None:
                     raise FileNotFoundError("tesseract")
                 version, langs = tesseract_info(exe)
+                if not version:
+                    raise FileNotFoundError("tesseract does not run")
+                version = re.sub(r"^tesseract\s+", "", version, flags=re.I)
                 yn = lambda ok: "yes" if ok else "no"
                 text = f"Tesseract {version}: Hebrew {yn('heb' in langs)}, English {yn('eng' in langs)}"
             except Exception:

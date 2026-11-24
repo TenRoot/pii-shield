@@ -351,10 +351,6 @@ class OcrSettingsTests(unittest.TestCase):
         self.assertEqual(s.dpi, 200)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def _qapp():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
@@ -497,9 +493,7 @@ class PdfSettingsGuiTests(unittest.TestCase):
         with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
                 mock.patch.object(ps, "tesseract_info", return_value=("tesseract 5.3.0", {"eng", "osd"})):
             dlg = self.dialog()
-            self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract tesseract 5.3.0: Hebrew no, English yes")
-            dlg.ed_tesseract.setText("/opt/y/tesseract")
-            self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract tesseract 5.3.0: Hebrew no, English yes")
+            self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract 5.3.0: Hebrew no, English yes")
 
     def test_label_when_info_raises(self):
         with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
@@ -513,4 +507,29 @@ class PdfSettingsGuiTests(unittest.TestCase):
         with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
                 mock.patch.object(ps, "tesseract_info", return_value=("5.3.0", {"heb", "eng"})):
             dlg.ed_tesseract.setText("/opt/x/tesseract")
+            dlg.ed_tesseract.editingFinished.emit()
         self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract 5.3.0: Hebrew yes, English yes")
+
+    def test_typing_does_not_probe_until_editing_finished(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            dlg = self.dialog()
+        with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")) as find, \
+                mock.patch.object(ps, "tesseract_info", return_value=("tesseract 5.3.0", {"heb"})) as info:
+            dlg.ed_tesseract.setText("/opt/x/tess")
+            dlg.ed_tesseract.setText("/opt/x/tesseract")
+            find.assert_not_called()
+            info.assert_not_called()
+            dlg.ed_tesseract.editingFinished.emit()
+            info.assert_called_once()
+        self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract 5.3.0: Hebrew yes, English no")
+
+    def test_label_when_file_cannot_run(self):
+        bad = self.tmp / "not_a_program.txt"
+        bad.write_text("hello")
+        self.cfg.data["pdf"]["tesseract_path"] = str(bad)
+        dlg = self.dialog()
+        self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract not found")
+
+
+if __name__ == "__main__":
+    unittest.main()
