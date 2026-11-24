@@ -1,4 +1,5 @@
 """Hebrew NER tests:  python -m unittest discover -s tests -v"""
+import io
 import json
 import os
 import random
@@ -315,6 +316,43 @@ def _fake_model_files():
     return table, blobs
 
 
+def make_pe(imports, delay=()):
+    """A minimal PE32+ file with an import table (and a delay-import table) naming DLLs."""
+    import struct
+    sec_rva, sec_raw = 0x1000, 0x200
+    n_imp, n_del = len(imports), len(delay)
+    imp_off = 0
+    del_off = 20 * (n_imp + 1)
+    names_off = del_off + 32 * (n_del + 1)
+    body = bytearray(names_off)
+    names = bytearray()
+    for i, name in enumerate(imports):
+        struct.pack_into("<I", body, imp_off + 20 * i + 12, sec_rva + names_off + len(names))
+        names += name.encode("ascii") + b"\0"
+    for i, name in enumerate(delay):
+        struct.pack_into("<II", body, del_off + 32 * i, 1, sec_rva + names_off + len(names))
+        names += name.encode("ascii") + b"\0"
+    body += names
+    opt_size = 112 + 16 * 8
+    head = bytearray(sec_raw)
+    head[0:2] = b"MZ"
+    struct.pack_into("<I", head, 0x3C, 0x40)
+    head[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HH", head, 0x44, 0x8664, 1)
+    struct.pack_into("<H", head, 0x44 + 16, opt_size)
+    opt = 0x58
+    struct.pack_into("<H", head, opt, 0x20B)
+    struct.pack_into("<I", head, opt + 108, 16)
+    if imports:
+        struct.pack_into("<II", head, opt + 112 + 8 * 1, sec_rva + imp_off, 20 * (n_imp + 1))
+    if delay:
+        struct.pack_into("<II", head, opt + 112 + 8 * 13, sec_rva + del_off, 32 * (n_del + 1))
+    sh = opt + opt_size
+    head[sh:sh + 8] = b".idata\0\0"
+    struct.pack_into("<IIII", head, sh + 8, len(body), sec_rva, len(body), sec_raw)
+    return bytes(head + body)
+
+
 class FetchAssetsTests(unittest.TestCase):
     """The fetch script with a fake downloader. No network."""
 
@@ -401,12 +439,146 @@ class FetchAssetsTests(unittest.TestCase):
             self.assertTrue((root / "models" / fa.MODEL_DIRNAME / name).is_file())
 
     def test_notices_content(self):
-        text = fa.thirdparty_notices(["libb.dll", "liba.dll"], "Apache License text here")
+        text = fa.thirdparty_notices(["zlib1.dll", "libjbig-0.dll", "libiconv-2.dll"],
+                                     "Apache License text here")
         for needle in ("DictaBERT", "CC BY 4.0", "Tesseract", "Apache License 2.0", "onnxruntime",
-                       "MIT", "tokenizers", "tessdata_best", "liba.dll", "libb.dll",
-                       "Apache License text here"):
+                       "MIT", "tokenizers", "tessdata_best", "zlib1.dll", "libjbig-0.dll",
+                       "Apache License text here", "License: Zlib", "GPL-2.0-or-later",
+                       "LGPL-2.1-or-later", "https://www.gnu.org/software/libiconv/"):
             self.assertIn(needle, text)
-        self.assertLess(text.index("liba.dll"), text.index("libb.dll"))
+        self.assertLess(text.index("libiconv-2.dll"), text.index("zlib1.dll"))
+        # LGPL and GPL entries name the duty (license text and source)
+        iconv = text[text.index("libiconv-2.dll"):text.index("libjbig-0.dll")]
+        self.assertIn("LGPL: the license text and the library source", iconv)
+        jbig = text[text.index("libjbig-0.dll"):text.index("zlib1.dll")]
+        self.assertIn("GPL: the license text and the complete source", jbig)
+
+    def test_notices_with_unlisted_dll_fail(self):
+        with self.assertRaises(fa.AssetError) as cm:
+            fa.thirdparty_notices(["zlib1.dll", "libnew-9.dll"], "")
+        self.assertIn("libnew-9.dll", str(cm.exception))
+        self.assertIn("DLL_LICENSES", str(cm.exception))
+
+    def test_model_only_notices_list_only_what_was_fetched(self):
+        fa.write_model_only_notices(self.tmp)
+        text = (self.tmp / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
+        for needle in ("DictaBERT", "onnxruntime", "tokenizers"):
+            self.assertIn(needle, text)
+        for needle in ("Tesseract", "tessdata", ".dll"):
+            self.assertNotIn(needle, text)
+
+    def test_download_goes_to_part_file_then_renamed(self):
+        seen = []
+
+        def dl(url, dest):
+            seen.append(dest.name)
+            self.downloader()(url, dest)
+        out = fa.fetch_model(self.tmp, dl)
+        self.assertEqual(seen, [n + ".part" for n in self.blobs])
+        self.assertEqual(list(out.glob("*.part")), [])
+
+    def test_hash_mismatch_deletes_part_file(self):
+        with self.assertRaises(fa.AssetError):
+            fa.fetch_verified("https://x/tokenizer.json", self.tmp / "tokenizer.json",
+                              self.table[1][2], self.table[1][3], self.downloader(corrupt="tokenizer.json"))
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
+    def _main_with_failing_download(self, exc):
+        def dl(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if Path(url).name == "tokenizer.json":
+                dest.write_bytes(b"half")
+                raise exc
+            self.downloader()(url, dest)
+        err = io.StringIO()
+        with mock.patch.object(fa, "http_download", dl), mock.patch("sys.stderr", err):
+            rc = fa.main(["--dest", str(self.tmp / "out"), "--model-only"])
+        folder = self.tmp / "out" / "models" / fa.MODEL_DIRNAME
+        return rc, err.getvalue(), folder
+
+    def test_network_error_prints_one_line_and_exits_non_zero(self):
+        import requests
+        rc, err, folder = self._main_with_failing_download(requests.ConnectionError("boom"))
+        self.assertEqual(rc, 1)
+        self.assertEqual(err.strip(), "ERROR: tokenizer.json: boom")
+        self.assertNotIn("Traceback", err)
+        self.assertFalse((folder / "tokenizer.json.part").exists())
+        self.assertFalse((folder / "tokenizer.json").exists())
+
+    def test_os_error_prints_one_line_and_exits_non_zero(self):
+        rc, err, folder = self._main_with_failing_download(OSError(28, "No space left on device"))
+        self.assertEqual(rc, 1)
+        self.assertTrue(err.startswith("ERROR: tokenizer.json: "), err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertFalse((folder / "tokenizer.json.part").exists())
+
+    def test_os_error_outside_download_is_caught_in_main(self):
+        err = io.StringIO()
+        boom = PermissionError(13, "Permission denied", str(self.tmp / "out" / "LICENSE.txt"))
+        with mock.patch.object(fa, "run", side_effect=boom), mock.patch("sys.stderr", err):
+            rc = fa.main(["--dest", str(self.tmp / "out"), "--model-only"])
+        self.assertEqual(rc, 1)
+        self.assertEqual(err.getvalue().strip(), "ERROR: LICENSE.txt: Permission denied")
+
+    def test_silent_install_command_with_spaces(self):
+        installer = Path("C:/Build Temp/tesseract-setup.exe")
+        target = Path("C:/Build Temp/un packed")
+        cmd = fa.silent_install_command(installer, target)
+        self.assertEqual(cmd, f'"{installer}" /S /D={target}')
+        self.assertTrue(cmd.endswith(f"/D={target}"))  # last and unquoted
+        self.assertNotIn('"/D=', cmd)
+
+    def test_extract_fallback_passes_one_command_string(self):
+        target = self.tmp / "with space" / "unpacked"
+        installer = self.tmp / "with space" / "setup.exe"
+        calls = []
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            (target / "tesseract.exe").write_bytes(b"exe")
+            return types.SimpleNamespace(returncode=0)
+        with mock.patch.object(fa, "find_7z", return_value=None), \
+             mock.patch.object(fa.subprocess, "run", fake_run):
+            fa.extract_installer(installer, target)
+        self.assertEqual(calls, [f'"{installer}" /S /D={target}'])
+
+    def test_pe_imports_reads_import_and_delay_import_tables(self):
+        exe = self.tmp / "a.exe"
+        exe.write_bytes(make_pe(["libone.dll", "KERNEL32.dll"], delay=["libtwo.dll"]))
+        self.assertEqual(fa.pe_imports(exe), ["libone.dll", "KERNEL32.dll", "libtwo.dll"])
+
+    def test_pe_imports_rejects_non_pe(self):
+        bad = self.tmp / "bad.dll"
+        bad.write_bytes(b"not a pe file")
+        with self.assertRaises(fa.AssetError) as cm:
+            fa.pe_imports(bad)
+        self.assertIn("bad.dll", str(cm.exception))
+
+    def test_needed_dlls_is_the_import_closure(self):
+        d = self.tmp / "unpacked"
+        d.mkdir()
+        (d / "tesseract.exe").write_bytes(make_pe(["libtesseract-5.dll", "KERNEL32.dll"]))
+        (d / "libtesseract-5.dll").write_bytes(make_pe(["libleptonica-6.dll", "msvcrt.dll"]))
+        (d / "libleptonica-6.dll").write_bytes(make_pe(["ZLIB1.DLL"], delay=["libpng16-16.dll"]))
+        (d / "zlib1.dll").write_bytes(make_pe([]))
+        (d / "libpng16-16.dll").write_bytes(make_pe(["zlib1.dll"]))
+        # a training-tool library that tesseract.exe never loads
+        (d / "libpango-1.0-0.dll").write_bytes(make_pe(["zlib1.dll"]))
+        self.assertEqual(fa.needed_dlls(d), ["libleptonica-6.dll", "libpng16-16.dll",
+                                             "libtesseract-5.dll", "zlib1.dll"])
+
+    def test_tesseract_path_with_unlisted_dll_fails(self):
+        def unpack(installer, target):
+            target.mkdir(parents=True)
+            (target / "tesseract.exe").write_bytes(make_pe(["libnew-9.dll"]))
+            (target / "libnew-9.dll").write_bytes(make_pe([]))
+        with mock.patch.object(fa, "TESSERACT_INSTALLER_SHA256", hashlib.sha256(b"setup").hexdigest()), \
+             mock.patch.object(fa, "TESSERACT_INSTALLER_SIZE", 5), \
+             mock.patch.object(fa, "extract_installer", unpack):
+            with self.assertRaises(fa.AssetError) as cm:
+                fa.fetch_tesseract(self.tmp / "out", lambda url, dest: dest.write_bytes(b"setup"))
+        self.assertIn("libnew-9.dll", str(cm.exception))
+        self.assertFalse((self.tmp / "out" / "tesseract" / "libnew-9.dll").exists())
 
     def test_tesseract_path_with_fake_installer(self):
         """Windows path with a fake unpacker and fake downloads (the real run is CI-only)."""
@@ -422,8 +594,10 @@ class FetchAssetsTests(unittest.TestCase):
 
         def unpack(installer, target):
             (target / "doc").mkdir(parents=True)
-            (target / "tesseract.exe").write_bytes(b"exe")
-            (target / "libtesseract-5.dll").write_bytes(b"dll")
+            (target / "tesseract.exe").write_bytes(make_pe(["libtesseract-5.dll", "KERNEL32.dll"]))
+            (target / "libtesseract-5.dll").write_bytes(make_pe(["zlib1.dll"]))
+            (target / "zlib1.dll").write_bytes(make_pe([]))
+            (target / "libpango-1.0-0.dll").write_bytes(make_pe([]))  # not loaded: not copied
             (target / "doc" / "LICENSE").write_text("Apache License", encoding="utf-8")
 
         with mock.patch.object(fa, "TESSDATA_FILES", small), \
@@ -433,6 +607,8 @@ class FetchAssetsTests(unittest.TestCase):
             out = fa.fetch_tesseract(self.tmp / "out", dl)
         self.assertTrue((out / "tesseract.exe").is_file())
         self.assertTrue((out / "libtesseract-5.dll").is_file())
+        self.assertTrue((out / "zlib1.dll").is_file())
+        self.assertFalse((out / "libpango-1.0-0.dll").exists())
         for n in ("heb", "eng", "osd"):
             self.assertTrue((out / "tessdata" / f"{n}.traineddata").is_file())
         notices = (self.tmp / "out" / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")

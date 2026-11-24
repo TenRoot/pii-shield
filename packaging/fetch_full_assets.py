@@ -11,11 +11,12 @@ import argparse
 import hashlib
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -55,6 +56,66 @@ TESSDATA_FILES = [
      "9cf5d576fcc47564f11265841e5ca839001e7e6f38ff7f7aacf46d15a96b00ff", 10562727),
 ]
 
+# ---- licenses of the DLLs copied from the Tesseract installer ----
+# The installer has no notice file per DLL. Each DLL is mapped here to its upstream project,
+# SPDX license and project URL; THIRD_PARTY_NOTICES.txt is generated from this table. The script
+# copies only the DLLs that tesseract.exe loads (see needed_dlls). A needed DLL that is not in
+# this table stops the script, so an installer update cannot ship an unlisted DLL.
+# DLL file name (lower case) -> (project, SPDX license, URL, extra duty or "")
+LGPL_DUTY = ("LGPL: the license text and the library source must be available. Get both from "
+             "the project URL; replace the DLL with your own build of the same version if you like.")
+GPL_DUTY = ("GPL: the license text and the complete source must be available. Get both from "
+            "the project URL.")
+GCC_DUTY = ("Covered by the GCC Runtime Library Exception 3.1: no source duty for programs "
+            "that use it.")
+DLL_LICENSES: Dict[str, Tuple[str, str, str, str]] = {
+    "libtesseract-5.dll": ("Tesseract OCR", "Apache-2.0", "https://github.com/tesseract-ocr/tesseract", ""),
+    "libleptonica-6.dll": ("Leptonica", "BSD-2-Clause", "http://www.leptonica.org/", ""),
+    "libarchive-13.dll": ("libarchive", "BSD-2-Clause", "https://www.libarchive.org/", ""),
+    "libcurl-4.dll": ("curl (libcurl)", "curl", "https://curl.se/", ""),
+    "libssh2-1.dll": ("libssh2", "BSD-3-Clause", "https://libssh2.org/", ""),
+    "libpsl-5.dll": ("libpsl", "MIT", "https://github.com/rockdaboot/libpsl", ""),
+    "libidn2-0.dll": ("GNU Libidn2", "LGPL-3.0-or-later OR GPL-2.0-or-later",
+                      "https://www.gnu.org/software/libidn/", LGPL_DUTY),
+    "libunistring-5.dll": ("GNU libunistring", "LGPL-3.0-or-later OR GPL-2.0-or-later",
+                           "https://www.gnu.org/software/libunistring/", LGPL_DUTY),
+    "libiconv-2.dll": ("GNU libiconv", "LGPL-2.1-or-later",
+                       "https://www.gnu.org/software/libiconv/", LGPL_DUTY),
+    "libintl-8.dll": ("GNU gettext (libintl)", "LGPL-2.1-or-later",
+                      "https://www.gnu.org/software/gettext/", LGPL_DUTY),
+    "libbrotlicommon.dll": ("Brotli", "MIT", "https://github.com/google/brotli", ""),
+    "libbrotlidec.dll": ("Brotli", "MIT", "https://github.com/google/brotli", ""),
+    "libzstd.dll": ("Zstandard", "BSD-3-Clause OR GPL-2.0-only (used under BSD-3-Clause)",
+                    "https://github.com/facebook/zstd", ""),
+    "zlib1.dll": ("zlib", "Zlib", "https://zlib.net/", ""),
+    "libdeflate.dll": ("libdeflate", "MIT", "https://github.com/ebiggers/libdeflate", ""),
+    "liblzma-5.dll": ("XZ Utils (liblzma)", "0BSD", "https://tukaani.org/xz/", ""),
+    "liblz4.dll": ("LZ4", "BSD-2-Clause", "https://github.com/lz4/lz4", ""),
+    "libbz2-1.dll": ("bzip2", "bzip2-1.0.6", "https://sourceware.org/bzip2/", ""),
+    "libb2-1.dll": ("libb2 (BLAKE2)", "CC0-1.0 OR OpenSSL OR Apache-2.0",
+                    "https://github.com/BLAKE2/libb2", ""),
+    "libexpat-1.dll": ("Expat", "MIT", "https://libexpat.github.io/", ""),
+    "libtiff-6.dll": ("LibTIFF", "libtiff", "https://libtiff.gitlab.io/libtiff/", ""),
+    "libjpeg-8.dll": ("libjpeg-turbo", "IJG AND BSD-3-Clause AND Zlib",
+                      "https://libjpeg-turbo.org/", ""),
+    "libjbig-0.dll": ("JBIG-KIT", "GPL-2.0-or-later",
+                      "https://www.cl.cam.ac.uk/~mgk25/jbigkit/", GPL_DUTY),
+    "liblerc.dll": ("LERC (Esri)", "Apache-2.0", "https://github.com/Esri/lerc", ""),
+    "libpng16-16.dll": ("libpng", "libpng-2.0", "http://www.libpng.org/pub/png/libpng.html", ""),
+    "libopenjp2-7.dll": ("OpenJPEG", "BSD-2-Clause", "https://www.openjpeg.org/", ""),
+    "libgif-7.dll": ("GIFLIB", "MIT", "https://giflib.sourceforge.net/", ""),
+    "libwebp-7.dll": ("libwebp", "BSD-3-Clause", "https://chromium.googlesource.com/webm/libwebp", ""),
+    "libwebpmux-3.dll": ("libwebp", "BSD-3-Clause", "https://chromium.googlesource.com/webm/libwebp", ""),
+    "libsharpyuv-0.dll": ("libwebp (sharpyuv)", "BSD-3-Clause",
+                          "https://chromium.googlesource.com/webm/libwebp", ""),
+    "libgcc_s_seh-1.dll": ("GCC runtime (libgcc)", "GPL-3.0-or-later WITH GCC-exception-3.1",
+                           "https://gcc.gnu.org/", GCC_DUTY),
+    "libstdc++-6.dll": ("GCC runtime (libstdc++)", "GPL-3.0-or-later WITH GCC-exception-3.1",
+                        "https://gcc.gnu.org/", GCC_DUTY),
+    "libwinpthread-1.dll": ("mingw-w64 winpthreads", "MIT AND BSD-3-Clause",
+                            "https://www.mingw-w64.org/", ""),
+}
+
 TIMEOUT = 60
 CHUNK = 1 << 20
 
@@ -85,16 +146,25 @@ def sha256_of(path: Path) -> str:
 
 def fetch_verified(url: str, dest: Path, sha256: str, size: int,
                    downloader: Downloader = http_download) -> Path:
-    """Download url to dest and check size and SHA-256. A bad file is deleted."""
+    """Download url to <dest>.part, check size and SHA-256, then rename it to dest.
+    On any failure the .part file is deleted and AssetError names the file."""
     if dest.is_file() and dest.stat().st_size == size and sha256_of(dest) == sha256:
         return dest
-    downloader(url, dest)
-    actual_size = dest.stat().st_size
-    actual_hash = sha256_of(dest)
-    if actual_size != size or actual_hash != sha256:
-        dest.unlink()
-        raise AssetError(f"{dest.name}: size or SHA-256 mismatch "
-                         f"(expected {size} bytes / {sha256}, got {actual_size} bytes / {actual_hash})")
+    part = dest.with_name(dest.name + ".part")
+    try:
+        downloader(url, part)
+        actual_size = part.stat().st_size
+        actual_hash = sha256_of(part)
+        if actual_size != size or actual_hash != sha256:
+            raise AssetError(f"{dest.name}: size or SHA-256 mismatch (expected {size} bytes / "
+                             f"{sha256}, got {actual_size} bytes / {actual_hash})")
+        part.replace(dest)
+    except AssetError:
+        part.unlink(missing_ok=True)
+        raise
+    except OSError as exc:  # requests.RequestException is an OSError subclass
+        part.unlink(missing_ok=True)
+        raise AssetError(f"{dest.name}: {exc}") from exc
     return dest
 
 
@@ -134,6 +204,12 @@ def find_7z() -> Optional[str]:
     return None
 
 
+def silent_install_command(installer: Path, target: Path) -> str:
+    """NSIS wants /D= last and unquoted, also with spaces in the path. A list argument would
+    make subprocess quote the whole "/D=..." and NSIS rejects that, so pass one string."""
+    return f'"{installer}" /S /D={target}'
+
+
 def extract_installer(installer: Path, target: Path) -> None:
     """Unpack the NSIS installer with 7z. Fallback: run it silently into target."""
     target.mkdir(parents=True, exist_ok=True)
@@ -144,12 +220,92 @@ def extract_installer(installer: Path, target: Path) -> None:
         if res.returncode == 0 and (target / "tesseract.exe").is_file():
             return
         print("7z could not unpack the installer; trying a silent install.")
-    res = subprocess.run([str(installer), "/S", f"/D={target}"])
+    res = subprocess.run(silent_install_command(installer, target))
     if res.returncode != 0 or not (target / "tesseract.exe").is_file():
         raise AssetError("Could not unpack the Tesseract installer (7z and /S both failed).")
 
 
-def thirdparty_notices(dlls: List[str], tesseract_license: str) -> str:
+# ---- PE import tables (pure Python: the script runs on Windows CI, where objdump is absent) ----
+def pe_imports(path: Path) -> List[str]:
+    """DLL names in the import and delay-import tables of a PE file. Static imports only:
+    a DLL loaded with LoadLibrary at run time does not show here."""
+    data = path.read_bytes()
+    try:
+        if data[:2] != b"MZ":
+            raise ValueError("no MZ header")
+        pe = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[pe:pe + 4] != b"PE\0\0":
+            raise ValueError("no PE signature")
+        n_sections, opt_size = struct.unpack_from("<H", data, pe + 6)[0], \
+            struct.unpack_from("<H", data, pe + 20)[0]
+        opt = pe + 24
+        magic = struct.unpack_from("<H", data, opt)[0]
+        dirs = opt + {0x10B: 96, 0x20B: 112}[magic]
+        n_dirs = struct.unpack_from("<I", data, dirs - 4)[0]
+        sections = []
+        for i in range(n_sections):
+            sh = opt + opt_size + 40 * i
+            vsize, va, rsize, raw = struct.unpack_from("<IIII", data, sh + 8)
+            sections.append((va, max(vsize, rsize), raw))
+
+        def off(rva: int) -> int:
+            for va, size, raw in sections:
+                if va <= rva < va + size:
+                    return raw + rva - va
+            raise ValueError(f"RVA {rva:#x} outside the sections")
+
+        def cstr(rva: int) -> str:
+            o = off(rva)
+            return data[o:data.index(b"\0", o)].decode("ascii")
+
+        names: List[str] = []
+        for index, entry_size, name_at in ((1, 20, 12), (13, 32, 4)):  # import, delay import
+            if index >= n_dirs:
+                continue
+            rva = struct.unpack_from("<I", data, dirs + 8 * index)[0]
+            if not rva:
+                continue
+            o = off(rva)
+            while True:
+                entry = data[o:o + entry_size]
+                if len(entry) < entry_size or not any(entry):
+                    break
+                name_rva = struct.unpack_from("<I", entry, name_at)[0]
+                if not name_rva:
+                    break
+                names.append(cstr(name_rva))
+                o += entry_size
+        return names
+    except (ValueError, KeyError, struct.error) as exc:
+        raise AssetError(f"{path.name}: cannot read the PE import table ({exc})") from exc
+
+
+def needed_dlls(folder: Path, exe: str = "tesseract.exe") -> List[str]:
+    """The DLLs in folder that exe loads, directly or through other DLLs in folder.
+    DLLs not in folder (Windows system DLLs) are skipped."""
+    present = {p.name.lower(): p.name for p in folder.glob("*.dll")}
+    seen: Dict[str, str] = {}
+    todo = [folder / exe]
+    while todo:
+        for name in pe_imports(todo.pop()):
+            key = name.lower()
+            if key in present and key not in seen:
+                seen[key] = present[key]
+                todo.append(folder / present[key])
+    return sorted(seen.values(), key=str.lower)
+
+
+def check_dll_licenses(dlls: Iterable[str]) -> None:
+    missing = sorted(d for d in dlls if d.lower() not in DLL_LICENSES)
+    if missing:
+        raise AssetError("DLL not in the license table: " + ", ".join(missing) +
+                         ". Add each one to DLL_LICENSES in packaging/fetch_full_assets.py "
+                         "with its upstream project and license.")
+
+
+def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool = True) -> str:
+    """Notices for what was fetched. tesseract=False: the model build (model, onnxruntime,
+    tokenizers only)."""
     lines = [
         "PII Shield third-party notices",
         "==============================",
@@ -159,6 +315,17 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str) -> str:
         f"  ONNX conversion: {MODEL_REPO}, revision {MODEL_REVISION}",
         "  Author: Dicta. The files are used unchanged.",
         "",
+        "onnxruntime",
+        "  License: MIT, https://github.com/microsoft/onnxruntime/blob/main/LICENSE",
+        "",
+        "tokenizers (Hugging Face)",
+        "  License: Apache License 2.0, https://github.com/huggingface/tokenizers",
+    ]
+    if not tesseract:
+        return "\n".join(lines + [""])
+    check_dll_licenses(dlls)
+    lines += [
+        "",
         "Tesseract OCR (UB Mannheim Windows build %s)" % TESSERACT_VERSION,
         "  License: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0",
         "  Source: https://github.com/tesseract-ocr/tesseract",
@@ -167,18 +334,16 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str) -> str:
         "  License: Apache License 2.0",
         f"  Source: https://github.com/tesseract-ocr/tessdata_best (commit {TESSDATA_COMMIT})",
         "",
-        "onnxruntime",
-        "  License: MIT, https://github.com/microsoft/onnxruntime/blob/main/LICENSE",
-        "",
-        "tokenizers (Hugging Face)",
-        "  License: Apache License 2.0, https://github.com/huggingface/tokenizers",
-        "",
         "Libraries copied from the Tesseract installer (folder tesseract/)",
-        "  The installer has no notice file for each library. It has one license file,",
-        "  the Tesseract Apache License 2.0, which is copied to tesseract/LICENSE.",
-        "  Each library below keeps the license of its own upstream project.",
+        "  The installer has no notice file for each library. Each library keeps the license",
+        "  of its upstream project, given below as an SPDX identifier. The full license text",
+        "  and copyright notices are at the project URL.",
     ]
-    lines += [f"    {d}" for d in sorted(dlls)]
+    for d in sorted(dlls, key=str.lower):
+        project, spdx, url, duty = DLL_LICENSES[d.lower()]
+        lines += ["", f"  {d}", f"    Project: {project}", f"    License: {spdx}", f"    URL: {url}"]
+        if duty:
+            lines.append(f"    Note: {duty}")
     lines += ["", "Tesseract license text", "----------------------", tesseract_license.strip(), ""]
     return "\n".join(lines)
 
@@ -195,10 +360,12 @@ def fetch_tesseract(dest: Path, downloader: Downloader = http_download) -> Path:
         unpacked = work / "unpacked"
         extract_installer(installer, unpacked)
         shutil.copy2(unpacked / "tesseract.exe", out / "tesseract.exe")
-        dlls = []
-        for dll in sorted(unpacked.glob("*.dll")):
-            shutil.copy2(dll, out / dll.name)
-            dlls.append(dll.name)
+        # only the DLLs tesseract.exe loads; the installer also holds the training tools'
+        # libraries (pango, cairo, ICU, ...), which tesseract.exe never loads
+        dlls = needed_dlls(unpacked)
+        check_dll_licenses(dlls)
+        for name in dlls:
+            shutil.copy2(unpacked / name, out / name)
         licence = unpacked / "doc" / "LICENSE"
         licence_text = licence.read_text(encoding="utf-8", errors="replace") if licence.is_file() else ""
         (out / "LICENSE").write_text(licence_text, encoding="utf-8")
@@ -218,7 +385,8 @@ def fetch_tesseract(dest: Path, downloader: Downloader = http_download) -> Path:
 
 
 def write_model_only_notices(dest: Path) -> None:
-    (dest / "THIRD_PARTY_NOTICES.txt").write_text(thirdparty_notices([], ""), encoding="utf-8")
+    (dest / "THIRD_PARTY_NOTICES.txt").write_text(thirdparty_notices([], "", tesseract=False),
+                                                  encoding="utf-8")
 
 
 def install_dev(dest: Path, root: Path = ROOT) -> Path:
@@ -251,8 +419,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
     try:
         run(Path(args.dest), args.model_only, args.install_dev, downloader=http_download)
-    except AssetError as exc:
+    except AssetError as exc:  # its message starts with the file name
         print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:  # also requests.RequestException, an OSError subclass
+        name = Path(exc.filename).name if getattr(exc, "filename", None) else "download"
+        print(f"ERROR: {name}: {exc.strerror or exc}", file=sys.stderr)
         return 1
     print("done")
     return 0
