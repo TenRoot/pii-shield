@@ -96,6 +96,44 @@ The GUI has five tabs:
 5. **Log** — see engine and sync messages. The log never contains detected values or
    prompt text.
 
+### PDF files
+
+**Load file** opens PDF files. The app reads text pages directly. Each page starts with a
+header line, for example `--- page 1 ---`. The text is read on your computer only. The app
+makes no network call.
+
+Scanned pages have no text layer. The app sends them to Tesseract (OCR) with Hebrew and
+English data. Pages that are mostly an image, or whose text is unreadable, also go to OCR.
+The page line then reads `--- page 2 (OCR) ---`.
+
+If Tesseract is not installed, the app skips each scanned page. The page line says why, for
+example `--- page 2 (scanned, skipped: Tesseract not installed) ---`. If Hebrew or English
+data is missing, OCR runs with the other language. The page line says so.
+
+The app looks for Tesseract in this order:
+
+1. the path in **Settings → PDF**;
+2. a `tesseract/` folder next to the app (only a full build has it);
+3. `tesseract` on PATH;
+4. on Windows, `C:\Program Files\Tesseract-OCR\tesseract.exe`.
+
+To install Tesseract:
+
+- **Windows:** run the UB Mannheim Tesseract installer. Under additional languages, select
+  **Hebrew**. The app finds `C:\Program Files\Tesseract-OCR\tesseract.exe`. To use another
+  location, set the path in **Settings → PDF**.
+- **Debian/Ubuntu:** run `sudo apt install tesseract-ocr tesseract-ocr-heb`.
+
+Tesseract 4.0 or later is needed. The app sends page images to Tesseract through a pipe. It
+writes no temporary image files. To turn OCR off, clear **OCR scanned pages (Tesseract)** in
+**Settings → PDF**.
+
+Limits:
+
+- The app finds names and organizations with an English model. In Hebrew text, only rules and
+  word lists find PII.
+- The app cannot open password-protected PDFs.
+
 ### Scan a Git branch
 
 Use the Git scan to find PII and secrets in a branch before you push it. The scan only reports.

@@ -7,14 +7,14 @@ datas, binaries, hiddenimports = [], [], []
 # entry points, dynamic imports), so collect each package whole, with its dist metadata.
 for pkg in ("spacy", "thinc", "en_core_web_lg", "presidio_analyzer", "presidio_anonymizer", "tldextract",
             "phonenumbers", "srsly", "blis", "cymem", "preshed", "murmurhash", "catalogue", "confection",
-            "spacy_legacy", "spacy_loggers", "weasel", "wasabi"):
+            "spacy_legacy", "spacy_loggers", "weasel", "wasabi", "pypdfium2", "pypdfium2_raw"):
     d, b, h = collect_all(pkg)
     datas += d
     binaries += b
     hiddenimports += h
 # spacy.util.is_package() and the PyPI version check read these through importlib.metadata
 for dist in ("spacy", "en_core_web_lg", "thinc", "presidio-analyzer", "presidio-anonymizer",
-             "spacy-legacy", "spacy-loggers", "requests", "keyring"):
+             "spacy-legacy", "spacy-loggers", "requests", "keyring", "pypdfium2"):
     datas += copy_metadata(dist)
 hiddenimports += ["keyring.backends.Windows", "keyring.backends.fail", "keyring.backends.null"]
 
