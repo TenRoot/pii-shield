@@ -277,6 +277,21 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(p.method, "skipped")
 
 
+class PageHeaderSpanTests(unittest.TestCase):
+    def test_header_forms_match(self):
+        for h in ["--- page 1 ---", "--- page 2 (OCR) ---", "--- page 3 (scanned, skipped: OCR turned off) ---",
+                  "--- page 4 (OCR, English only: Hebrew language data missing) ---",
+                  "--- page 5 (little text, image text not read: OCR failed) ---",
+                  "--- page 6 (OCR) (form fields or notes not read) ---"]:
+            text = "before\n" + h + "\nafter"
+            self.assertEqual(ps.page_header_spans(text), [(7, 7 + len(h))], h)
+
+    def test_other_lines_do_not_match(self):
+        for line in ["--- page 1 John Smith ---", "x --- page 1 ---", "--- page 1 --- x", "--- page one ---",
+                     "--- page 2 (a (b) c) ---"]:
+            self.assertEqual(ps.page_header_spans(line), [], line)
+
+
 FAKE_TESSERACT = """#!{python}
 import sys, time
 from pathlib import Path

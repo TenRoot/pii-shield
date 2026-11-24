@@ -67,6 +67,22 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(any("054-123-4567" in f.text for f in fs))
         self.assertEqual(d["jsmith"].entity, "USERNAME", "only the user name in C:\\Users\\jsmith is masked")
 
+    def test_pdf_page_headers_not_masked(self):
+        text = ("--- page 1 ---\nTicket SEC-10442 for John Smith.\n\n"
+                "--- page 2 (OCR) ---\nJohn Smith called from SRV-DC01.\n\n"
+                "--- page 3 (scanned, skipped: OCR turned off) ---\n\n"
+                "--- page 4 (OCR, English only: Hebrew language data missing) ---\nTesseract read this.\n\n"
+                "--- page 5 (little text, image text not read: Tesseract not installed) ---\npage 7")
+        fs, _ = self.analyze(text)
+        headers = ps.page_header_spans(text)
+        self.assertEqual(len(headers), 5)
+        for f in fs:
+            for s, e in headers:
+                self.assertFalse(f.start < e and s < f.end, f"{f.entity} {f.text!r} covers {text[s:e]!r}")
+        d = self.by_text(fs)
+        self.assertIn("John Smith", d, "body text is still scanned")
+        self.assertIn("SRV-DC01", d)
+
     def test_skip_ner_argument_drops_ner_findings(self):
         if self.engine.mode != "presidio+spacy":
             self.skipTest("needs a spaCy model")

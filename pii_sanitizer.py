@@ -1904,6 +1904,25 @@ def _raise_builtin_scores(registry) -> None:
                             else Pattern(p.name, p.regex, p.score) for p in rec.patterns]
 
 
+# A page header line written by extract_pdf_text, for example "--- page 2 (OCR) ---".
+PAGE_HEADER_RE = re.compile(r"^--- page \d+(?: \([^()\n]*\))* ---$", re.M)
+
+
+def page_header_spans(text: str) -> List[Tuple[int, int]]:
+    """Return the (start, end) of each PDF page header line in text."""
+    if "--- page " not in text:
+        return []
+    return [m.span() for m in PAGE_HEADER_RE.finditer(text)]
+
+
+def _outside_spans(findings: List[Finding], spans: List[Tuple[int, int]]) -> List[Finding]:
+    """Drop findings that lie inside a span (manual-rule findings are kept, as with the allow list)."""
+    if not spans:
+        return findings
+    return [f for f in findings
+            if f.source == "manual" or not any(s <= f.start and f.end <= e for s, e in spans)]
+
+
 class DetectionEngine:
     """Owns the (expensive) NLP engine once; recognizer registries are rebuilt on hot reload."""
 
@@ -2089,7 +2108,9 @@ class DetectionEngine:
         # allow-list (never applies to manual rules)
         allow = rs.allow_list
         found = [f for f in found if f.source == "manual" or f.text.strip().casefold() not in allow]
-        found = resolve_overlaps(found)
+        # PDF page header lines hold no PII; NER tags words such as "OCR" in them.
+        headers = page_header_spans(text)
+        found = resolve_overlaps(_outside_spans(found, headers))
 
         # propagation: every literal occurrence of a detected value or a value already in the session map
         if bcfg.get("propagate_values", True):
@@ -2113,7 +2134,7 @@ class DetectionEngine:
                 for s, e in find_literal(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], vault.token_entity.get(tok, "CUSTOM"), 0.99,
                                          "session", "session-map"))
-            found = resolve_overlaps(found + extra)
+            found = resolve_overlaps(_outside_spans(found + extra, headers))
 
         # entity consistency for identical values, then token proposals
         entity_for: Dict[str, str] = {}
