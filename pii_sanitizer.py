@@ -1905,7 +1905,30 @@ def _raise_builtin_scores(registry) -> None:
 
 
 # A page header line written by extract_pdf_text, for example "--- page 2 (OCR) ---".
-PAGE_HEADER_RE = re.compile(r"^--- page \d+(?: \([^()\n]*\))* ---$", re.M)
+# Skip reasons and OCR language names. The PDF extractor writes them into page headers, and
+# PAGE_HEADER_RE is built from them, so the two cannot drift apart.
+OCR_OFF_REASON = "OCR turned off"
+OCR_NO_TESSERACT_REASON = "Tesseract not installed"
+OCR_NO_LANG_REASON = "no OCR language data"
+OCR_FAILED_REASON = "OCR failed"
+OCR_TIMEOUT_REASON = "OCR timed out"
+OCR_NO_TEXT_REASON = "OCR found no text"
+_HDR_REASONS = (OCR_OFF_REASON, OCR_NO_TESSERACT_REASON, OCR_NO_LANG_REASON, OCR_FAILED_REASON,
+                OCR_TIMEOUT_REASON, OCR_NO_TEXT_REASON)
+_LANG_NAMES = {"heb": "Hebrew", "eng": "English"}
+
+_HDR_REASON = "(?:" + "|".join(re.escape(r) for r in _HDR_REASONS) + ")"
+# One language: a display name from _LANG_NAMES, or a Tesseract code such as chi_sim.
+_HDR_LANG = "(?:" + "|".join(re.escape(n) for n in _LANG_NAMES.values()) + r"|[a-z]{3}(?:_[a-z]+)?)"
+_HDR_LANGS = _HDR_LANG + "(?: and " + _HDR_LANG + ")*"
+# Match only the header forms extract_pdf_text writes. Never accept free text in the parentheses:
+# anything a header line matches goes out unmasked and is hidden from the leak check.
+PAGE_HEADER_RE = re.compile(
+    r"^--- page \d+"
+    r"(?: \((?:OCR(?:, " + _HDR_LANGS + " only: " + _HDR_LANGS + r" language data missing)?"
+    r"|(?:scanned, skipped|little text, image text not read|mostly image, image text not read"
+    r"|unreadable text, not read): " + _HDR_REASON + r")\))?"
+    r"(?: \(form fields or notes not read\))? ---$", re.M)
 
 
 def page_header_spans(text: str) -> List[Tuple[int, int]]:
@@ -3408,18 +3431,15 @@ def ocr_image(exe: Path, image: bytes, languages: str, timeout: int, dpi: int = 
         r = _run_tesseract([str(exe), "stdin", "stdout", "--dpi", str(dpi), "-l", languages], timeout, image)
     except subprocess.TimeoutExpired as exc:
         log.warning("OCR timed out after %s s", timeout)
-        raise PdfError("OCR timed out") from exc
+        raise PdfError(OCR_TIMEOUT_REASON) from exc
     except OSError as exc:
         log.warning("OCR failed: %s", exc)
-        raise PdfError("OCR failed") from exc
+        raise PdfError(OCR_FAILED_REASON) from exc
     if r.returncode != 0:
         err = r.stderr.decode("utf-8", "replace").strip().splitlines()
         log.warning("OCR failed: %s", err[0].strip() if err else f"exit code {r.returncode}")
-        raise PdfError("OCR failed")
+        raise PdfError(OCR_FAILED_REASON)
     return clean_bidi(r.stdout.decode("utf-8", "replace"))
-
-
-_LANG_NAMES = {"heb": "Hebrew", "eng": "English"}
 
 
 def _ocr_languages(wanted: str, installed: Set[str]) -> Tuple[str, str]:
@@ -3453,11 +3473,11 @@ def _prepare_ocr(ocr: OcrSettings) -> Tuple[Optional[Path], str, str, str]:
     """Find Tesseract and pick languages. Returns (exe, languages, note, skip reason)."""
     exe = find_tesseract(ocr.tesseract_path)
     if exe is None:
-        return None, "", "", "Tesseract not installed"
+        return None, "", "", OCR_NO_TESSERACT_REASON
     _version, installed = tesseract_info(exe)
     langs, note = _ocr_languages(ocr.languages, installed)
     if not langs:
-        return exe, "", "", "no OCR language data"
+        return exe, "", "", OCR_NO_LANG_REASON
     return exe, langs, note, ""
 
 
@@ -3501,7 +3521,7 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                 if not needs_ocr:
                     pass
                 elif not ocr.enabled:
-                    reason = "OCR turned off"
+                    reason = OCR_OFF_REASON
                 else:
                     if engine is None:
                         engine = _prepare_ocr(ocr)
@@ -3510,7 +3530,7 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                         try:
                             ocr_text = ocr_image(exe, _render_pgm(page, ocr.dpi), langs, ocr.timeout, ocr.dpi)
                             if not ocr_text.strip():
-                                reason = "OCR found no text"
+                                reason = OCR_NO_TEXT_REASON
                         except PdfError as exc:
                             reason = str(exc)
             finally:

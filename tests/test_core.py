@@ -94,6 +94,17 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(ps.leak_check(out, vault), [])
         self.assertEqual(ps.leak_check(out + "\nOCR again", vault), ["OCR"])
 
+    def test_header_shaped_line_with_free_text_is_masked_and_checked(self):
+        text = "--- page 3 (John Smith, 123456782) ---\nbody"
+        self.assertEqual(ps.page_header_spans(text), [])
+        fs, vault = self.analyze(text)
+        out, _ = ps.sanitize(text, fs, vault)
+        self.assertNotIn("John Smith", out)
+        self.assertNotIn("123456782", out)
+        vault2 = ps.SessionVault()
+        vault2.commit("Jane Roe", "<PERSON_1>", "PERSON")
+        self.assertEqual(ps.leak_check("--- page 3 (Jane Roe) ---", vault2), ["Jane Roe"])
+
     def test_skip_ner_argument_drops_ner_findings(self):
         if self.engine.mode != "presidio+spacy":
             self.skipTest("needs a spaCy model")

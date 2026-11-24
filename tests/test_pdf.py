@@ -288,8 +288,31 @@ class PageHeaderSpanTests(unittest.TestCase):
 
     def test_other_lines_do_not_match(self):
         for line in ["--- page 1 John Smith ---", "x --- page 1 ---", "--- page 1 --- x", "--- page one ---",
-                     "--- page 2 (a (b) c) ---"]:
+                     "--- page 2 (a (b) c) ---", "--- page 3 (John Smith, 123456782) ---",
+                     "--- page 2 (OCR) (John Smith) ---", "--- page 1 (password=Sup3rS3cret!) ---",
+                     "--- page 2 (scanned, skipped: John Smith) ---",
+                     "--- page 2 (OCR, John only: Smith language data missing) ---",
+                     "--- page 2 (OCR) (SRV-DC01 054-123-4567) ---"]:
             self.assertEqual(ps.page_header_spans(line), [], line)
+
+    def test_every_emitted_header_matches(self):
+        notes = ["", ps._ocr_languages("heb+eng", {"eng"})[1], ps._ocr_languages("heb+eng", {"heb"})[1],
+                 ps._ocr_languages("heb+chi_sim", {"heb"})[1], ps._ocr_languages("chi_sim+eng", {"eng"})[1],
+                 ps._ocr_languages("heb+eng+chi_sim", {"chi_sim"})[1]]
+        self.assertTrue(all(notes[1:]))
+        count = 0
+        for kind in ("text", "scanned", "mostly_image", "unreadable"):
+            for layer in ("", "Some layer text here"):
+                for reason in ps._HDR_REASONS:
+                    for ocr_text in (None, "", "ocr words"):
+                        for note in notes:
+                            for failed in (False, True):
+                                page = ps._finish_page(4, layer, kind, ocr_text, reason, note)
+                                page = ps._add_annot_values(page, ["Field: value"], failed)
+                                with self.subTest(header=page.header):
+                                    self.assertEqual(ps.page_header_spans(page.header), [(0, len(page.header))])
+                                count += 1
+        self.assertGreater(count, 500)
 
 
 FAKE_TESSERACT = """#!{python}
