@@ -62,6 +62,16 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 try:
+    import onnxruntime as ort  # Hebrew NER runtime (optional, full build)
+except ImportError:  # pragma: no cover
+    ort = None
+
+try:
+    from tokenizers import Tokenizer as HfTokenizer  # Hebrew NER tokenizer (optional)
+except ImportError:  # pragma: no cover
+    HfTokenizer = None
+
+try:
     import pypdfium2 as pdfium  # PDF text extraction + page rendering (optional)
 except ImportError:  # pragma: no cover
     pdfium = None
@@ -3576,6 +3586,148 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
         doc.close()
     text = "\n\n".join(p.header + "\n" + p.text for p in pages)
     return PdfExtraction(pages, text)
+
+
+# ---- Hebrew NER ----
+HEBREW_LABEL_MAP = {"PER": "PERSON", "ORG": "ORGANIZATION", "GPE": "LOCATION",
+                    "LOC": "LOCATION", "FAC": "LOCATION"}
+_HEBREW_LETTER_RE = re.compile("[\u05d0-\u05ea]")
+
+
+@dataclass
+class HebrewSpan:
+    start: int
+    end: int
+    entity: str
+    score: float
+
+
+def _hebrew_groups(text: str) -> List[Tuple[int, int]]:
+    """(start, end) of runs of consecutive lines that contain a Hebrew letter."""
+    groups: List[Tuple[int, int]] = []
+    pos, open_group = 0, None
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        if _HEBREW_LETTER_RE.search(body):
+            if open_group is None:
+                open_group = pos
+            last_end = pos + len(body)
+        elif open_group is not None:
+            groups.append((open_group, last_end))
+            open_group = None
+        pos += len(line)
+    if open_group is not None:
+        groups.append((open_group, last_end))
+    return groups
+
+
+class HebrewNerModel:
+    def __init__(self, tokenizer, session, id2label: Dict[int, str],
+                 max_tokens: int = 400, overlap: int = 50):
+        self.tokenizer = tokenizer
+        self.session = session
+        self.id2label = id2label
+        self.max_tokens = max_tokens
+        self.overlap = min(overlap, max_tokens - 1)
+        self._input_names = {i.name for i in session.get_inputs()}
+
+    def predict(self, text: str) -> List[HebrewSpan]:
+        spans: List[HebrewSpan] = []
+        for g_start, g_end in _hebrew_groups(text):
+            spans.extend(self._predict_group(text[g_start:g_end], g_start))
+        return self._dedupe(spans)
+
+    def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
+        enc = self.tokenizer.encode(group, add_special_tokens=False)
+        ids, offsets = list(enc.ids), list(enc.offsets)
+        cls_id = self.tokenizer.token_to_id("[CLS]")
+        sep_id = self.tokenizer.token_to_id("[SEP]")
+        step = self.max_tokens - self.overlap
+        spans: List[HebrewSpan] = []
+        for lo in range(0, max(len(ids), 1), step):
+            hi = min(lo + self.max_tokens, len(ids))
+            if hi <= lo:
+                break
+            probs = self._run([cls_id] + ids[lo:hi] + [sep_id])[1:-1]
+            spans.extend(self._spans(probs, offsets[lo:hi], base))
+            if hi >= len(ids):
+                break
+        return spans
+
+    def _run(self, ids: List[int]):
+        import numpy as np
+        arr = np.array([ids], dtype=np.int64)
+        feeds = {"input_ids": arr, "attention_mask": np.ones_like(arr)}
+        if "token_type_ids" in self._input_names:
+            feeds["token_type_ids"] = np.zeros_like(arr)
+        logits = np.asarray(self.session.run(None, feeds)[0][0], dtype=np.float64)
+        e = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        return e / e.sum(axis=-1, keepdims=True)
+
+    def _spans(self, probs, offsets, base: int) -> List[HebrewSpan]:
+        spans: List[HebrewSpan] = []
+        cur = None  # [start, end, type, [scores]]
+
+        def close():
+            nonlocal cur
+            if cur is not None:
+                entity = HEBREW_LABEL_MAP.get(cur[2])
+                if entity:
+                    spans.append(HebrewSpan(base + cur[0], base + cur[1], entity,
+                                            sum(cur[3]) / len(cur[3])))
+            cur = None
+
+        for row, (s, e) in zip(probs, offsets):
+            if (s, e) == (0, 0):
+                continue
+            idx = int(row.argmax())
+            label = self.id2label.get(idx, "O")
+            score = float(row[idx])
+            if label == "O" or "-" not in label:
+                close()
+                continue
+            prefix, kind = label.split("-", 1)
+            if prefix == "I" and cur is not None and cur[2] == kind:
+                cur[1] = e
+                cur[3].append(score)
+            else:
+                close()
+                cur = [s, e, kind, [score]]
+        close()
+        return spans
+
+    @staticmethod
+    def _dedupe(spans: List[HebrewSpan]) -> List[HebrewSpan]:
+        """Drop repeats from overlapping windows and fragments cut by a window edge."""
+        kept: List[HebrewSpan] = []
+        for sp in sorted(spans, key=lambda x: (x.start, -(x.end - x.start), -x.score)):
+            if any(k.entity == sp.entity and k.start <= sp.start and sp.end <= k.end
+                   for k in kept):
+                continue
+            kept.append(sp)
+        # same (start, end, entity) repeats keep the best score
+        best: Dict[Tuple[int, int, str], float] = {}
+        for sp in spans:
+            key = (sp.start, sp.end, sp.entity)
+            best[key] = max(best.get(key, 0.0), sp.score)
+        for k in kept:
+            k.score = best.get((k.start, k.end, k.entity), k.score)
+        return sorted(kept, key=lambda x: x.start)
+
+
+def load_hebrew_model(model_dir: Path) -> HebrewNerModel:
+    if ort is None or HfTokenizer is None:
+        raise RuntimeError("Hebrew NER needs the onnxruntime and tokenizers packages. "
+                           "Install them or use the full build.")
+    model_dir = Path(model_dir)
+    cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
+    id2label = {int(k): v for k, v in cfg["id2label"].items()}
+    tokenizer = HfTokenizer.from_file(str(model_dir / "tokenizer.json"))
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    session = ort.InferenceSession(str(model_dir / "model_quantized.onnx"), sess_options=opts,
+                                   providers=["CPUExecutionProvider"])
+    return HebrewNerModel(tokenizer, session, id2label)
 
 
 # ===========================================================================

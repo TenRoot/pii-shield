@@ -7,3 +7,6 @@ pyyaml>=6.0
 # optional but recommended: stores the GitHub PAT in the OS credential store
 keyring>=24
 pypdfium2>=5.0
+# optional, full build only (Hebrew NER): see requirements-full.txt
+# onnxruntime==1.32.0
+# tokenizers==0.23.3
