@@ -4077,6 +4077,27 @@ if QT_OK:
             f2.addRow("", self.check_presidio)
             tabs.addTab(w2, "Behavior")
 
+            # pdf
+            w3 = QtWidgets.QWidget()
+            f3 = QtWidgets.QFormLayout(w3)
+            pdf = config["pdf"]
+            self.chk_ocr = QtWidgets.QCheckBox("OCR scanned pages (Tesseract)")
+            self.chk_ocr.setChecked(bool(pdf.get("ocr_enabled", True)))
+            self.ed_tesseract = QtWidgets.QLineEdit(pdf.get("tesseract_path", ""))
+            self.ed_tesseract.setPlaceholderText("Empty = find Tesseract automatically")
+            btn_tess = QtWidgets.QPushButton("Browse...")
+            btn_tess.clicked.connect(self._browse_tesseract)
+            row_tess = QtWidgets.QHBoxLayout()
+            row_tess.addWidget(self.ed_tesseract)
+            row_tess.addWidget(btn_tess)
+            self.lbl_tesseract = QtWidgets.QLabel()
+            self.ed_tesseract.textChanged.connect(self._update_tesseract_label)
+            f3.addRow("", self.chk_ocr)
+            f3.addRow("Tesseract program", row_tess)
+            f3.addRow("", self.lbl_tesseract)
+            tabs.addTab(w3, "PDF")
+            self._update_tesseract_label()
+
             bb = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok |
                                             QtWidgets.QDialogButtonBox.StandardButton.Cancel)
             bb.accepted.connect(self._accept)
@@ -4085,6 +4106,23 @@ if QT_OK:
             lay.addWidget(tabs)
             lay.addWidget(bb)
             self.needs_engine_restart = False
+
+        def _browse_tesseract(self):
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Tesseract program", self.ed_tesseract.text())
+            if p:
+                self.ed_tesseract.setText(p)
+
+        def _update_tesseract_label(self, *_):
+            try:
+                exe = find_tesseract(self.ed_tesseract.text().strip())
+                if exe is None:
+                    raise FileNotFoundError("tesseract")
+                version, langs = tesseract_info(exe)
+                yn = lambda ok: "yes" if ok else "no"
+                text = f"Tesseract {version}: Hebrew {yn('heb' in langs)}, English {yn('eng' in langs)}"
+            except Exception:
+                text = "Tesseract not found"
+            self.lbl_tesseract.setText(text)
 
         def _accept(self):
             tf = self.token_format.text().strip()
@@ -4109,6 +4147,8 @@ if QT_OK:
                      clipboard_clear_seconds=self.clip.value(), offline_mode=self.offline.isChecked())
             self.config["github"]["auto_sync_on_startup"] = self.auto_sync.isChecked()
             e["check_presidio_updates"] = self.check_presidio.isChecked()
+            self.config["pdf"].update(ocr_enabled=self.chk_ocr.isChecked(),
+                                      tesseract_path=self.ed_tesseract.text().strip())
             self.config.save()
             self.accept()
 
@@ -4415,13 +4455,17 @@ if QT_OK:
             self.btn_analyze = _button("Analyze PII && Sensitive Data", primary=True, tip="Ctrl+Enter")
             self.btn_analyze.clicked.connect(self.analyze)
             self.btn_analyze.setEnabled(False)
-            btn_load = _button("Load File...")
-            btn_load.clicked.connect(self.load_file)
+            self.btn_load = _button("Load File...")
+            self.btn_load.clicked.connect(self.load_file)
+            btn_load = self.btn_load
             self.btn_git_scan = _button("Scan Git Repo...", tip="Scan the commits this branch would push, plus "
                                         "uncommitted and untracked files, for PII and secrets")
             self.btn_git_scan.clicked.connect(self.open_git_scan)
             self.btn_git_scan.setEnabled(False)
             self._git_scan_dialog = None
+            self._pdf_task: Optional[Task] = None
+            self._pdf_cancel = False
+            self._closing = False
             btn_clear = _button("Clear", tip="Clear the input and the Step 2 review. The session map and "
                                              "temporary rules stay until Reset Session.")
             btn_clear.clicked.connect(self.clear_input_and_review)
@@ -4806,14 +4850,67 @@ if QT_OK:
             self._git_scan_dialog.activateWindow()
 
         def load_file(self):
-            p, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load text file", "", "Text (*.txt *.log *.md *.json *.yaml *.yml *.csv *.xml *.ps1 *.py *.conf *.ini);;All (*)")
+            p, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Load file", "", "Text (*.txt *.log *.md *.json *.yaml *.yml *.csv *.xml *.ps1 *.py *.conf *.ini *.pdf);;"
+                "PDF (*.pdf);;All (*)")
             if p:
-                try:
-                    text = Path(p).read_text("utf-8", errors="replace")
-                    self.clear_review()
-                    self.input.setPlainText(text)
-                except Exception as exc:
-                    QtWidgets.QMessageBox.warning(self, "Load file", str(exc))
+                self.load_path(Path(p))
+
+        def load_path(self, path: Path):
+            if path.suffix.lower() == ".pdf":
+                self._load_pdf(path)
+                return
+            try:
+                text = path.read_text("utf-8", errors="replace")
+                self.clear_review()
+                self.input.setPlainText(text)
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(self, "Load file", str(exc))
+
+        def _load_pdf(self, path: Path):
+            if self._pdf_task is not None:
+                self.statusBar().showMessage("A PDF is already loading")
+                return
+            self._pdf_cancel = False
+            task = Task(extract_pdf_text, path, OcrSettings.from_config(self.config),
+                        wants_progress=True, cancel=lambda: self._pdf_cancel)
+            task.signals.progress.connect(self._on_pdf_progress)
+            task.signals.done.connect(self._on_pdf_done)
+            task.signals.error.connect(self._on_pdf_error)
+            self._pdf_task = task
+            self.btn_load.setEnabled(False)
+            self.statusBar().showMessage("Loading PDF...")
+            QtCore.QThreadPool.globalInstance().start(task)
+
+        def _on_pdf_progress(self, msg: str):
+            # A bound method of the window, so Qt queues the call to the GUI thread (a lambda would run in the worker).
+            if not self._closing:
+                self.statusBar().showMessage(msg)
+
+        def _pdf_finished(self):
+            self._pdf_task = None
+            self._pdf_cancel = False
+            self.btn_load.setEnabled(True)
+
+        def _on_pdf_done(self, result: PdfExtraction):
+            if self._closing:
+                return
+            self._pdf_finished()
+            self.clear_review()
+            self.input.setPlainText(result.text)
+            self.statusBar().showMessage(f"PDF loaded: {len(result.pages)} page(s), {result.ocr_count} by OCR, "
+                                         f"{result.skipped_count} skipped (see Log)", 8000)
+            if result.all_skipped:
+                lines = ["No text was found in this PDF."] + [
+                    f"Page {pg.number}: {pg.reason}" for pg in result.pages]
+                QtWidgets.QMessageBox.warning(self, "Load PDF", "\n".join(lines))
+
+        def _on_pdf_error(self, msg: str):
+            if self._closing:
+                return
+            self._pdf_finished()
+            self.statusBar().clearMessage()
+            QtWidgets.QMessageBox.warning(self, "Load PDF", msg)
 
         def clear_review(self):
             """Drop the Step 2 review: staged findings, table rows and highlights. Keeps the session map."""
@@ -5368,6 +5465,8 @@ if QT_OK:
                     "responses can no longer be restored. Quit?") != QtWidgets.QMessageBox.StandardButton.Yes:
                 ev.ignore()
                 return
+            self._closing = True
+            self._pdf_cancel = True
             log.removeHandler(self._log_handler)
             ev.accept()
 

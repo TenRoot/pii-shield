@@ -353,3 +353,164 @@ class OcrSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+    # Earlier tests in the run leave queued signals that point at deleted windows. Drop them
+    # before these tests call processEvents, or they run against dead widgets and crash.
+    ps.QtCore.QThreadPool.globalInstance().waitForDone(10000)
+    ps.QtCore.QCoreApplication.removePostedEvents(None)
+    return app
+
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+@unittest.skipIf(ps.pdfium is None, "pypdfium2 not installed")
+class PdfLoadGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _qapp()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        cfg = ps.AppConfig(self.tmp / "config.json")
+        cfg.data["pdf"]["ocr_enabled"] = False
+        with mock.patch.object(ps.MainWindow, "_start_engine"):
+            self.win = ps.MainWindow(cfg)
+        self.addCleanup(self.win.deleteLater)
+
+    def wait(self):
+        ps.QtCore.QThreadPool.globalInstance().waitForDone(10000)
+        self.app.processEvents()
+
+    def test_text_pdf_fills_input(self):
+        self.win.load_path(FIX / "he_text.pdf"); self.wait()
+        self.assertIn("123456782", self.win.input.toPlainText())
+        self.assertTrue(self.win.statusBar().currentMessage().startswith("PDF loaded: 1 page(s), 0 by OCR, 0 skipped"))
+        self.assertTrue(self.win.btn_load.isEnabled())
+        self.assertIsNone(self.win._pdf_task)
+
+    def test_all_pages_skipped_warns(self):
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            self.win.load_path(FIX / "he_scan.pdf"); self.wait()
+        self.assertIn("--- page 1 (scanned, skipped: OCR turned off) ---", self.win.input.toPlainText())
+        warn.assert_called_once()
+        self.assertEqual(warn.call_args.args[1], "Load PDF")
+        self.assertEqual(warn.call_args.args[2], "No text was found in this PDF.\nPage 1: OCR turned off")
+
+    def test_some_pages_skipped_no_box(self):
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            self.win.load_path(FIX / "he_mixed.pdf"); self.wait()
+        warn.assert_not_called()
+        self.assertIn("1 skipped", self.win.statusBar().currentMessage())
+
+    def test_load_error_keeps_input(self):
+        self.win.input.setPlainText("old text")
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            self.win.load_path(FIX / "he_password.pdf"); self.wait()
+        self.assertEqual(self.win.input.toPlainText(), "old text")
+        self.assertEqual(warn.call_args.args[2], "This PDF is password protected. PII Shield cannot open it.")
+        self.assertTrue(self.win.btn_load.isEnabled())
+        self.assertIsNone(self.win._pdf_task)
+
+    def test_result_after_close_is_ignored(self):
+        self.win.input.setPlainText("old text")
+        self.win._closing = True
+        self.win._on_pdf_done(ps.PdfExtraction(pages=[], text="new"))
+        self.assertEqual(self.win.input.toPlainText(), "old text")
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "warning") as warn:
+            self.win._on_pdf_error("boom")
+        warn.assert_not_called()
+
+    def test_text_file_still_loads(self):
+        f = self.tmp / "a.txt"
+        f.write_text("host SRV-DC01", "utf-8")
+        self.win.load_path(f)
+        self.assertEqual(self.win.input.toPlainText(), "host SRV-DC01")
+
+    def test_uppercase_extension_loads_pdf(self):
+        f = self.tmp / "A.PDF"
+        shutil.copy(FIX / "he_text.pdf", f)
+        self.win.load_path(f); self.wait()
+        self.assertIn("123456782", self.win.input.toPlainText())
+
+    def test_second_load_while_running_is_refused(self):
+        self.win._pdf_task = object()
+        with mock.patch.object(ps.QtCore.QThreadPool.globalInstance(), "start") as start:
+            self.win.load_path(FIX / "he_text.pdf")
+        start.assert_not_called()
+        self.assertEqual(self.win.statusBar().currentMessage(), "A PDF is already loading")
+        self.win._pdf_task = None
+
+    def test_close_sets_flags_only_when_accepted(self):
+        self.win.vault.commit("SRV-DC01", "<HOSTNAME_1>", "HOSTNAME")
+        self.assertEqual(len(self.win.vault), 1)
+        ev = ps.QtGui.QCloseEvent()
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question",
+                               return_value=ps.QtWidgets.QMessageBox.StandardButton.No):
+            self.win.closeEvent(ev)
+        self.assertFalse(ev.isAccepted())
+        self.assertFalse(self.win._closing)
+        self.assertFalse(self.win._pdf_cancel)
+        ev2 = ps.QtGui.QCloseEvent()
+        with mock.patch.object(ps.QtWidgets.QMessageBox, "question",
+                               return_value=ps.QtWidgets.QMessageBox.StandardButton.Yes):
+            self.win.closeEvent(ev2)
+        self.assertTrue(ev2.isAccepted())
+        self.assertTrue(self.win._closing)
+        self.assertTrue(self.win._pdf_cancel)
+
+
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+class PdfSettingsGuiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _qapp()
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = ps.AppConfig(self.tmp / "config.json")
+
+    def dialog(self):
+        dlg = ps.SettingsDialog(None, self.cfg, mock.Mock(builtin_supported=[]))
+        self.addCleanup(dlg.deleteLater)
+        return dlg
+
+    def test_settings_saves_pdf_options(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            dlg = self.dialog()
+        dlg.chk_ocr.setChecked(False)
+        dlg.ed_tesseract.setText("/opt/x/tesseract")
+        dlg._accept()
+        self.assertFalse(self.cfg.data["pdf"]["ocr_enabled"])
+        self.assertEqual(self.cfg.data["pdf"]["tesseract_path"], "/opt/x/tesseract")
+
+    def test_label_when_not_found(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            dlg = self.dialog()
+        self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract not found")
+
+    def test_label_shows_version_and_languages(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
+                mock.patch.object(ps, "tesseract_info", return_value=("tesseract 5.3.0", {"eng", "osd"})):
+            dlg = self.dialog()
+            self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract tesseract 5.3.0: Hebrew no, English yes")
+            dlg.ed_tesseract.setText("/opt/y/tesseract")
+            self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract tesseract 5.3.0: Hebrew no, English yes")
+
+    def test_label_when_info_raises(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
+                mock.patch.object(ps, "tesseract_info", side_effect=RuntimeError("x")):
+            dlg = self.dialog()
+        self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract not found")
+
+    def test_label_updates_on_path_change(self):
+        with mock.patch.object(ps, "find_tesseract", return_value=None):
+            dlg = self.dialog()
+        with mock.patch.object(ps, "find_tesseract", return_value=Path("/opt/x/tesseract")), \
+                mock.patch.object(ps, "tesseract_info", return_value=("5.3.0", {"heb", "eng"})):
+            dlg.ed_tesseract.setText("/opt/x/tesseract")
+        self.assertEqual(dlg.lbl_tesseract.text(), "Tesseract 5.3.0: Hebrew yes, English yes")
