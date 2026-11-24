@@ -3656,9 +3656,41 @@ def _hebrew_groups(text: str) -> List[Tuple[int, int]]:
     return groups
 
 
+def _is_word_char(ch: str) -> bool:
+    return ch.isalnum() or unicodedata.category(ch).startswith("M")
+
+
+def _extend_to_words(text: str, spans: List[HebrewSpan]) -> List[HebrewSpan]:
+    """Grow each span edge to the whole word (the model labels sub-word tokens, so a span can
+    stop inside a word). Same-type spans that overlap after growing are merged."""
+    grown: List[HebrewSpan] = []
+    for sp in spans:
+        start, end = sp.start, sp.end
+        while start > 0 and _is_word_char(text[start - 1]):
+            start -= 1
+        while end < len(text) and _is_word_char(text[end]):
+            end += 1
+        grown.append(HebrewSpan(start, end, sp.entity, sp.score))
+    merged: List[HebrewSpan] = []
+    for sp in sorted(grown, key=lambda x: (x.entity, x.start, x.end)):
+        last = merged[-1] if merged else None
+        if last is not None and last.entity == sp.entity and sp.start < last.end:
+            last.end = max(last.end, sp.end)
+            last.score = max(last.score, sp.score)
+        else:
+            merged.append(sp)
+    return sorted(merged, key=lambda x: x.start)
+
+
+# Window size. The plan said 400, but with the real int8 model a 400-token window missed 4 of 48
+# person names that 128, 200, 256 and 300-token windows all found. Smaller windows cost no speed.
+HEBREW_WINDOW_TOKENS = 256
+HEBREW_WINDOW_OVERLAP = 50
+
+
 class HebrewNerModel:
     def __init__(self, tokenizer, session, id2label: Dict[int, str],
-                 max_tokens: int = 400, overlap: int = 50):
+                 max_tokens: int = HEBREW_WINDOW_TOKENS, overlap: int = HEBREW_WINDOW_OVERLAP):
         self.tokenizer = tokenizer
         self.session = session
         self.id2label = id2label
@@ -3670,7 +3702,7 @@ class HebrewNerModel:
         spans: List[HebrewSpan] = []
         for g_start, g_end in _hebrew_groups(text):
             spans.extend(self._predict_group(text[g_start:g_end], g_start))
-        return self._dedupe(spans)
+        return self._dedupe(_extend_to_words(text, spans))
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
         enc = self.tokenizer.encode(group, add_special_tokens=False)
@@ -3736,8 +3768,10 @@ class HebrewNerModel:
         """Drop repeats from overlapping windows and fragments cut by a window edge."""
         kept: List[HebrewSpan] = []
         for sp in sorted(spans, key=lambda x: (x.start, -(x.end - x.start), -x.score)):
-            if any(k.entity == sp.entity and k.start <= sp.start and sp.end <= k.end
-                   for k in kept):
+            # One window never gives two spans over the same token, so any overlap here comes
+            # from the 50-token window overlap, where one window saw less context. Keep the
+            # longer span, whatever its type: it covers more text.
+            if any(k.start <= sp.start and sp.end <= k.end for k in kept):
                 continue
             kept.append(sp)
         # same (start, end, entity) repeats keep the best score
@@ -3758,6 +3792,14 @@ def load_hebrew_model(model_dir: Path) -> HebrewNerModel:
     cfg = json.loads((model_dir / "config.json").read_text(encoding="utf-8"))
     id2label = {int(k): v for k, v in cfg["id2label"].items()}
     tokenizer = HfTokenizer.from_file(str(model_dir / "tokenizer.json"))
+    # tokenizer.json may enable truncation (512) or padding. Text past the cut would never reach
+    # the model, so a name there would leak. HebrewNerModel does its own windowing.
+    tokenizer.no_truncation()
+    tokenizer.no_padding()
+    missing = [t for t in ("[CLS]", "[SEP]") if tokenizer.token_to_id(t) is None]
+    if missing:
+        raise RuntimeError("Hebrew NER tokenizer has no " + " or ".join(missing)
+                           + " token. The tokenizer.json file does not match the model.")
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
     session = ort.InferenceSession(str(model_dir / "model_quantized.onnx"), sess_options=opts,

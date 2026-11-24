@@ -1,9 +1,11 @@
 """Hebrew NER tests:  python -m unittest discover -s tests -v"""
+import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -14,6 +16,9 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 import pii_sanitizer as ps  # noqa: E402
+
+sys.path.insert(0, str(HERE.parent / "packaging"))
+import fetch_full_assets as fa  # noqa: E402
 
 
 def make_model(root: Path, names=ps.HEBREW_MODEL_FILES) -> Path:
@@ -188,6 +193,208 @@ class HebrewNerCoreTests(unittest.TestCase):
         with mock.patch.object(ps, "ort", None):
             with self.assertRaises(RuntimeError):
                 ps.load_hebrew_model(Path("/nonexistent"))
+
+
+class LoadHebrewModelGuardTests(unittest.TestCase):
+    """load_hebrew_model with fakes: truncation off, special tokens present."""
+
+    def load(self, token_ids):
+        tok = mock.MagicMock()
+        tok.token_to_id.side_effect = lambda t: token_ids.get(t)
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "config.json").write_text(json.dumps({"id2label": {"0": "O"}}), encoding="utf-8")
+        ort_fake = mock.MagicMock()
+        with mock.patch.object(ps, "ort", ort_fake), \
+             mock.patch.object(ps, "HfTokenizer", mock.Mock(from_file=mock.Mock(return_value=tok))):
+            model = ps.load_hebrew_model(tmp)
+        return tok, model
+
+    def test_truncation_and_padding_switched_off(self):
+        tok, _ = self.load({"[CLS]": 1, "[SEP]": 2})
+        tok.no_truncation.assert_called_once()
+        tok.no_padding.assert_called_once()
+
+    def test_missing_special_token_raises(self):
+        for ids in ({"[CLS]": 1}, {"[SEP]": 2}, {}):
+            with self.assertRaises(RuntimeError) as cm:
+                self.load(ids)
+            self.assertRegex(str(cm.exception), r"\[(CLS|SEP)\]")
+
+
+class WindowOverlapDedupeTests(unittest.TestCase):
+    def test_shorter_span_of_other_type_inside_longer_span_dropped(self):
+        spans = [ps.HebrewSpan(10, 17, "PERSON", 0.99), ps.HebrewSpan(10, 13, "ORGANIZATION", 0.93),
+                 ps.HebrewSpan(30, 35, "LOCATION", 0.9)]
+        out = ps.HebrewNerModel._dedupe(spans)
+        self.assertEqual([(s.start, s.end, s.entity) for s in out],
+                         [(10, 17, "PERSON"), (30, 35, "LOCATION")])
+
+    def test_same_range_other_type_keeps_higher_score(self):
+        spans = [ps.HebrewSpan(0, 5, "ORGANIZATION", 0.97), ps.HebrewSpan(0, 5, "PERSON", 0.99)]
+        out = ps.HebrewNerModel._dedupe(spans)
+        self.assertEqual([(s.entity) for s in out], ["PERSON"])
+
+
+class WordBoundaryTests(unittest.TestCase):
+    def test_extend_span_to_whole_words(self):
+        text = "הגיעו ומתתיהו אלקבץ מאלפי מנשה."
+        sp = ps.HebrewSpan(text.index("ומת"), text.index("ומת") + 3, "PERSON", 1.0)
+        out = ps._extend_to_words(text, [sp])
+        self.assertEqual([text[s.start:s.end] for s in out], ["ומתתיהו"])
+
+    def test_overlapping_same_type_spans_merge_after_extension(self):
+        text = "הגיעו ומתתיהו אלקבץ."
+        a = text.index("ומת")
+        spans = [ps.HebrewSpan(a, a + 3, "PERSON", 0.9),
+                 ps.HebrewSpan(a + 5, a + 13, "PERSON", 0.8)]
+        out = ps._extend_to_words(text, spans)
+        self.assertEqual([text[s.start:s.end] for s in out], ["ומתתיהו אלקבץ"])
+        self.assertEqual(out[0].score, 0.9)
+
+    def test_different_types_not_merged_and_hyphen_kept(self):
+        text = "אביגיל רוזנצוויג-שטרנברג בחיפה"
+        spans = [ps.HebrewSpan(0, 8, "PERSON", 1.0), ps.HebrewSpan(7, 24, "PERSON", 1.0),
+                 ps.HebrewSpan(25, 29, "LOCATION", 1.0)]
+        out = ps._extend_to_words(text, spans)
+        self.assertEqual([(text[s.start:s.end], s.entity) for s in out],
+                         [("אביגיל רוזנצוויג-שטרנברג", "PERSON"), ("בחיפה", "LOCATION")])
+
+
+import hashlib  # noqa: E402
+
+REAL_MODEL_FILES = list(fa.MODEL_FILES)
+
+
+def _fake_model_files():
+    blobs = {"config.json": b"{}", "tokenizer.json": b"tok", "model_quantized.onnx": b"onnx"}
+    table = [(("onnx/" if n.endswith(".onnx") else "") + n, n, hashlib.sha256(b).hexdigest(), len(b))
+             for n, b in blobs.items()]
+    return table, blobs
+
+
+class FetchAssetsTests(unittest.TestCase):
+    """The fetch script with a fake downloader. No network."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.table, self.blobs = _fake_model_files()
+        p = mock.patch.object(fa, "MODEL_FILES", self.table)
+        p.start()
+        self.addCleanup(p.stop)
+        self.urls = []
+
+    def downloader(self, corrupt=None):
+        def dl(url, dest):
+            self.urls.append(url)
+            name = Path(url).name
+            data = self.blobs[name] + (b"!" if name == corrupt else b"")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+        return dl
+
+    def test_constants_match_global_constraints(self):
+        self.assertEqual(fa.MODEL_REVISION, "4f0aabf58566526df6f3fb548e0fd2619fbf2b1d")
+        self.assertEqual(
+            {f[1]: (f[2], f[3]) for f in REAL_MODEL_FILES},
+            {"config.json": ("ba12e2d104a01d60b22641dcdedd6d01a7743be917d489ab60f0722953232336", 1690),
+             "tokenizer.json": ("00657b39a8a73b96ddcc3cda245c5e8fa02be36e31e318bd13a9169eb89c999b", 3577623),
+             "model_quantized.onnx": ("fd7ac841768f11197e1d46ea6bbfe82d9cd9e21289be8761af63dbc996a32007", 184984466)})
+        self.assertEqual(sorted(f[1] for f in REAL_MODEL_FILES), sorted(ps.HEBREW_MODEL_FILES))
+
+    def test_pinned_values_have_the_right_shape(self):
+        for value in [f[1] for f in fa.TESSDATA_FILES] + [fa.TESSERACT_INSTALLER_SHA256]:
+            self.assertRegex(value, r"^[0-9a-f]{64}$")
+        self.assertRegex(fa.TESSDATA_COMMIT, r"^[0-9a-f]{40}$")
+        self.assertIn(fa.TESSDATA_COMMIT, fa.TESSDATA_URL)
+        self.assertTrue(fa.TESSERACT_INSTALLER_URL.startswith("https://"))
+
+    def test_model_download_writes_files_and_license(self):
+        out = fa.fetch_model(self.tmp, self.downloader())
+        for name in self.blobs:
+            self.assertEqual((out / name).read_bytes(), self.blobs[name])
+        lic = (out / "LICENSE.txt").read_text(encoding="utf-8")
+        for needle in ("dicta-il/dictabert-ner", "onnx-community/dictabert-ner-ONNX",
+                       fa.MODEL_REVISION, "https://creativecommons.org/licenses/by/4.0/", "Dicta"):
+            self.assertIn(needle, lic)
+        self.assertTrue(all(u.startswith("https://huggingface.co/") and fa.MODEL_REVISION in u
+                            for u in self.urls))
+
+    def test_hash_mismatch_deletes_file_and_exits_non_zero(self):
+        with mock.patch.object(fa, "http_download", self.downloader(corrupt="tokenizer.json")), \
+             mock.patch("sys.stderr"):
+            rc = fa.main(["--dest", str(self.tmp / "out"), "--model-only"])
+        self.assertEqual(rc, 1)
+        self.assertFalse((self.tmp / "out" / "models" / fa.MODEL_DIRNAME / "tokenizer.json").exists())
+
+    def test_hash_mismatch_message_names_the_file(self):
+        with self.assertRaises(fa.AssetError) as cm:
+            fa.fetch_verified("https://x/tokenizer.json", self.tmp / "tokenizer.json",
+                              self.table[1][2], self.table[1][3], self.downloader(corrupt="tokenizer.json"))
+        self.assertIn("tokenizer.json", str(cm.exception))
+
+    def test_valid_file_is_not_downloaded_again(self):
+        fa.fetch_model(self.tmp, self.downloader())
+        self.urls.clear()
+        fa.fetch_model(self.tmp, self.downloader())
+        self.assertEqual(self.urls, [])
+
+    def test_model_only_never_touches_tesseract_code(self):
+        with mock.patch.object(fa, "fetch_tesseract", side_effect=AssertionError("tesseract")), \
+             mock.patch.object(fa, "extract_installer", side_effect=AssertionError("7z")):
+            fa.run(self.tmp / "out", model_only=True, dev=False, downloader=self.downloader(),
+                   windows=True)
+        self.assertTrue((self.tmp / "out" / "THIRD_PARTY_NOTICES.txt").is_file())
+
+    def test_tesseract_skipped_off_windows(self):
+        with mock.patch.object(fa, "fetch_tesseract", side_effect=AssertionError("tesseract")):
+            fa.run(self.tmp / "out", model_only=False, dev=False, downloader=self.downloader(),
+                   windows=False)
+
+    def test_install_dev_copies_model(self):
+        root = self.tmp / "root"
+        fa.run(self.tmp / "out", model_only=True, dev=True, downloader=self.downloader(), root=root)
+        for name in self.blobs:
+            self.assertTrue((root / "models" / fa.MODEL_DIRNAME / name).is_file())
+
+    def test_notices_content(self):
+        text = fa.thirdparty_notices(["libb.dll", "liba.dll"], "Apache License text here")
+        for needle in ("DictaBERT", "CC BY 4.0", "Tesseract", "Apache License 2.0", "onnxruntime",
+                       "MIT", "tokenizers", "tessdata_best", "liba.dll", "libb.dll",
+                       "Apache License text here"):
+            self.assertIn(needle, text)
+        self.assertLess(text.index("liba.dll"), text.index("libb.dll"))
+
+    def test_tesseract_path_with_fake_installer(self):
+        """Windows path with a fake unpacker and fake downloads (the real run is CI-only)."""
+        small = [("heb.traineddata", hashlib.sha256(b"h").hexdigest(), 1),
+                 ("eng.traineddata", hashlib.sha256(b"e").hexdigest(), 1),
+                 ("osd.traineddata", hashlib.sha256(b"o").hexdigest(), 1)]
+        blobs = {"heb.traineddata": b"h", "eng.traineddata": b"e", "osd.traineddata": b"o",
+                 "tesseract-setup.exe": b"setup"}
+
+        def dl(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(blobs[Path(url).name if "tessdata" in url else "tesseract-setup.exe"])
+
+        def unpack(installer, target):
+            (target / "doc").mkdir(parents=True)
+            (target / "tesseract.exe").write_bytes(b"exe")
+            (target / "libtesseract-5.dll").write_bytes(b"dll")
+            (target / "doc" / "LICENSE").write_text("Apache License", encoding="utf-8")
+
+        with mock.patch.object(fa, "TESSDATA_FILES", small), \
+             mock.patch.object(fa, "TESSERACT_INSTALLER_SHA256", hashlib.sha256(b"setup").hexdigest()), \
+             mock.patch.object(fa, "TESSERACT_INSTALLER_SIZE", 5), \
+             mock.patch.object(fa, "extract_installer", unpack):
+            out = fa.fetch_tesseract(self.tmp / "out", dl)
+        self.assertTrue((out / "tesseract.exe").is_file())
+        self.assertTrue((out / "libtesseract-5.dll").is_file())
+        for n in ("heb", "eng", "osd"):
+            self.assertTrue((out / "tessdata" / f"{n}.traineddata").is_file())
+        notices = (self.tmp / "out" / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
+        self.assertIn("libtesseract-5.dll", notices)
 
 
 TEMPLATE_RULES = HERE.parent / "github-repo-template" / "rules"
@@ -384,3 +591,162 @@ class HebrewSettingsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+FIXTURE = HERE / "fixtures" / "hebrew_ner_sentences.json"
+KIND_TO_ENTITY = ps.HEBREW_LABEL_MAP
+
+
+def _real_model_available():
+    return ps.find_hebrew_model() is not None and ps.ort is not None and ps.HfTokenizer is not None
+
+
+def _match(pred_text, pred_entity, gold_text, gold_kind):
+    if pred_entity != KIND_TO_ENTITY[gold_kind] or len(pred_text) < 2 or len(gold_text) < 2:
+        return False
+    return pred_text in gold_text or gold_text in pred_text
+
+
+def _score(model, items):
+    """(tp, fp, fn, pairs) with greedy one-to-one matching per sentence."""
+    tp = fp = fn = 0
+    missed, extra = [], []
+    for item in items:
+        text = item["text"]
+        preds = [(text[s.start:s.end], s.entity) for s in model.predict(text)]
+        gold = [tuple(e) for e in item["entities"]]
+        used = set()
+        for g_text, g_kind in gold:
+            hit = next((i for i, (p, e) in enumerate(preds)
+                        if i not in used and _match(p, e, g_text, g_kind)), None)
+            if hit is None:
+                fn += 1
+                missed.append((g_text, g_kind, text))
+            else:
+                used.add(hit)
+                tp += 1
+        for i, (p, e) in enumerate(preds):
+            if i not in used:
+                fp += 1
+                extra.append((p, e, text))
+    return tp, fp, fn, missed, extra
+
+
+@unittest.skipUnless(_real_model_available(), "Hebrew model or runtime not installed")
+class RealModelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model = ps.load_hebrew_model(ps.find_hebrew_model())
+        cls.items = json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+    def spans(self, text):
+        return [(text[s.start:s.end], s.entity) for s in self.model.predict(text)]
+
+    def test_f1_on_fixture(self):
+        tp, fp, fn, missed, extra = _score(self.model, self.items)
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        print(f"\nF1={f1:.3f} P={precision:.3f} R={recall:.3f} tp={tp} fp={fp} fn={fn}")
+        print("missed:", missed)
+        print("extra:", extra)
+        self.assertGreaterEqual(f1, 0.85)
+
+    # A bare family name after "משפחת" comes back as ORGANIZATION "משפחת אזולאי". The text is
+    # still masked, only the type differs. Known model limit, measured with the pinned model.
+    KNOWN_PERSON_AS_ORG = {"אזולאי"}
+
+    def test_every_person_found(self):
+        for item in self.items:
+            text = item["text"]
+            preds = self.spans(text)
+            for g_text, g_kind in item["entities"]:
+                if g_kind != "PER":
+                    continue
+                if g_text in self.KNOWN_PERSON_AS_ORG:
+                    # never unmasked: some span of any type must cover the name
+                    self.assertTrue(any(g_text in p for p, _ in preds), f"{g_text!r}: {preds}")
+                    continue
+                self.assertTrue(any(_match(p, e, g_text, g_kind) for p, e in preds),
+                                f"person {g_text!r} missed in {text!r}: {preds}")
+
+    def test_speed_long_text(self):
+        base = " ".join(i["text"] for i in self.items)
+        text = (base * 3)[:1500]
+        start = time.perf_counter()
+        self.model.predict(text)
+        took = time.perf_counter() - start
+        print(f"\nspeed: {len(text)} chars in {took:.2f} s")
+        self.assertLess(took, 5.0)
+
+    # ---- R2 checks ----
+    def test_tokenizer_has_no_truncation_or_padding(self):
+        self.assertIsNone(self.model.tokenizer.truncation)
+        self.assertIsNone(self.model.tokenizer.padding)
+
+    def test_special_tokens_and_label_map(self):
+        tok = self.model.tokenizer
+        self.assertIsNotNone(tok.token_to_id("[CLS]"))
+        self.assertIsNotNone(tok.token_to_id("[SEP]"))
+        self.assertEqual(len(self.model.id2label), 27)
+        self.assertIn("O", self.model.id2label.values())
+
+    def test_logits_shape(self):
+        tok = self.model.tokenizer
+        ids = [tok.token_to_id("[CLS]")] + tok.encode("דנה כהן", add_special_tokens=False).ids \
+            + [tok.token_to_id("[SEP]")]
+        self.assertEqual(self.model._run(ids).shape, (len(ids), 27))
+
+    def test_name_after_600_tokens_found(self):
+        filler = " ".join(["הדוח נשלח למחלקת הכספים אתמול בערב והמערכת עודכנה לפי הנוהל."] * 70)
+        text = filler + " בסוף נפגשה אורית דהן עם הצוות."
+        tokens = len(self.model.tokenizer.encode(text, add_special_tokens=False).ids)
+        self.assertGreater(tokens, 600)
+        self.assertTrue(any(e == "PERSON" and "דהן" in t for t, e in self.spans(text)),
+                        self.spans(text)[-3:])
+
+    def test_spans_cover_whole_words(self):
+        texts = [
+            "דנה כהן נפגשה עם משה לוי בחיפה.",
+            "אביגיל רוזנצוויג-שטרנברג נפגשה עם זלמן שכטמן-קורנפלד בקריית שמונה.",
+            "הגיעו הדס ברגמן, אנאבל מרקוביץ ומתתיהו אלקבץ מאלפי מנשה.",
+        ]
+        for text in texts:
+            for s in self.model.predict(text):
+                if s.start > 0:
+                    self.assertFalse(text[s.start - 1].isalnum(), (text, text[s.start:s.end]))
+                if s.end < len(text):
+                    self.assertFalse(text[s.end].isalnum(), (text, text[s.start:s.end]))
+        found = self.spans(texts[2])
+        self.assertTrue(any("מתתיהו" in t for t, e in found), found)
+        self.assertTrue(any("אנאבל" in t for t, e in found), found)
+
+    def test_window_default_is_not_the_lossy_400(self):
+        # a 400-token window missed 4 of 48 persons with the pinned model (see HEBREW_WINDOW_TOKENS)
+        self.assertLessEqual(ps.HEBREW_WINDOW_TOKENS, 300)
+        self.assertEqual(self.model.max_tokens, ps.HEBREW_WINDOW_TOKENS)
+
+    def test_long_text_matches_its_parts(self):
+        # sentences the model types alone with high confidence; 8 of them, 8 times over
+        good = [self.items[k] for k in (0, 3, 4, 10, 13, 14, 15, 17)]
+        parts = [self.spans(i["text"]) for i in good]
+        whole_text = " ".join([i["text"] for i in good] * 8)
+        tokens = len(self.model.tokenizer.encode(whole_text, add_special_tokens=False).ids)
+        self.assertGreater(tokens, 2 * ps.HEBREW_WINDOW_TOKENS)
+        found = self.model.predict(whole_text)
+        # no duplicate or overlapping spans
+        for a, b in zip(found, found[1:]):
+            self.assertLessEqual(a.end, b.start, (whole_text[a.start:a.end], whole_text[b.start:b.end]))
+        # Context shifts some ORGANIZATION and LOCATION labels in a long text (measured: one
+        # repeated company name loses its tail). PERSON is the leak-critical type: every PERSON
+        # found in a part is found again at every repeat in the whole text.
+        for entity_text, entity in sorted({p for part in parts for p in part}):
+            if entity != "PERSON":
+                continue
+            for m in re.finditer(re.escape(entity_text), whole_text):
+                self.assertTrue(any(s.entity == "PERSON" and s.start <= m.start() and m.end() <= s.end
+                                    for s in found), (entity_text, m.start()))
+        for s in found:
+            for ch_pos in (s.start - 1, s.end):
+                if 0 <= ch_pos < len(whole_text):
+                    self.assertFalse(whole_text[ch_pos].isalnum())
