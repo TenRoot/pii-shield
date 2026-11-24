@@ -97,6 +97,14 @@ class ExtractTextTests(unittest.TestCase):
         self.assertEqual(r.skipped_count, 1)
         self.assertFalse(r.all_skipped)
 
+    def test_little_text_scan_keeps_text_layer(self):
+        r = ps.extract_pdf_text(FIX / "little_text_scan.pdf", self.off())
+        page = r.pages[0]
+        self.assertEqual(page.method, "partial")
+        self.assertEqual(page.header, "--- page 1 (little text, image text not read: OCR turned off) ---")
+        self.assertEqual(page.text.strip(), "page 7")
+        self.assertFalse(r.all_skipped)
+
     def test_password_pdf_raises_pdf_error(self):
         with self.assertRaises(ps.PdfError) as cm:
             ps.extract_pdf_text(FIX / "he_password.pdf", self.off())
@@ -162,6 +170,21 @@ class ImageRatioTests(unittest.TestCase):
     def test_image_outside_crop_box_is_zero(self):
         r = self.ratio("he_scan.pdf", lambda p: p.set_cropbox(1000, 1000, 1100, 1100))
         self.assertEqual(r, 0.0)
+
+    def test_scan_inside_scaled_form_xobject(self):
+        # The form is scaled to the page (612x792); the image inside it is 1x1 in form space.
+        self.assertGreater(self.ratio("form_xobject_scan.pdf"), 0.5)
+        r = ps.extract_pdf_text(FIX / "form_xobject_scan.pdf", ps.OcrSettings(enabled=False))
+        page = r.pages[0]
+        self.assertEqual(page.method, "partial")
+        self.assertEqual(page.header, "--- page 1 (mostly image, image text not read: OCR turned off) ---")
+        doc = ps.pdfium.PdfDocument(str(FIX / "form_xobject_scan.pdf"))
+        try:
+            pg = doc[0]
+            self.assertEqual(ps.classify_page(ps._layer_text(pg), ps._image_ratio(pg)), "mostly_image")
+            pg.close()
+        finally:
+            doc.close()
 
     def test_image_with_text_layer_is_mostly_image(self):
         for name in ("he_image_text.pdf", "he_image_text_rot90.pdf"):

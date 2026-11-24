@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the PDF test fixtures. Needs soffice (LibreOffice), pdftoppm and qpdf.
+# Rebuild the PDF test fixtures. Needs soffice (LibreOffice), pdftoppm, qpdf and Python 3.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -21,3 +21,6 @@ rm -f he_password.pdf
 qpdf --encrypt user owner 256 -- he_text.pdf he_password.pdf
 
 rm -f he_text.txt he_scan.png
+
+# Hand-made PDFs (form fields and notes, a scan inside a Form XObject, a little-text scan).
+"${PYTHON:-../../.venv/bin/python}" -I make_hand_pdfs.py

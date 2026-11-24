@@ -3227,6 +3227,8 @@ def _image_ratio(page) -> float:
 
     get_bounds() gives unrotated user-space coordinates, so clip against the crop box
     (which falls back to the media box) in that same space, not against get_size().
+    For an image inside a Form XObject, get_bounds() is in the form's space: apply the
+    matrix of each parent form object to get page space.
     """
     box_l, box_b, box_r, box_t = page.get_cropbox()
     area = (box_r - box_l) * (box_t - box_b)
@@ -3235,6 +3237,14 @@ def _image_ratio(page) -> float:
     covered = 0.0
     for obj in page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE], max_depth=5):
         left, bottom, right, top = obj.get_bounds()
+        form = obj.container
+        if form is not None:
+            m = form.get_matrix()
+            form = form.container
+            while form is not None:
+                m = m.multiply(form.get_matrix())  # inner form first, then its parent
+                form = form.container
+            left, bottom, right, top = m.on_rect(left, bottom, right, top)
         w = min(right, box_r) - max(left, box_l)
         h = min(top, box_t) - max(bottom, box_b)
         if w > 0 and h > 0:
