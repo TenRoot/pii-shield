@@ -85,6 +85,37 @@ def default_app_dir() -> Path:
 
 
 APP_DIR = default_app_dir()
+
+HEBREW_MODEL_DIRNAME = "dictabert-ner"
+HEBREW_MODEL_FILES = ("config.json", "tokenizer.json", "model_quantized.onnx")
+
+
+def bundle_dir() -> Path:
+    """Folder that holds the build's own files: PyInstaller's unpack folder, else next to this script."""
+    if is_frozen():
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+
+def bundled_model_dir() -> Path:
+    return bundle_dir() / "models" / HEBREW_MODEL_DIRNAME
+
+
+def _model_dir_valid(d: Path) -> bool:
+    return all((d / name).is_file() for name in HEBREW_MODEL_FILES)
+
+
+def find_hebrew_model() -> Optional[Path]:
+    """First valid Hebrew model folder: the bundled one, then APP_DIR/models/."""
+    for d in (bundled_model_dir(), APP_DIR / "models" / HEBREW_MODEL_DIRNAME):
+        if _model_dir_valid(d):
+            return d
+    return None
+
+
+def is_full_build() -> bool:
+    """True only when the model ships inside the build. Loads nothing."""
+    return _model_dir_valid(bundled_model_dir())
 RULES_DIR = APP_DIR / "rules"
 LOCAL_RULES_DIR = RULES_DIR / "local"
 REMOTE_RULES_DIR = RULES_DIR / "remote"
@@ -135,6 +166,7 @@ DEFAULT_CONFIG: Dict = {
         "detect_organizations": True,   # spaCy ORG: some false positives, but safer to over-detect
         "skip_ner_on_logs": False,      # drop spaCy PERSON/ORG/LOCATION findings when the input looks like a log
         "check_presidio_updates": True,  # ask PyPI at startup; reports only, never installs
+        "hebrew_ner": True,             # DictaBERT NER on Hebrew lines (needs the Hebrew model files)
     },
     "behavior": {
         "token_format": "<{entity}_{n}>",
@@ -1568,7 +1600,7 @@ class Finding:
         return self.end - self.start
 
 
-SOURCE_PRIORITY = {"manual": 3, "custom": 2, "session": 2, "presidio": 1, "propagated": 0}
+SOURCE_PRIORITY = {"manual": 3, "custom": 2, "session": 2, "presidio": 1, "hebrew_ner": 1, "propagated": 0}
 
 
 def resolve_overlaps(findings: List[Finding]) -> List[Finding]:
@@ -3384,7 +3416,7 @@ def find_tesseract(configured: str = "") -> Optional[Path]:
     """Find the Tesseract program: configured path, bundled copy, PATH, then the Windows default."""
     if configured and Path(configured).is_file():
         return Path(configured)
-    bundled = APP_DIR / "tesseract" / ("tesseract.exe" if os.name == "nt" else "tesseract")
+    bundled = bundle_dir() / "tesseract" / ("tesseract.exe" if os.name == "nt" else "tesseract")
     if bundled.is_file():
         return bundled
     found = shutil.which("tesseract")
@@ -3558,7 +3590,7 @@ except Exception as _exc:  # pragma: no cover
 
 ENTITY_COLORS = ["#ffe08a", "#b6e3ff", "#c9f2c7", "#ffc9de", "#e3d2ff", "#ffd7b5", "#c2f0ef", "#f0e1c2"]
 SOURCE_LABEL = {"presidio": "Presidio", "custom": "Custom rule", "manual": "Manual", "propagated": "Propagated",
-                "session": "Session map"}
+                "session": "Session map", "hebrew_ner": "Hebrew NER"}
 
 if QT_OK:
     class TaskSignals(QtCore.QObject):

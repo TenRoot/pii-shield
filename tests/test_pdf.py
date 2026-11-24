@@ -373,11 +373,11 @@ class OcrTests(unittest.TestCase):
         exe = fake_tesseract(self.tmp)
         self.assertEqual(ps.find_tesseract(str(exe)), exe)
         with mock.patch.object(ps.shutil, "which", return_value=None), \
-             mock.patch.object(ps, "APP_DIR", self.tmp / "none"), mock.patch.object(ps.os, "name", "posix"):
+             mock.patch.object(ps, "bundle_dir", return_value=self.tmp / "none"), mock.patch.object(ps.os, "name", "posix"):
             self.assertIsNone(ps.find_tesseract(""))
         bundled = self.tmp / "app" / "tesseract"; bundled.mkdir(parents=True)
         shutil.copy(exe, bundled / "tesseract")
-        with mock.patch.object(ps, "APP_DIR", self.tmp / "app"):
+        with mock.patch.object(ps, "bundle_dir", return_value=self.tmp / "app"):
             self.assertEqual(ps.find_tesseract(""), bundled / "tesseract")
 
     def test_tesseract_info(self):
