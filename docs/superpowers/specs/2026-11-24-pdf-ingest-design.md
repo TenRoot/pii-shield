@@ -144,14 +144,24 @@ The app does two things to each extracted line:
    regex fails, and value propagation misses the value.
 2. **Fix visual order.** Hebrew final letters (ך ם ן ף ץ) occur only at the end of
    a word. If, in a line, final letters occur at the start of Hebrew words more
-   often than at the end, the line is in visual order. The app then:
-   - reverses the order of **all** runs in the line (Hebrew, Latin, digit and
-     space runs), and
-   - reverses the characters inside each Hebrew run only. Latin and digit runs keep
-     their characters in the same order.
+   often than at the end, the line is in visual order. The app splits the line into
+   runs:
+   - a **Hebrew run**: one or more Hebrew letters;
+   - an **LTR run**: from a Latin letter or digit to the last Latin letter or digit
+     before the next Hebrew letter, with the spaces and punctuation between them
+     (so `test@example.com` and `world 2024` are one run each);
+   - every other character (space, punctuation) is a run of its own.
 
-   Example: the visual line `םש 123456782 :ז.ת` becomes `ת.ז: 123456782 שם`.
-   This is the reverse of how a viewer draws a right-to-left line.
+   The app then reverses the order of all runs, and reverses the characters inside
+   each Hebrew run only. LTR runs keep their characters in the same order.
+
+   Examples (checked with a short script):
+   - `םש 123456782 :ז.ת` becomes `ת.ז: 123456782 שם`
+   - `הדות test@example.com :ליימ` becomes `מייל: test@example.com תודה`
+   - `םולש world 2024 םולש` becomes `שלום world 2024 שלום`
+
+   This is the reverse of how a viewer draws a right-to-left line. It is a simple
+   form of the Unicode bidi rules, and it is enough for one-line runs of text.
 
 The builder confirms this with fixture PDFs: one in logical order (made with
 LibreOffice) and one in visual order. Both must give the same text. A value such as
