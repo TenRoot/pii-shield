@@ -512,6 +512,15 @@ class FetchAssetsTests(unittest.TestCase):
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertFalse((folder / "tokenizer.json.part").exists())
 
+    def test_interrupt_during_download_deletes_part_file(self):
+        def dl(url, dest):
+            dest.write_bytes(b"half")
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            fa.fetch_verified("https://x/tokenizer.json", self.tmp / "tokenizer.json",
+                              self.table[1][2], self.table[1][3], dl)
+        self.assertEqual(list(self.tmp.iterdir()), [])
+
     def test_os_error_outside_download_is_caught_in_main(self):
         err = io.StringIO()
         boom = PermissionError(13, "Permission denied", str(self.tmp / "out" / "LICENSE.txt"))
@@ -981,6 +990,10 @@ SHUFFLE_EXTRA_PERSONS = ["אבי לוי", "ז'אן-פייר לוי"]
 # outside predict's overlap handling: the model misses a name in long context ("אזולאי"), or it
 # splits "בבית אבי לוי" into two touching spans. See the task-4 report.
 SHUFFLE_SEED = 5
+# End-to-end guard seeds (search over seeds 0-99): with the old _dedupe, analyze + sanitize left
+# part of a review name in the output; with the union merge the name is fully masked.
+# 43: "ז'אן-פייר לוי" lost "פייר" and "לוי"; 90: "אבי לוי" lost "לוי".
+E2E_GUARD_SEEDS = (43, 90)
 
 
 def shuffled_long_text(items, seed):
@@ -1063,14 +1076,23 @@ class ShuffledLongTextTests(unittest.TestCase):
         text = shuffled_long_text(self.items, SHUFFLE_SEED)
         self.assertEqual(engine_problems(self.engine, text, SHUFFLE_EXTRA_PERSONS), [])
 
+    def test_review_names_fully_masked_end_to_end_guard_seeds(self):
+        for seed in E2E_GUARD_SEEDS:
+            with self.subTest(seed=seed):
+                text = shuffled_long_text(self.items, seed)
+                self.assertEqual(engine_problems(self.engine, text, SHUFFLE_EXTRA_PERSONS), [])
+
     # KNOWN LEAK, outside Hebrew NER: the English spaCy model tags Hebrew text with long junk
     # spans (LOCATION "אברהמי מחברת אורנים"). resolve_overlaps keeps the longer span at equal
-    # source priority, so PERSON "יוסי אברהמי" loses and "יוסי" stays in the output. Strict
-    # check kept as an expected failure so a fix shows up as an unexpected success.
-    @unittest.expectedFailure
+    # source priority, so PERSON "יוסי אברהמי" loses and "יוסי" stays in the output. Measured
+    # with the pinned model and en_core_web_lg; see the task-4 report. Every other fixture
+    # person must be fully masked.
+    KNOWN_SPACY_OVERRIDE = {"יוסי אברהמי"}
+
     def test_every_fixture_person_fully_masked_end_to_end(self):
         text = shuffled_long_text(self.items, SHUFFLE_SEED)
-        self.assertEqual(engine_problems(self.engine, text, shuffle_persons(self.items)), [])
+        problems = engine_problems(self.engine, text, shuffle_persons(self.items))
+        self.assertEqual([p for p in problems if p[1] not in self.KNOWN_SPACY_OVERRIDE], [])
 
 
 if __name__ == "__main__":

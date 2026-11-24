@@ -159,12 +159,12 @@ def fetch_verified(url: str, dest: Path, sha256: str, size: int,
             raise AssetError(f"{dest.name}: size or SHA-256 mismatch (expected {size} bytes / "
                              f"{sha256}, got {actual_size} bytes / {actual_hash})")
         part.replace(dest)
-    except AssetError:
-        part.unlink(missing_ok=True)
-        raise
     except OSError as exc:  # requests.RequestException is an OSError subclass
         part.unlink(missing_ok=True)
         raise AssetError(f"{dest.name}: {exc}") from exc
+    except BaseException:  # AssetError, Ctrl+C, anything else: never leave a .part
+        part.unlink(missing_ok=True)
+        raise
     return dest
 
 
