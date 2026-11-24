@@ -108,6 +108,48 @@ class ExtractTextTests(unittest.TestCase):
         self.assertEqual(len(r.pages), 1)
 
 
+@unittest.skipIf(ps.pdfium is None, "pypdfium2 not installed")
+class ImageRatioTests(unittest.TestCase):
+    def ratio(self, name, setup=None):
+        doc = ps.pdfium.PdfDocument(str(FIX / name))
+        try:
+            page = doc[0]
+            if setup:
+                setup(page)
+            r = ps._image_ratio(page)
+            page.close()
+            return r
+        finally:
+            doc.close()
+
+    def test_ratio_values(self):
+        self.assertEqual(self.ratio("he_text.pdf"), 0.0)
+        self.assertGreater(self.ratio("he_scan.pdf"), 0.8)
+        self.assertGreater(self.ratio("he_image_text.pdf"), 0.8)
+
+    def test_rotated_page_ratio_matches_unrotated(self):
+        self.assertAlmostEqual(self.ratio("he_image_text_rot90.pdf"), self.ratio("he_image_text.pdf"), places=6)
+
+    def test_shifted_crop_box_uses_crop_box_space(self):
+        # Crop box (400,500)-(700,800) overlaps the image (28.3..583.6 x 36.8..755.3) by 183.6x255.3 of 300x300.
+        # Clipping to [0,300]x[0,300] (the old behavior) would give 1.0.
+        r = self.ratio("he_scan.pdf", lambda p: p.set_cropbox(400, 500, 700, 800))
+        self.assertAlmostEqual(r, (183.625 * 255.348) / (300 * 300), places=2)
+
+    def test_image_outside_crop_box_is_zero(self):
+        r = self.ratio("he_scan.pdf", lambda p: p.set_cropbox(1000, 1000, 1100, 1100))
+        self.assertEqual(r, 0.0)
+
+    def test_image_with_text_layer_is_mostly_image(self):
+        for name in ("he_image_text.pdf", "he_image_text_rot90.pdf"):
+            r = ps.extract_pdf_text(FIX / name, ps.OcrSettings(enabled=False))
+            page = r.pages[0]
+            self.assertEqual(page.method, "partial", name)
+            self.assertEqual(page.header, "--- page 1 (mostly image, image text not read: OCR turned off) ---", name)
+            self.assertIn("123456782", page.text, name)
+            self.assertIn("test@example.com", page.text, name)
+
+
 class ClassifyTests(unittest.TestCase):
     def test_classify(self):
         self.assertEqual(ps.classify_page("short", 0.0), "scanned")

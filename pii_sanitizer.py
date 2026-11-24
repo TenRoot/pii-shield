@@ -3208,16 +3208,20 @@ def _finish_page(number: int, layer_text: str, kind: str, ocr_text: Optional[str
 
 
 def _image_ratio(page) -> float:
-    """Share of the page area covered by images, from 0.0 to 1.0."""
-    width, height = page.get_size()
-    area = width * height
+    """Share of the page area covered by images, from 0.0 to 1.0.
+
+    get_bounds() gives unrotated user-space coordinates, so clip against the crop box
+    (which falls back to the media box) in that same space, not against get_size().
+    """
+    box_l, box_b, box_r, box_t = page.get_cropbox()
+    area = (box_r - box_l) * (box_t - box_b)
     if area <= 0:
         return 0.0
     covered = 0.0
     for obj in page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_IMAGE], max_depth=5):
         left, bottom, right, top = obj.get_bounds()
-        w = min(right, width) - max(left, 0)
-        h = min(top, height) - max(bottom, 0)
+        w = min(right, box_r) - max(left, box_l)
+        h = min(top, box_t) - max(bottom, box_b)
         if w > 0 and h > 0:
             covered += w * h
     return min(covered / area, 1.0)

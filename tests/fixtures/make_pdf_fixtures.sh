@@ -15,6 +15,8 @@ pdftoppm -r 100 -png -f 1 -l 1 he_text.pdf he_scan_src
 mv he_scan_src-*.png he_scan.png
 soffice --headless --convert-to pdf he_scan.png >/dev/null
 qpdf --empty --pages he_text.pdf 1 he_scan.pdf 1 he_text.pdf 1 -- he_mixed.pdf
+qpdf he_scan.pdf --overlay he_text.pdf -- he_image_text.pdf
+qpdf --rotate=+90 he_image_text.pdf he_image_text_rot90.pdf
 rm -f he_password.pdf
 qpdf --encrypt user owner 256 -- he_text.pdf he_password.pdf
 
