@@ -3254,8 +3254,8 @@ def find_tesseract(configured: str = "") -> Optional[Path]:
     return None
 
 
-def _run_tesseract(args: List[str], timeout: int) -> "subprocess.CompletedProcess[bytes]":
-    return subprocess.run(args, capture_output=True, timeout=timeout, shell=False,
+def _run_tesseract(args: List[str], timeout: int, data: Optional[bytes] = None) -> "subprocess.CompletedProcess[bytes]":
+    return subprocess.run(args, capture_output=True, timeout=timeout, shell=False, input=data,
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -3267,14 +3267,21 @@ def tesseract_info(exe: Path) -> Tuple[str, Set[str]]:
     except (OSError, subprocess.SubprocessError):
         return "", set()
     version = (v.stdout or v.stderr).decode("utf-8", "replace").strip().splitlines()
-    langs = l.stdout.decode("utf-8", "replace").splitlines()[1:]
-    return (version[0].strip() if version else ""), {x.strip() for x in langs if x.strip()}
+    # Old Tesseract versions print the list to stderr, new ones to stdout.
+    lines = l.stdout.decode("utf-8", "replace").splitlines()[1:]
+    if not any(x.strip() for x in lines):
+        lines = l.stderr.decode("utf-8", "replace").splitlines()[1:]
+    return (version[0].strip() if version else ""), {x.strip() for x in lines if x.strip()}
 
 
-def ocr_image(exe: Path, image: Path, languages: str, timeout: int) -> str:
-    """Run Tesseract on one image and return the cleaned text. Raises PdfError on failure."""
+def ocr_image(exe: Path, image: bytes, languages: str, timeout: int) -> str:
+    """Run Tesseract on one image (PGM bytes, sent on stdin) and return the cleaned text.
+
+    Raises PdfError on failure. No temp file is written: Windows Tesseract builds
+    mishandle non-ASCII temp paths.
+    """
     try:
-        r = _run_tesseract([str(exe), str(image), "stdout", "-l", languages], timeout)
+        r = _run_tesseract([str(exe), "stdin", "stdout", "-l", languages], timeout, image)
     except subprocess.TimeoutExpired as exc:
         raise PdfError("OCR timed out") from exc
     except OSError as exc:
@@ -3301,22 +3308,16 @@ def _ocr_languages(wanted: str, installed: Set[str]) -> Tuple[str, str]:
     return "+".join(have), f"{used} only: {missing} language data missing"
 
 
-def _render_pgm(page, dpi: int) -> Path:
-    """Render a page to a temporary binary PGM file. The caller deletes the file."""
+def _render_pgm(page, dpi: int) -> bytes:
+    """Render a page to binary PGM bytes in memory."""
     bitmap = page.render(scale=dpi / 72, grayscale=True)
     try:
         w, h, stride = bitmap.width, bitmap.height, bitmap.stride
         buf = memoryview(bitmap.buffer).cast("B")
-        fd, name = tempfile.mkstemp(suffix=".pgm")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(f"P5 {w} {h} 255\n".encode("ascii"))
-                for y in range(h):
-                    f.write(buf[y * stride:y * stride + w])
-        except BaseException:
-            Path(name).unlink(missing_ok=True)
-            raise
-        return Path(name)
+        out = bytearray(f"P5 {w} {h} 255\n".encode("ascii"))
+        for y in range(h):
+            out += buf[y * stride:y * stride + w]
+        return bytes(out)
     finally:
         bitmap.close()
 
@@ -3369,15 +3370,12 @@ def extract_pdf_text(path: Path, ocr: OcrSettings, progress: Optional[Callable[[
                         engine = _prepare_ocr(ocr)
                     exe, langs, ocr_note, reason = engine
                     if exe is not None and langs:
-                        image = None
                         try:
-                            image = _render_pgm(page, ocr.dpi)
-                            ocr_text = ocr_image(exe, image, langs, ocr.timeout)
+                            ocr_text = ocr_image(exe, _render_pgm(page, ocr.dpi), langs, ocr.timeout)
+                            if not ocr_text.strip():
+                                reason = "OCR found no text"
                         except PdfError as exc:
                             reason = str(exc)
-                        finally:
-                            if image is not None:
-                                image.unlink(missing_ok=True)
             finally:
                 page.close()
             done = _finish_page(n, layer, kind, ocr_text, reason, ocr_note)
