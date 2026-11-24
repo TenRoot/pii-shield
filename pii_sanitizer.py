@@ -2197,6 +2197,10 @@ def leak_check(output: str, vault: SessionVault, extra_values: Iterable[str] = (
     """Return raw values (len>=3) from the session that still appear in the sanitized output."""
     values = {v for v in list(vault.token_to_value.values()) + list(extra_values) if len(v.strip()) >= 3}
     tokens = set(vault.token_to_value)
+    # analyze() never masks PDF page header lines, so a session value such as "OCR" in a
+    # header is not a leak. Blank the header lines (same length) before the search.
+    if page_header_spans(output):
+        output = PAGE_HEADER_RE.sub(lambda m: " " * len(m.group()), output)
     leaks = []
     for v in sorted(values, key=len, reverse=True):
         if v in tokens:

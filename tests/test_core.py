@@ -83,6 +83,17 @@ class EngineTests(unittest.TestCase):
         self.assertIn("John Smith", d, "body text is still scanned")
         self.assertIn("SRV-DC01", d)
 
+    def test_header_word_in_session_is_not_a_leak(self):
+        vault = ps.SessionVault()
+        vault.commit("OCR", "<ORGANIZATION_1>", "ORGANIZATION")
+        text = "--- page 2 (OCR) ---\nThe OCR team met John Smith."
+        fs, _ = self.analyze(text, vault=vault)
+        out, _ = ps.sanitize(text, fs, vault)
+        self.assertTrue(out.startswith("--- page 2 (OCR) ---\n"), out)
+        self.assertNotIn("OCR team", out, "the session value is still masked in body text")
+        self.assertEqual(ps.leak_check(out, vault), [])
+        self.assertEqual(ps.leak_check(out + "\nOCR again", vault), ["OCR"])
+
     def test_skip_ner_argument_drops_ner_findings(self):
         if self.engine.mode != "presidio+spacy":
             self.skipTest("needs a spaCy model")
