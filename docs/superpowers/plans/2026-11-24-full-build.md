@@ -221,7 +221,7 @@ def test_settings_checkbox_saves(self): ...
 def test_f1_on_fixture(self):
     # match rule: same type (PER/ORG/LOC from the map) and one surface contains the other, both >= 2 chars
     self.assertGreaterEqual(f1, 0.85)
-def test_every_person_found(self): ...   # every PER surface is matched by some PERSON span (any type counts as found? no: PERSON only)
+def test_every_person_found(self): ...   # every PER surface is matched by a PERSON span
 def test_speed_long_text(self): ...      # 1500-char Hebrew text predicted in < 5 s (generous CI bound); prints the time
 ```
 
