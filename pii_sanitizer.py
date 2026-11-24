@@ -3765,23 +3765,34 @@ class HebrewNerModel:
 
     @staticmethod
     def _dedupe(spans: List[HebrewSpan]) -> List[HebrewSpan]:
-        """Drop repeats from overlapping windows and fragments cut by a window edge."""
-        kept: List[HebrewSpan] = []
-        for sp in sorted(spans, key=lambda x: (x.start, -(x.end - x.start), -x.score)):
-            # One window never gives two spans over the same token, so any overlap here comes
-            # from the 50-token window overlap, where one window saw less context. Keep the
-            # longer span, whatever its type: it covers more text.
-            if any(k.start <= sp.start and sp.end <= k.end for k in kept):
-                continue
-            kept.append(sp)
-        # same (start, end, entity) repeats keep the best score
-        best: Dict[Tuple[int, int, str], float] = {}
-        for sp in spans:
-            key = (sp.start, sp.end, sp.entity)
-            best[key] = max(best.get(key, 0.0), sp.score)
-        for k in kept:
-            k.score = best.get((k.start, k.end, k.entity), k.score)
-        return sorted(kept, key=lambda x: x.start)
+        """Merge every group of overlapping spans, of any type, into one union span.
+
+        Overlaps come from the 50-token window overlap (one window saw less context and gave
+        other labels) and from word extension (PERSON "ז'" grows to "ז'אן" and touches an
+        ORGANIZATION "אן-פייר"). resolve_overlaps keeps only one of two overlapping findings, so
+        a partial overlap would leave part of a name unmasked. The union never loses coverage.
+        Type: PERSON if any part is PERSON, else the type of the highest-scoring part.
+        Score: the highest part score."""
+        merged: List[HebrewSpan] = []
+        group: List[HebrewSpan] = []
+
+        def close():
+            if not group:
+                return
+            best = max(group, key=lambda x: x.score)
+            entity = "PERSON" if any(g.entity == "PERSON" for g in group) else best.entity
+            merged.append(HebrewSpan(min(g.start for g in group), max(g.end for g in group),
+                                     entity, best.score))
+            group.clear()
+
+        end = -1
+        for sp in sorted(spans, key=lambda x: (x.start, x.end)):
+            if group and sp.start >= end:
+                close()
+            group.append(sp)
+            end = max(end, sp.end) if len(group) > 1 else sp.end
+        close()
+        return merged
 
 
 def load_hebrew_model(model_dir: Path) -> HebrewNerModel:
