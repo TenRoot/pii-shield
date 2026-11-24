@@ -192,6 +192,16 @@ class ClassifyTests(unittest.TestCase):
         p = ps._finish_page(2, "", "scanned", ocr_text="hello", reason="", ocr_note="English only: Hebrew language data missing")
         self.assertEqual(p.header, "--- page 2 (OCR, English only: Hebrew language data missing) ---")
 
+    def test_little_text_page_keeps_layer_when_no_ocr(self):
+        for reason in ("Tesseract not installed", "OCR failed", "OCR timed out", "OCR found no text"):
+            p = ps._finish_page(4, "page 7", "scanned", None if reason != "OCR found no text" else " ", reason)
+            self.assertEqual(p.method, "partial", reason)
+            self.assertEqual(p.text, "page 7", reason)
+            self.assertEqual(p.header, f"--- page 4 (little text, image text not read: {reason}) ---")
+        p = ps._finish_page(4, " \n ", "scanned", None, "OCR turned off")
+        self.assertEqual((p.method, p.text, p.header),
+                         ("skipped", "", "--- page 4 (scanned, skipped: OCR turned off) ---"))
+
     def test_finish_page_unreadable_and_empty_partial(self):
         p = ps._finish_page(3, "\ue001" * 30, "unreadable", None, "OCR turned off")
         self.assertEqual(p.method, "partial")

@@ -3212,6 +3212,10 @@ def _finish_page(number: int, layer_text: str, kind: str, ocr_text: Optional[str
     if kind == "text":
         return PdfPage(number, "text", "", layer_text, f"--- page {number} ---")
     if kind == "scanned":
+        if layer_text.strip():
+            # Keep the little text the page has (a stamp, a footer); say that the image was not read.
+            return PdfPage(number, "partial", reason, layer_text,
+                           f"--- page {number} (little text, image text not read: {reason}) ---")
         return PdfPage(number, "skipped", reason, "", f"--- page {number} (scanned, skipped: {reason}) ---")
     label = "mostly image, image text not read" if kind == "mostly_image" else "unreadable text, not read"
     method = "partial" if layer_text.strip() else "skipped"

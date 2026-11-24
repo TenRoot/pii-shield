@@ -107,8 +107,11 @@ English data. Pages that are mostly an image, or whose text is unreadable, also 
 The page line then reads `--- page 2 (OCR) ---`.
 
 If Tesseract is not installed, the app skips each scanned page. The page line says why, for
-example `--- page 2 (scanned, skipped: Tesseract not installed) ---`. If Hebrew or English
-data is missing, OCR runs with the other language. The page line says so.
+example `--- page 2 (scanned, skipped: Tesseract not installed) ---`. If a scanned page has a
+little text, for example a stamp or a page number, the app keeps that text. The page line
+then reads `--- page 2 (little text, image text not read: Tesseract not installed) ---`.
+If Hebrew or English data is missing, OCR runs with the other language. The page line says
+so.
 
 The app looks for Tesseract in this order:
 
