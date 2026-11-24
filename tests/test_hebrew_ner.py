@@ -869,16 +869,28 @@ def _spacy_he_results(rule_name):
 
 
 class SpacyOnHebrewTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+    # one engine for the class: each engine loads the spaCy model (memory)
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.engine, _ = make_engine(cls.tmp)
 
-    def run_engine(self, **kw):
-        eng, _ = make_engine(self.tmp, **kw)
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+        cls.engine = None
+
+    def run_engine(self, model_loaded=True, setting=True):
+        eng = self.engine
         rule = eng.ruleset.rules[0].name
-        with mock.patch.object(eng.analyzer, "analyze", return_value=_spacy_he_results(rule)):
+        with mock.patch.object(eng.analyzer, "analyze", return_value=_spacy_he_results(rule)), \
+             mock.patch.dict(eng.config["engine"], {"hebrew_ner": setting}), \
+             mock.patch.object(eng, "hebrew_model", eng.hebrew_model if model_loaded else None):
             fs = eng.analyze(SPACY_HE_TEXT, [], ps.SessionVault())
         return {(f.text, f.source) for f in fs}
+
+    def test_engine_has_the_model(self):
+        self.assertEqual(self.engine.hebrew_status, "loaded")
 
     def test_spacy_finding_with_hebrew_letter_dropped(self):
         got = self.run_engine()
@@ -892,19 +904,10 @@ class SpacyOnHebrewTests(unittest.TestCase):
         self.assertIn(("ת.ז. 123456782", "custom"), self.run_engine())
 
     def test_no_drop_when_setting_off(self):
-        got = self.run_engine(hebrew=False)
-        self.assertIn(("אברהמי מחברת אורנים", "presidio"), got)
+        self.assertIn(("אברהמי מחברת אורנים", "presidio"), self.run_engine(setting=False))
 
-    def test_no_drop_when_model_not_installed(self):
-        got = self.run_engine(model="none")
-        self.assertIn(("אברהמי מחברת אורנים", "presidio"), got)
-
-    def test_no_drop_when_setting_turned_off_after_load(self):
-        eng, _ = make_engine(self.tmp)
-        eng.config["engine"]["hebrew_ner"] = False
-        with mock.patch.object(eng.analyzer, "analyze", return_value=_spacy_he_results("x")):
-            fs = eng.analyze(SPACY_HE_TEXT, [], ps.SessionVault())
-        self.assertIn("אברהמי מחברת אורנים", {f.text for f in fs})
+    def test_no_drop_when_model_not_loaded(self):
+        self.assertIn(("אברהמי מחברת אורנים", "presidio"), self.run_engine(model_loaded=False))
 
 
 # ---- a Hebrew NER span that loses to a rule finding keeps its other words (task 4b) ----
@@ -912,13 +915,20 @@ RULE_HE_TEXT = "גרה ברחוב הרצל 12 תל אביב רונית שפיר�
 
 
 class HebrewPersonCoverageTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp())
+        cls.engine, _ = make_engine(cls.tmp)
 
-    def analyze(self, results, **kw):
-        eng, _ = make_engine(self.tmp, **kw)
-        with mock.patch.object(eng.analyzer, "analyze", return_value=results(eng)):
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+        cls.engine = None
+
+    def analyze(self, results, hebrew=True):
+        eng = self.engine
+        with mock.patch.object(eng.analyzer, "analyze", return_value=results(eng)), \
+             mock.patch.dict(eng.config["engine"], {"hebrew_ner": hebrew}):
             return eng.analyze(RULE_HE_TEXT, [], ps.SessionVault())
 
     @staticmethod
