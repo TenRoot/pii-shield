@@ -81,7 +81,7 @@ dependencies. The user picked pypdfium2 for text and Tesseract for scans.
 3. When the task finishes, the app calls `clear_review()` and puts the text into
    the input box. The app writes one line per page to the Log tab (the Python
    `logging` handler that feeds `log_box`). The status bar shows a summary, for
-   example "PDF loaded: 12 pages, 3 by OCR, 1 skipped (see Log)".
+   example "PDF loaded: 12 page(s), 3 by OCR, 1 skipped (see Log)".
 4. While the task runs, the "Load file" button is disabled. The extraction checks
    a cancel flag between pages. Closing the window sets the flag. The app ignores
    a result that arrives after the window starts to close.
