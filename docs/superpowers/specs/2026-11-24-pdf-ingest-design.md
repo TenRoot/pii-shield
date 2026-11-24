@@ -150,7 +150,7 @@ The app does two things to each extracted line:
    - reverses the characters inside each Hebrew run only. Latin and digit runs keep
      their characters in the same order.
 
-   Example: the visual line `םש 123456782 :הז.ת` becomes `ת.ז: 123456782 שם`.
+   Example: the visual line `םש 123456782 :ז.ת` becomes `ת.ז: 123456782 שם`.
    This is the reverse of how a viewer draws a right-to-left line.
 
 The builder confirms this with fixture PDFs: one in logical order (made with
