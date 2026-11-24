@@ -147,8 +147,12 @@ class HebrewNerCoreTests(unittest.TestCase):
     def test_i_after_o_starts_new_span(self):
         model, _ = build({"דנה": "B-PER", "כהן": "I-PER", "לוי": "I-PER", "משה": "I-ORG"})
         text = "דנה כהן נפגשה לוי משה"
-        self.assertEqual(self.spans(model, text),
-                         [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
+        # the BIO decode, before the gap merge
+        with mock.patch.object(ps.HebrewNerModel, "_merge_gaps", staticmethod(lambda t, sp: sp)):
+            self.assertEqual(self.spans(model, text),
+                             [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
+        # the gap merge then joins the two spans that one space separates (PERSON wins)
+        self.assertEqual(self.spans(model, text), [("דנה כהן", "PERSON"), ("לוי משה", "PERSON")])
 
     def test_english_only_text_never_calls_session(self):
         model, sess = build({"John": "B-PER"})
@@ -277,6 +281,78 @@ class UnionMergeTests(unittest.TestCase):
         with mock.patch.object(model, "_predict_group", return_value=raw):
             out = model.predict(text)
         self.assertEqual([(text[s.start:s.end], s.entity) for s in out], [("ז'אן-פייר לוי", "PERSON")])
+
+
+class GapMergeTests(unittest.TestCase):
+    """Spans split by one gap character (space, '-', maqaf, geresh) become one span, so the
+    engine threshold sees the whole name and cannot drop a weak half (fake spans)."""
+
+    def merged(self, text, spans):
+        return [(text[s.start:s.end], s.entity, s.score)
+                for s in ps.HebrewNerModel._merge_gaps(text, spans)]
+
+    def span(self, text, sub, entity, score):
+        s = text.index(sub)
+        return ps.HebrewSpan(s, s + len(sub), entity, score)
+
+    def test_weak_first_name_part_joins_strong_surname(self):
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "ז'אן-פייר", "PERSON", 0.52), self.span(t, "לוי", "PERSON", 0.92)]
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.92)])
+
+    def test_person_wins_over_other_type(self):
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "ז'אן-פייר", "ORGANIZATION", 0.99), self.span(t, "לוי", "PERSON", 0.77)]
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.99)])
+
+    def test_without_person_higher_score_type_wins(self):
+        t = "בבית אבי לוי."
+        spans = [self.span(t, "בבית", "ORGANIZATION", 0.6), self.span(t, "אבי לוי", "LOCATION", 0.8)]
+        self.assertEqual(self.merged(t, spans), [("בבית אבי לוי", "LOCATION", 0.8)])
+
+    def test_each_gap_character(self):
+        for gap in (" ", "-", "\u05be", "'", "\u05f3"):
+            with self.subTest(gap=repr(gap)):
+                t = "את אבו" + gap + "סאלח."
+                spans = [self.span(t, "אבו", "LOCATION", 0.6), self.span(t, "סאלח", "PERSON", 0.9)]
+                self.assertEqual(self.merged(t, spans), [("אבו" + gap + "סאלח", "PERSON", 0.9)])
+
+    def test_other_single_characters_do_not_join(self):
+        for gap in (",", ".", "\n", "/", ":"):
+            with self.subTest(gap=repr(gap)):
+                t = "את דנה" + gap + "כהן."
+                spans = [self.span(t, "דנה", "PERSON", 0.9), self.span(t, "כהן", "PERSON", 0.9)]
+                self.assertEqual(len(self.merged(t, spans)), 2)
+
+    def test_two_character_gap_does_not_join(self):
+        t = "את דנה, כהן."
+        spans = [self.span(t, "דנה", "PERSON", 0.9), self.span(t, "כהן", "LOCATION", 0.9)]
+        self.assertEqual(len(self.merged(t, spans)), 2)
+
+    def test_touching_spans_do_not_join(self):
+        t = "אבגדהו"
+        spans = [ps.HebrewSpan(0, 3, "PERSON", 0.9), ps.HebrewSpan(3, 6, "LOCATION", 0.9)]
+        self.assertEqual(len(self.merged(t, spans)), 2)
+
+    def test_chain_becomes_one_span(self):
+        t = "את מוחמד אבו-סאלח היום"
+        spans = [self.span(t, "מוחמד", "PERSON", 0.7), self.span(t, "אבו", "LOCATION", 0.5),
+                 self.span(t, "סאלח", "ORGANIZATION", 0.95)]
+        self.assertEqual(self.merged(t, spans), [("מוחמד אבו-סאלח", "PERSON", 0.95)])
+
+    def test_input_order_does_not_matter(self):
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "לוי", "PERSON", 0.92), self.span(t, "ז'אן-פייר", "PERSON", 0.52)]
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.92)])
+
+    def test_predict_runs_gap_merge(self):
+        text = "ואת ז'אן-פייר לוי."
+        model, _ = build({})
+        raw = [self.span(text, "ז'אן-פייר", "PERSON", 0.52), self.span(text, "לוי", "PERSON", 0.92)]
+        with mock.patch.object(model, "_predict_group", return_value=raw):
+            out = model.predict(text)
+        self.assertEqual([(text[s.start:s.end], s.entity, s.score) for s in out],
+                         [("ז'אן-פייר לוי", "PERSON", 0.92)])
 
 
 class WordBoundaryTests(unittest.TestCase):
@@ -736,6 +812,120 @@ class HebrewEngineVariantTests(unittest.TestCase):
         loader.assert_not_called()
 
 
+# ---- spaCy findings on Hebrew text (task 4b, change A) ----
+# The English spaCy model reads Hebrew as junk and gives long spans such as LOCATION
+# "אברהמי מחברת אורנים". When the Hebrew model is on, such spaCy findings are dropped before
+# overlap resolution, so they cannot beat a Hebrew PERSON span.
+SPACY_HE_TEXT = "יוסי אברהמי מחברת אורנים met John Smith, ת.ז. 123456782"
+
+
+def _spacy_he_results(rule_name):
+    t = SPACY_HE_TEXT
+
+    def res(sub, entity, rname, score=0.9):
+        s = t.index(sub)
+        return ps.RecognizerResult(entity_type=entity, start=s, end=s + len(sub), score=score,
+                                   recognition_metadata={"recognizer_name": rname})
+    return [res("אברהמי מחברת אורנים", "LOCATION", "SpacyRecognizer", 0.85),
+            res("John Smith", "PERSON", "SpacyRecognizer"),
+            res("יוסי אברהמי", "PERSON", ps.HEBREW_RECOGNIZER, 1.0),
+            res("ת.ז. 123456782", "IL_ID", rule_name, 1.0)]
+
+
+class SpacyOnHebrewTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def run_engine(self, **kw):
+        eng, _ = make_engine(self.tmp, **kw)
+        rule = eng.ruleset.rules[0].name
+        with mock.patch.object(eng.analyzer, "analyze", return_value=_spacy_he_results(rule)):
+            fs = eng.analyze(SPACY_HE_TEXT, [], ps.SessionVault())
+        return {(f.text, f.source) for f in fs}
+
+    def test_spacy_finding_with_hebrew_letter_dropped(self):
+        got = self.run_engine()
+        self.assertNotIn(("אברהמי מחברת אורנים", "presidio"), got)
+        self.assertIn(("יוסי אברהמי", "hebrew_ner"), got)
+
+    def test_spacy_finding_on_latin_text_kept(self):
+        self.assertIn(("John Smith", "presidio"), self.run_engine())
+
+    def test_rule_finding_on_hebrew_text_kept(self):
+        self.assertIn(("ת.ז. 123456782", "custom"), self.run_engine())
+
+    def test_no_drop_when_setting_off(self):
+        got = self.run_engine(hebrew=False)
+        self.assertIn(("אברהמי מחברת אורנים", "presidio"), got)
+
+    def test_no_drop_when_model_not_installed(self):
+        got = self.run_engine(model="none")
+        self.assertIn(("אברהמי מחברת אורנים", "presidio"), got)
+
+    def test_no_drop_when_setting_turned_off_after_load(self):
+        eng, _ = make_engine(self.tmp)
+        eng.config["engine"]["hebrew_ner"] = False
+        with mock.patch.object(eng.analyzer, "analyze", return_value=_spacy_he_results("x")):
+            fs = eng.analyze(SPACY_HE_TEXT, [], ps.SessionVault())
+        self.assertIn("אברהמי מחברת אורנים", {f.text for f in fs})
+
+
+# ---- a Hebrew NER span that loses to a rule finding keeps its other words (task 4b) ----
+RULE_HE_TEXT = "גרה ברחוב הרצל 12 תל אביב רונית שפירא, כך נמסר."
+
+
+class HebrewPersonCoverageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def analyze(self, results, **kw):
+        eng, _ = make_engine(self.tmp, **kw)
+        with mock.patch.object(eng.analyzer, "analyze", return_value=results(eng)):
+            return eng.analyze(RULE_HE_TEXT, [], ps.SessionVault())
+
+    @staticmethod
+    def res(sub, entity, rname, score):
+        s = RULE_HE_TEXT.index(sub)
+        return ps.RecognizerResult(entity_type=entity, start=s, end=s + len(sub), score=score,
+                                   recognition_metadata={"recognizer_name": rname})
+
+    def test_person_words_outside_rule_finding_stay_masked(self):
+        rule = lambda eng: eng.ruleset.rules[0].name
+        fs = self.analyze(lambda eng: [
+            self.res("רחוב הרצל 12 תל אביב רונית שפירא", "PERSON", ps.HEBREW_RECOGNIZER, 1.0),
+            self.res("רחוב הרצל 12", "IL_ADDRESS", rule(eng), 0.9)])
+        got = sorted((f.text, f.entity, f.source) for f in fs)
+        self.assertEqual(got, [("רחוב הרצל 12", "IL_ADDRESS", "custom"),
+                               ("תל אביב רונית שפירא", "PERSON", "hebrew_ner")])
+
+    def test_rest_split_in_two_pieces(self):
+        rule = lambda eng: eng.ruleset.rules[0].name
+        fs = self.analyze(lambda eng: [
+            self.res("ברחוב הרצל 12 תל אביב רונית שפירא", "PERSON", ps.HEBREW_RECOGNIZER, 1.0),
+            self.res("הרצל 12", "IL_ADDRESS", rule(eng), 0.9)])
+        got = sorted((f.text, f.source) for f in fs)
+        self.assertEqual(got, [("ברחוב", "hebrew_ner"), ("הרצל 12", "custom"),
+                               ("תל אביב רונית שפירא", "hebrew_ner")])
+
+    def test_other_hebrew_types_keep_coverage_too(self):
+        # the gap merge can give LOCATION "רחוב הרצל 12 תל אביב משפחת אזולאי" (measured)
+        rule = lambda eng: eng.ruleset.rules[0].name
+        fs = self.analyze(lambda eng: [
+            self.res("רחוב הרצל 12 תל אביב רונית שפירא", "LOCATION", ps.HEBREW_RECOGNIZER, 1.0),
+            self.res("רחוב הרצל 12", "IL_ADDRESS", rule(eng), 0.9)])
+        self.assertEqual([f.text for f in fs], ["רחוב הרצל 12", "תל אביב רונית שפירא"])
+
+    def test_other_sources_unchanged(self):
+        # a dropped spaCy or rule finding gives nothing back
+        rule = lambda eng: eng.ruleset.rules[0].name
+        fs = self.analyze(lambda eng: [
+            self.res("רחוב הרצל 12 תל אביב", "LOCATION", "SpacyRecognizer", 0.85),
+            self.res("תל אביב רונית שפירא", "PERSON", rule(eng), 0.9)], hebrew=False)
+        self.assertEqual([f.text for f in fs], ["תל אביב רונית שפירא"])
+
+
 class HebrewSelfTestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -945,6 +1135,13 @@ class RealModelTests(unittest.TestCase):
         self.assertTrue(any("מתתיהו" in t for t, e in found), found)
         self.assertTrue(any("אנאבל" in t for t, e in found), found)
 
+    def test_split_name_is_one_person_span(self):
+        text = "פגשתי את מוחמד אבו-סאלח ואת ז'אן-פייר לוי."
+        found = self.model.predict(text)
+        s = text.index("ז'אן-פייר לוי")
+        self.assertTrue(any(sp.entity == "PERSON" and sp.start <= s and s + 13 <= sp.end
+                            for sp in found), self.spans(text))
+
     def test_window_default_is_not_the_lossy_400(self):
         # a 400-token window missed 4 of 48 persons with the pinned model (see HEBREW_WINDOW_TOKENS)
         self.assertLessEqual(ps.HEBREW_WINDOW_TOKENS, 300)
@@ -994,6 +1191,13 @@ SHUFFLE_SEED = 5
 # part of a review name in the output; with the union merge the name is fully masked.
 # 43: "ז'אן-פייר לוי" lost "פייר" and "לוי"; 90: "אבי לוי" lost "לוי".
 E2E_GUARD_SEEDS = (43, 90)
+# Task 4b leak seeds: each one left part of a fixture person unmasked on e9a72f4 and passes now.
+# 0: "יוסי" (spaCy LOCATION "אברהמי מחברת אורנים" beat PERSON "יוסי אברהמי"; fixed by dropping
+# spaCy findings on Hebrew text). 54, 77: "לוי" of "ז'אן-פייר לוי" (two spans with one space
+# between, the weak half under the threshold; fixed by the gap merge). 59: "אבי" of "אבי לוי"
+# on e9a72f4; with the gap merge alone, PERSON "רחוב הרצל 12 תל אביב נועה גולן ויעל רוזן" lost
+# to the street rule (fixed by resolve_keep_hebrew_coverage).
+E2E_LEAK_SEEDS = (0, 54, 77, 59)
 
 
 def shuffled_long_text(items, seed):
@@ -1082,18 +1286,18 @@ class ShuffledLongTextTests(unittest.TestCase):
                 text = shuffled_long_text(self.items, seed)
                 self.assertEqual(engine_problems(self.engine, text, SHUFFLE_EXTRA_PERSONS), [])
 
-    # KNOWN LEAK, outside Hebrew NER: the English spaCy model tags Hebrew text with long junk
-    # spans (LOCATION "אברהמי מחברת אורנים"). resolve_overlaps keeps the longer span at equal
-    # source priority, so PERSON "יוסי אברהמי" loses and "יוסי" stays in the output. Measured
-    # with the pinned model and en_core_web_lg; see the task-4 report. Every other fixture
-    # person must be fully masked.
-    KNOWN_SPACY_OVERRIDE = {"יוסי אברהמי"}
-
     def test_every_fixture_person_fully_masked_end_to_end(self):
         text = shuffled_long_text(self.items, SHUFFLE_SEED)
-        problems = engine_problems(self.engine, text, shuffle_persons(self.items))
-        self.assertEqual([p for p in problems if p[1] not in self.KNOWN_SPACY_OVERRIDE], [])
+        self.assertEqual(engine_problems(self.engine, text, shuffle_persons(self.items)), [])
 
+    def test_every_fixture_person_fully_masked_on_leak_seeds(self):
+        # No fixture person surface stays in the output, and every part of a name longer than
+        # 1 char (a whole word) sits inside an applied finding. Coverage is checked by offsets:
+        # a substring search on the output gives false failures ("אבי" in "תל אביב").
+        for seed in E2E_LEAK_SEEDS:
+            with self.subTest(seed=seed):
+                text = shuffled_long_text(self.items, seed)
+                self.assertEqual(engine_problems(self.engine, text, shuffle_persons(self.items)), [])
 
 if __name__ == "__main__":
     unittest.main()

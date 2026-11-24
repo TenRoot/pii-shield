@@ -1632,6 +1632,37 @@ def resolve_overlaps(findings: List[Finding]) -> List[Finding]:
     return sorted(keep, key=lambda f: f.start)
 
 
+def resolve_keep_hebrew_coverage(findings: List[Finding], text: str) -> List[Finding]:
+    """resolve_overlaps, then give back the words of a dropped Hebrew NER span that no kept
+    finding covers.
+
+    A Hebrew span can lose to a higher-priority rule finding that covers only a part of it
+    (rule "רחוב הרצל 12" inside PERSON "רחוב הרצל 12 תל אביב רונית שפירא"; the gap merge
+    makes such long spans). Without this step the rest of the span, with the name, stays
+    unmasked. Each uncovered piece (edges trimmed to word characters) becomes a finding with
+    the dropped span's type and score. Findings of other sources are not changed."""
+    kept = resolve_overlaps(findings)
+    taken = [(f.start, f.end) for f in kept]
+    extra: List[Finding] = []
+    for f in findings:
+        if f.source != "hebrew_ner" or (f.start, f.end) in taken:
+            continue
+        cuts = sorted((s, e) for s, e in taken if s < f.end and f.start < e)
+        if not cuts:
+            continue
+        pos = f.start
+        for s, e in cuts + [(f.end, f.end)]:
+            a, b = pos, min(s, f.end)
+            while a < b and not _is_word_char(text[a]):
+                a += 1
+            while b > a and not _is_word_char(text[b - 1]):
+                b -= 1
+            if b > a:
+                extra.append(Finding(a, b, text[a:b], f.entity, f.score, f.source, f.recognizer))
+            pos = max(pos, e)
+    return sorted(kept + extra, key=lambda f: f.start) if extra else kept
+
+
 def find_literal(text: str, value: str, case_insensitive: bool) -> Iterable[Tuple[int, int]]:
     if not value.strip():
         return []
@@ -2170,9 +2201,16 @@ class DetectionEngine:
             entities = sorted(set(ecfg.get("builtin_entities", [])) | set(rs.entities))
             results = analyzer.analyze(text=text, language="en", entities=entities or None,
                                        score_threshold=threshold)
+            # The English spaCy model reads Hebrew as junk and gives long spans ("אברהמי מחברת
+            # אורנים" as LOCATION). Such a span can beat a Hebrew PERSON span in resolve_overlaps
+            # and leave part of the name unmasked. With the Hebrew model on, Hebrew text is its job.
+            drop_spacy_hebrew = self.hebrew_model is not None and bool(ecfg.get("hebrew_ner"))
             for r in results:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
                 if skip_ner and (rname in NER_RECOGNIZERS or rname == HEBREW_RECOGNIZER):
+                    continue
+                if (drop_spacy_hebrew and rname in NER_RECOGNIZERS
+                        and _HEBREW_LETTER_RE.search(text, r.start, r.end)):
                     continue
                 src = ("custom" if rname in custom_names
                        else "hebrew_ner" if rname == HEBREW_RECOGNIZER else "presidio")
@@ -2200,7 +2238,7 @@ class DetectionEngine:
         found = [f for f in found if f.source == "manual" or f.text.strip().casefold() not in allow]
         # PDF page header lines hold no PII; NER tags words such as "OCR" in them.
         headers = page_header_spans(text)
-        found = resolve_overlaps(_outside_spans(found, headers))
+        found = resolve_keep_hebrew_coverage(_outside_spans(found, headers), text)
 
         # propagation: every literal occurrence of a detected value or a value already in the session map
         if bcfg.get("propagate_values", True):
@@ -2224,7 +2262,7 @@ class DetectionEngine:
                 for s, e in find_literal(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], vault.token_entity.get(tok, "CUSTOM"), 0.99,
                                          "session", "session-map"))
-            found = resolve_overlaps(_outside_spans(found + extra, headers))
+            found = resolve_keep_hebrew_coverage(_outside_spans(found + extra, headers), text)
 
         # entity consistency for identical values, then token proposals
         entity_for: Dict[str, str] = {}
@@ -3685,6 +3723,8 @@ def _extend_to_words(text: str, spans: List[HebrewSpan]) -> List[HebrewSpan]:
 # Window size. The plan said 400, but with the real int8 model a 400-token window missed 4 of 48
 # person names that 128, 200, 256 and 300-token windows all found. Smaller windows cost no speed.
 HEBREW_WINDOW_TOKENS = 256
+# One of these characters between two spans joins them into one span (HebrewNerModel._merge_gaps).
+HEBREW_SPAN_GAPS = frozenset(" -\u05be'\u05f3")
 HEBREW_WINDOW_OVERLAP = 50
 
 
@@ -3702,7 +3742,7 @@ class HebrewNerModel:
         spans: List[HebrewSpan] = []
         for g_start, g_end in _hebrew_groups(text):
             spans.extend(self._predict_group(text[g_start:g_end], g_start))
-        return self._dedupe(_extend_to_words(text, spans))
+        return self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans)))
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
         enc = self.tokenizer.encode(group, add_special_tokens=False)
@@ -3792,6 +3832,32 @@ class HebrewNerModel:
             group.append(sp)
             end = max(end, sp.end) if len(group) > 1 else sp.end
         close()
+        return merged
+
+
+    @staticmethod
+    def _merge_gaps(text: str, spans: List[HebrewSpan]) -> List[HebrewSpan]:
+        """Join spans that one gap character (space, '-', maqaf, geresh) separates.
+
+        The model often splits a name into two spans: PERSON "ז'אן-פייר" at 0.52 and PERSON
+        "לוי" at 0.92. The engine threshold applies per span, so it would drop the weak half and
+        leave part of the name unmasked. One span with the best score keeps the name whole.
+        Type: PERSON if any part is PERSON, else the type of the highest-scoring part.
+        Score: the highest part score. Input spans do not overlap (_dedupe runs first)."""
+        merged: List[HebrewSpan] = []
+        parts: List[List[HebrewSpan]] = []
+        for sp in sorted(spans, key=lambda x: (x.start, x.end)):
+            last = merged[-1] if merged else None
+            if last is not None and sp.start - last.end == 1 and text[last.end] in HEBREW_SPAN_GAPS:
+                parts[-1].append(sp)
+                best = max(parts[-1], key=lambda x: x.score)
+                last.end = sp.end
+                last.score = best.score
+                last.entity = ("PERSON" if any(p.entity == "PERSON" for p in parts[-1])
+                               else best.entity)
+            else:
+                merged.append(HebrewSpan(sp.start, sp.end, sp.entity, sp.score))
+                parts.append([sp])
         return merged
 
 
