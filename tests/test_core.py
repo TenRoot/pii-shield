@@ -49,6 +49,94 @@ class EngineTests(unittest.TestCase):
     def by_text(self, findings):
         return {f.text: f for f in findings}
 
+    def test_long_text_in_parts_gives_same_findings(self):
+        """Text over the part size is analyzed in parts; offsets and findings match one pass."""
+        text = "\n".join([SAMPLE] * 6)
+        whole = {(f.start, f.end, f.entity) for f in self.analyze(text)[0]}
+        with mock.patch.object(ps, "ANALYZE_PART_CHARS", 700), mock.patch.object(ps, "ANALYZE_PART_OVERLAP", 120):
+            parts = self.analyze(text)[0]
+        self.assertEqual({(f.start, f.end, f.entity) for f in parts}, whole)
+        for f in parts:
+            self.assertEqual(text[f.start:f.end], f.text)
+
+    def test_text_longer_than_spacy_limit_is_analyzed(self):
+        """spaCy refuses text over nlp.max_length (1,000,000 by default); parts stay under it."""
+        nlp = self.engine.nlp_engine.nlp["en"]
+        text = "\n".join([SAMPLE] * 4)
+        with mock.patch.object(nlp, "max_length", 900), mock.patch.object(ps, "ANALYZE_PART_CHARS", 700):
+            fs, _ = self.analyze(text)
+        d = self.by_text(fs)
+        self.assertIn("John Smith", d)
+        self.assertIn("123456782", d)
+
+    def _fake_analyzer(self, word):
+        import re as _re
+        from presidio_analyzer import RecognizerResult
+
+        class Fake:
+            def analyze(self, text, **kw):
+                return [RecognizerResult("PERSON", m.start(), m.end(), 0.9,
+                                         recognition_metadata={"recognizer_name": "Fake"})
+                        for m in _re.finditer(word, text)]
+        return Fake()
+
+    def test_analyze_in_parts_value_across_whitespace_cut(self):
+        text = ("filler words here " * 30) + "Contoso Person " + ("more filler text " * 30)
+        with mock.patch.object(ps, "ANALYZE_PART_CHARS", 200), mock.patch.object(ps, "ANALYZE_PART_OVERLAP", 60):
+            res = ps.analyze_in_parts(self._fake_analyzer("Contoso Person"), text)
+        at = text.index("Contoso Person")
+        self.assertEqual([(r.start, r.end) for r in res], [(at, at + len("Contoso Person"))])
+
+    def test_analyze_in_parts_value_across_hard_cut(self):
+        text = "x" * 190 + "CONTOSOVALUE" + "y" * 300   # no whitespace: hard cuts
+        with mock.patch.object(ps, "ANALYZE_PART_CHARS", 200), mock.patch.object(ps, "ANALYZE_PART_OVERLAP", 60):
+            res = ps.analyze_in_parts(self._fake_analyzer("CONTOSOVALUE"), text)
+        self.assertEqual([(r.start, r.end) for r in res], [(190, 202)])
+
+    def test_analyze_in_parts_reports_progress(self):
+        text = ("filler words here " * 40) + "Contoso Person " + ("more filler text " * 40)
+        msgs = []
+        with mock.patch.object(ps, "ANALYZE_PART_CHARS", 200), mock.patch.object(ps, "ANALYZE_PART_OVERLAP", 60):
+            n = len(ps.split_for_analysis(text, 200, 60))
+            ps.analyze_in_parts(self._fake_analyzer("Contoso Person"), text, progress=msgs.append)
+        self.assertGreater(n, 2)
+        self.assertEqual([m.split(" · ")[0] for m in msgs], [f"Analyzing part {i} of {n}" for i in range(1, n + 1)])
+        self.assertNotIn(" left", msgs[0], "no time estimate before the first part ends")
+        self.assertIn(" left", msgs[1])
+
+    def test_short_text_sends_no_part_progress(self):
+        msgs = []
+        ps.analyze_in_parts(self._fake_analyzer("Contoso"), "Contoso here", progress=msgs.append)
+        self.assertEqual(msgs, [])
+
+    def test_engine_analyze_reports_stages_for_long_text(self):
+        text = "\n".join([SAMPLE] * 6)
+        msgs = []
+        with mock.patch.object(ps, "ANALYZE_PART_CHARS", 700), mock.patch.object(ps, "ANALYZE_PART_OVERLAP", 120):
+            self.engine.analyze(text, [], ps.SessionVault(), progress=msgs.append)
+        self.assertTrue(any(m.startswith("Analyzing part 1 of ") for m in msgs), msgs)
+        self.assertTrue(any(m.startswith("Finding repeated values") for m in msgs), msgs)
+
+    def test_format_time_left(self):
+        self.assertEqual(ps.format_time_left(20), "less than 1 min")
+        self.assertEqual(ps.format_time_left(90), "about 2 min")
+        self.assertEqual(ps.format_time_left(3000), "about 50 min")
+
+    def test_split_for_analysis_parts(self):
+        text = ("line of text number xx\n" * 100).strip()
+        parts = ps.split_for_analysis(text, 200, 40)
+        self.assertEqual(parts[0][0], 0)
+        self.assertEqual(parts[-1][0] + len(parts[-1][1]), len(text))
+        for start, part in parts:
+            self.assertLessEqual(len(part), 200)
+            self.assertEqual(text[start:start + len(part)], part)
+        for (s1, p1), (s2, _) in zip(parts, parts[1:]):
+            self.assertLess(s2, s1 + len(p1), "parts overlap")
+            self.assertGreater(s2, s1, "parts move forward")
+        self.assertEqual(ps.split_for_analysis("short", 200, 40), [(0, "short")])
+        no_breaks = "x" * 1000
+        self.assertTrue(all(len(p) <= 200 for _, p in ps.split_for_analysis(no_breaks, 200, 40)))
+
     def test_detections(self):
         fs, _ = self.analyze(SAMPLE)
         d = self.by_text(fs)
@@ -664,6 +752,19 @@ class MainWindowGuiTests(unittest.TestCase):
         with mock.patch.object(ps.MainWindow, "_start_engine"):
             self.win = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
         self.addCleanup(self.win.deleteLater)
+
+    def test_analyze_progress_shows_in_label_and_status_bar(self):
+        self.win._on_analyze_progress("Analyzing part 2 of 9 · about 3 min left")
+        self.assertEqual(self.win.lbl_counts.text(), "Analyzing part 2 of 9 · about 3 min left")
+        self.assertEqual(self.win.statusBar().currentMessage(), "Analyzing part 2 of 9 · about 3 min left")
+
+    def test_analyze_passes_progress_slot(self):
+        w = self.win
+        w.input.setPlainText("host SRV-DC01")
+        w.btn_analyze.setEnabled(True)
+        with mock.patch.object(w, "_run") as run:
+            w.analyze()
+        self.assertEqual(run.call_args.kwargs.get("progress"), w._on_analyze_progress)
 
     def test_button_follows_analysis_state(self):
         w = self.win

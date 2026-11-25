@@ -130,6 +130,28 @@ def build(table, with_type_ids=False, **kw):
     return ps.HebrewNerModel(tok, sess, id2label, **kw), sess
 
 
+class HebrewBatchingTests(unittest.TestCase):
+    """Short Hebrew groups between English lines go to the model in batches, not one by one."""
+
+    def test_many_groups_few_calls_same_spans(self):
+        model, sess = build(HE_TABLE)
+        text = "\n".join(f"English line {i}\nדנה כהן נפגשה בחיפה" for i in range(50))
+        got = [(sp.start, sp.end, sp.entity) for sp in model.predict(text)]
+        want = []
+        for m in re.finditer("דנה כהן נפגשה בחיפה", text):
+            want.append((m.start(), m.start() + len("דנה כהן"), "PERSON"))
+            at = m.start() + len("דנה כהן נפגשה ")
+            want.append((at, at + len("בחיפה"), "LOCATION"))
+        self.assertEqual(got, want)
+        self.assertLessEqual(len(sess.calls), 5, "50 groups, few model calls")
+
+    def test_span_never_crosses_groups(self):
+        model, _ = build({"דנה": "B-PER", "כהן": "I-PER"})
+        text = "שלום דנה\nJohn Smith works here\nכהן שלום"
+        got = [(text[sp.start:sp.end], sp.entity) for sp in model.predict(text)]
+        self.assertEqual(got, [("דנה", "PERSON"), ("כהן", "PERSON")])
+
+
 class HebrewNerCoreTests(unittest.TestCase):
     def spans(self, model, text):
         return [(text[s.start:s.end], s.entity) for s in model.predict(text)]

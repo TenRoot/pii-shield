@@ -11,6 +11,43 @@ check) and a Presidio version check on PyPI. All of them run at startup, and you
 start the rules sync manually. PII Shield never sends prompt text. Offline mode turns off all
 network access.
 
+## How detection works
+
+Microsoft Presidio runs all detection. It sends the text to each detector below and collects
+the results. All detectors run locally, in the same analysis.
+
+| Detector | Runs on | Finds | Build |
+|---|---|---|---|
+| **Presidio built-in recognizers** | all text | email, phone, IP address, credit card (with a checksum test), IBAN, URL, US SSN, crypto wallet, MAC address | small and full |
+| **spaCy** (`en_core_web_lg`, through Presidio) | all text | person names, organizations and places in English | small and full |
+| **DictaBERT NER** (Hebrew model, through Presidio) | only lines with Hebrew letters | person names, organizations and places in Hebrew | full only |
+| **PII Shield rules and word lists** | all text | Israeli ID (ת.ז), Hebrew street addresses, host names, user names, keys and secrets, and your own rules | small and full |
+
+To select which Presidio entities to find, open **Settings > Detection**. The review table
+shows the source of each finding: Presidio (built-in recognizers and spaCy), Custom rule,
+Hebrew NER, Manual, Propagated or Session map.
+
+**English text:** the small build and the full build give the same result. Presidio, spaCy and
+the rules find the values.
+
+**Hebrew text, small build:** only the rules, the word lists and the Presidio built-in
+recognizers find values. spaCy does not know Hebrew, so its findings on Hebrew text are often
+wrong.
+
+**Hebrew text, full build:** the Hebrew model finds the names. spaCy still runs on Hebrew
+lines, but its findings there are often wrong and too long. So PII Shield drops each spaCy
+finding on Hebrew words that a Hebrew model finding already covers. PII Shield keeps a spaCy
+finding on a Hebrew word that no Hebrew model finding covers, because the Hebrew model misses
+some surnames.
+
+**Long text:** spaCy cannot read more than 1,000,000 characters at a time. PII Shield analyzes
+a long text, for example a large PDF, in parts of 100,000 characters. The parts overlap by 2,000
+characters, so PII Shield finds a value that crosses a cut.
+
+**After the detectors:** when two findings overlap, PII Shield keeps one of them, normally the
+longer one. Then it finds every other copy of each detected value in the text and masks those
+copies too.
+
 ## Features
 
 - You review every detection in an editable table before PII Shield masks the text.
@@ -144,6 +181,20 @@ The GUI has five tabs:
 1. **Input & Review** — paste or load text, then click **Analyze PII & Sensitive Data**.
    Enable or disable each finding. Add manual rules for values the engine did not find.
 2. **Sanitize** — click **Generate Sanitized Prompt**, then copy the clean text into your LLM.
+   A text that is too long for the LLM can go in parts:
+   - Set **Split into parts of** (default 50,000 characters) and click **Split**. A cut falls
+     after a blank line, else after a line break, else after a space. A token such as
+     `<PERSON_1>` is never cut.
+   - **Part headers** starts each part with a line such as `--- Part 2 of 7 ---`.
+   - **Copy Part** copies the selected part and then selects the next part.
+   - **Export Full Text…** writes the sanitized text to one `.txt` file. **Export Parts…** writes
+     `sanitized_part_1_of_7.txt` and the other parts to a folder that you select. The file names
+     contain only numbers. The app asks before it overwrites a file.
+
+   Exports contain only the sanitized text. All parts belong to the same session, so the same
+   value has the same token in every part, and **Restore** works on replies to any part.
+   Use `.txt`, not PDF: a PDF can keep PII in its file properties, and its text extraction can
+   break tokens.
 3. **Restore** — paste the LLM reply and click **Restore Original Values**.
 4. **Session Map** — see the token-to-value map. Export it or import it to continue a
    session later.

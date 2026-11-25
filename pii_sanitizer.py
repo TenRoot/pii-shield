@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import unicodedata
 import uuid
@@ -232,6 +233,8 @@ DEFAULT_CONFIG: Dict = {
         "clipboard_clear_seconds": 0,    # 0 = never auto-clear
         "offline_mode": False,           # True = no network at all: no GitHub sync, no update checks
         "git_scan_last_repo": "",        # last folder used in Scan Git Repo
+        "split_chars": 50000,            # part size for Split in the Sanitize tab
+        "split_headers": True,           # each part starts with "--- Part i of n ---"
     },
     "pdf": {
         "ocr_enabled": True,             # read scanned pages with Tesseract
@@ -591,7 +594,7 @@ def parse_rule_document(doc, path: Path, root: Path) -> Tuple[List[RuleDef], set
             problems.append(f"{where}: recognizer must be a mapping")
             continue
         name = str(r.get("name", "")).strip()
-        src = str(path.relative_to(root)) if root in path.parents else path.name
+        src = path.relative_to(root).as_posix() if root in path.parents else path.name
         name_ok = bool(name) and bool(RULE_NAME_RE.match(name))
         if is_marker_mapping(r):
             if not name_ok:
@@ -703,7 +706,7 @@ def _load_rule_files(root: Path, files: List[Path], rs: RuleSet,
         except Exception as exc:
             rs.errors.append(f"{label}{f.name}: cannot parse ({exc.__class__.__name__}: {exc})")
             continue
-        rs.files.append(label + str(f.relative_to(root)))
+        rs.files.append(label + f.relative_to(root).as_posix())
         rs.warnings.extend(label + w for w in warns)
         rs.allow_list |= allow
         for r in rules:
@@ -1664,19 +1667,52 @@ def _overlap_rank(f: Finding) -> Tuple:
             f.recognizer in NER_RECOGNIZERS, f.start)
 
 
+class _Coverage:
+    """The union of character spans, as sorted disjoint (start, end) ranges. Overlap tests and
+    the covered parts of a range take a binary search, not a scan of every span: a long text
+    (a large PDF) has tens of thousands of findings."""
+
+    def __init__(self, spans: Iterable[Tuple[int, int]] = ()):
+        self.starts: List[int] = []
+        self.ends: List[int] = []
+        for s, e in sorted(spans):
+            self.add(s, e)
+
+    def add(self, s: int, e: int) -> None:
+        if e <= s:
+            return
+        i = bisect.bisect_left(self.ends, s)      # first range that ends at or after s
+        j = bisect.bisect_right(self.starts, e)   # ranges that start at or before e
+        if i < j:
+            s, e = min(s, self.starts[i]), max(e, self.ends[j - 1])
+        self.starts[i:j] = [s]
+        self.ends[i:j] = [e]
+
+    def overlaps(self, s: int, e: int) -> bool:
+        i = bisect.bisect_right(self.ends, s)     # first range that ends after s
+        return i < len(self.starts) and self.starts[i] < e
+
+    def within(self, s: int, e: int) -> List[Tuple[int, int]]:
+        """The covered parts of [s, e), clipped to it."""
+        out = []
+        i = bisect.bisect_right(self.ends, s)
+        while i < len(self.starts) and self.starts[i] < e:
+            out.append((max(self.starts[i], s), min(self.ends[i], e)))
+            i += 1
+        return out
+
+
 def resolve_overlaps(findings: List[Finding]) -> List[Finding]:
     """Greedy non-overlapping selection: manual > custom/session > presidio > propagated,
     then the longer span (fs01.corp.local beats corp.local), then the higher score, then a
     pattern match over an NER guess (spaCy sometimes tags a URL as PERSON)."""
     ranked = sorted(findings, key=_overlap_rank)
-    taken: List[Tuple[int, int]] = []
+    taken = _Coverage()
     keep: List[Finding] = []
     for f in ranked:
-        if f.length <= 0:
+        if f.length <= 0 or taken.overlaps(f.start, f.end):
             continue
-        if any(f.start < e and s < f.end for s, e in taken):
-            continue
-        taken.append((f.start, f.end))
+        taken.add(f.start, f.end)
         keep.append(f)
     return sorted(keep, key=lambda f: f.start)
 
@@ -1702,28 +1738,32 @@ def resolve_keep_hebrew_coverage(findings: List[Finding], text: str,
     counts as covered for the next one. Thus the pieces never overlap each other: sanitize runs
     resolve_overlaps again and would drop one of two overlapping pieces."""
     kept = resolve_overlaps(findings)
-    taken = [(f.start, f.end) for f in kept]
+    taken = _Coverage((f.start, f.end) for f in kept)
+    taken_keys = {(f.start, f.end) for f in kept}
     extra: List[Finding] = []
     for f in sorted(findings, key=_overlap_rank):
-        if (f.start, f.end) in taken or not (
+        if (f.start, f.end) in taken_keys or not (
                 f.source == "hebrew_ner"
                 or (hebrew_copies and f.source == "propagated"
                     and _HEBREW_LETTER_RE.search(f.text))):
             continue
-        if not any(s < f.end and f.start < e for s, e in taken):
+        if not taken.overlaps(f.start, f.end):
             continue
         for a, b in _uncovered_pieces(text, f.start, f.end, taken):
             extra.append(Finding(a, b, text[a:b], f.entity, f.score, f.source, f.recognizer))
-            taken.append((a, b))
+            taken.add(a, b)
+            taken_keys.add((a, b))
     return sorted(kept + extra, key=lambda f: f.start) if extra else kept
 
 
-def _uncovered_pieces(text: str, start: int, end: int,
-                      covered: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def _uncovered_pieces(text: str, start: int, end: int, covered) -> List[Tuple[int, int]]:
     """The parts of text[start:end] that no span in `covered` overlaps, each trimmed to word
     characters at both ends. Coverage is per character: when a covered span stops inside a
     word ("אבו" in "אבו-סאלח"), the rest of the word stays in a piece."""
-    cuts = sorted((max(s, start), min(e, end)) for s, e in covered if s < end and start < e)
+    if isinstance(covered, _Coverage):
+        cuts = covered.within(start, end)
+    else:
+        cuts = sorted((max(s, start), min(e, end)) for s, e in covered if s < end and start < e)
     pieces: List[Tuple[int, int]] = []
     pos = start
     for s, e in cuts + [(end, end)]:
@@ -1738,8 +1778,7 @@ def _uncovered_pieces(text: str, start: int, end: int,
     return pieces
 
 
-def _uncovered_hebrew_pieces(text: str, start: int, end: int,
-                             covered: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+def _uncovered_hebrew_pieces(text: str, start: int, end: int, covered) -> List[Tuple[int, int]]:
     """Pieces of a spaCy span on Hebrew text that no Hebrew NER span covers (_uncovered_pieces).
     Every piece is returned, also a piece without Hebrew letters: "John Smith" in the mixed
     span "John Smith מחיפה" is a name too."""
@@ -2023,6 +2062,38 @@ def installed_spacy_models() -> List[str]:
 
 
 if PRESIDIO_OK:
+    from presidio_analyzer.context_aware_enhancers import LemmaContextAwareEnhancer
+
+    class FastContextEnhancer(LemmaContextAwareEnhancer):
+        """Presidio's context enhancer, with a binary search for the token of a finding.
+
+        Presidio scans all tokens of the text for each finding, so the time grows with
+        (findings x tokens): many minutes on a large PDF. The tokens are sorted and do not
+        overlap, so their end offsets are sorted too, and the first token that ends after the
+        finding's start is the same token that Presidio's scan finds."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._ends_for = None   # (tokens_indices list, end offsets) of the last text
+            self._lock = threading.Lock()
+
+        def _find_index_of_match_token(self, word, start, tokens, tokens_indices):
+            with self._lock:
+                cached = self._ends_for
+                if cached is None or cached[0] is not tokens_indices or len(cached[1]) != len(tokens_indices):
+                    ends = [i + len(t) for i, t in zip(tokens_indices, tokens)]
+                    if any(b < a for a, b in zip(ends, ends[1:])):   # not sorted: use Presidio's scan
+                        return LemmaContextAwareEnhancer._find_index_of_match_token(
+                            word, start, tokens, tokens_indices)
+                    cached = self._ends_for = (tokens_indices, ends)
+            i = bisect.bisect_right(cached[1], start)
+            if i > 0 and tokens_indices[i - 1] == start:   # an empty token at start
+                i -= 1
+            if i >= len(tokens_indices):
+                raise ValueError("Did not find word '" + word + "' in the list of tokens although it "
+                                 "is expected to be found")
+            return i
+
     class ValidatedPatternRecognizer(PatternRecognizer):
         """PatternRecognizer with an optional checksum/semantic validator from VALIDATORS."""
 
@@ -2125,6 +2196,126 @@ def _outside_spans(findings: List[Finding], spans: List[Tuple[int, int]]) -> Lis
         return findings
     return [f for f in findings
             if f.source == "manual" or not any(s <= f.start and f.end <= e for s, e in spans)]
+
+
+# spaCy refuses a text longer than nlp.max_length (1,000,000 characters) and needs about 1 GB of
+# memory for each 100,000 characters. A long input (a large PDF) is analyzed in parts. The parts
+# overlap, so a value that crosses a cut is found whole in the next part.
+ANALYZE_PART_CHARS = 100_000
+ANALYZE_PART_OVERLAP = 2_000
+_WHITESPACE_RE = re.compile(r"\s")
+
+
+def split_for_analysis(text: str, size: int, overlap: int) -> List[Tuple[int, str]]:
+    """Cut text into (start, part) pieces of at most size characters. A cut falls after a line
+    break, else after a space, in the second half of the part. Each part starts at a whitespace
+    character inside the last overlap characters of the part before it."""
+    if len(text) <= size:
+        return [(0, text)]
+    parts: List[Tuple[int, str]] = []
+    start = 0
+    while True:
+        end = min(start + size, len(text))
+        if end < len(text):
+            low = start + size // 2
+            cut = text.rfind("\n", low, end)
+            if cut == -1:
+                cut = max(text.rfind(" ", low, end), text.rfind("\t", low, end))
+            if cut != -1:
+                end = cut + 1
+        parts.append((start, text[start:end]))
+        if end >= len(text):
+            return parts
+        nxt = max(end - overlap, start + 1)
+        m = _WHITESPACE_RE.search(text, nxt, end - 1)
+        start = m.end() if m else nxt
+
+
+# A token in the sanitized output, for example <PERSON_1>. A cut must never fall inside one.
+_TOKEN_LIKE_RE = re.compile(r"<[^<>\s]{1,64}>")
+
+
+def split_output(text: str, max_chars: int) -> List[str]:
+    """Cut the sanitized output into parts of at most max_chars characters, to paste into an LLM
+    one by one. A cut falls after a blank line, else after a line break, else after a space, in the
+    second half of the part. A hard cut (no whitespace) never falls inside a token. The parts
+    joined give the text back unchanged."""
+    if len(text) <= max_chars:
+        return [text]
+    parts: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            low = start + max_chars // 2
+            for sep in ("\n\n", "\n", " "):
+                cut = text.rfind(sep, low, end)
+                if cut != -1:
+                    end = cut + len(sep)
+                    break
+            else:
+                for m in _TOKEN_LIKE_RE.finditer(text, max(start, end - 64), min(len(text), end + 64)):
+                    if m.start() < end < m.end():
+                        end = m.start() if m.start() > start else m.end()
+                        break
+        parts.append(text[start:end])
+        start = end
+    return parts
+
+
+PART_HEADER = "--- Part {i} of {n} ---\n"
+
+
+def with_part_headers(parts: List[str]) -> List[str]:
+    """Add a "--- Part i of n ---" line at the start of each part (not for a single part)."""
+    if len(parts) < 2:
+        return list(parts)
+    return [PART_HEADER.format(i=i, n=len(parts)) + p for i, p in enumerate(parts, 1)]
+
+
+def part_file_names(n: int) -> List[str]:
+    """File names for exported parts. They hold only numbers, never text from the document."""
+    width = len(str(n))
+    return [f"sanitized_part_{i:0{width}d}_of_{n}.txt" for i in range(1, n + 1)]
+
+
+def format_time_left(seconds: float) -> str:
+    """Short, rounded time-left text for the status bar."""
+    if seconds < 60:
+        return "less than 1 min"
+    return f"about {round(seconds / 60)} min"
+
+
+def analyze_in_parts(analyzer, text: str, progress: Optional[Callable[[str], None]] = None,
+                     **kwargs) -> list:
+    """analyzer.analyze over the parts of a long text, with offsets moved back into text. A part
+    normally ends and starts at whitespace. At a hard cut (no whitespace found), a result that
+    touches the cut can be cut short, so it is dropped: the overlap finds it whole. The same
+    result from two parts is kept once, with the higher score."""
+    parts = split_for_analysis(text, ANALYZE_PART_CHARS, ANALYZE_PART_OVERLAP)
+    if len(parts) == 1:
+        return analyzer.analyze(text=text, **kwargs)
+    best: Dict[Tuple[int, int, str, str], object] = {}
+    began = time.monotonic()
+    for i, (start, part) in enumerate(parts):
+        if progress is not None:
+            msg = f"Analyzing part {i + 1} of {len(parts)}"
+            if i:
+                left = (time.monotonic() - began) / i * (len(parts) - i)
+                msg += f" · {format_time_left(left)} left"
+            progress(msg)
+        last = i == len(parts) - 1
+        cut_before = i > 0 and not text[start - 1].isspace()     # a hard cut: no whitespace found
+        cut_after = not last and not text[start + len(part) - 1].isspace()
+        for r in analyzer.analyze(text=part, **kwargs):
+            if (cut_after and r.end >= len(part)) or (cut_before and r.start <= 0):
+                continue
+            r.start += start
+            r.end += start
+            key = (r.start, r.end, r.entity_type, (r.recognition_metadata or {}).get("recognizer_name", ""))
+            if key not in best or r.score > best[key].score:
+                best[key] = r
+    return sorted(best.values(), key=lambda r: (r.start, r.end))
 
 
 class DetectionEngine:
@@ -2270,7 +2461,8 @@ class DetectionEngine:
         if PRESIDIO_OK and self.nlp_engine is not None:
             registry = self._build_registry(rs)
             analyzer = AnalyzerEngine(registry=registry, nlp_engine=self.nlp_engine,
-                                      supported_languages=["en"])
+                                      supported_languages=["en"],
+                                      context_aware_enhancer=FastContextEnhancer())
             builtin = sorted(set(analyzer.get_supported_entities("en")) - set(rs.entities))
             with self.lock:
                 self.analyzer, self.ruleset, self.builtin_supported = analyzer, rs, builtin
@@ -2302,7 +2494,10 @@ class DetectionEngine:
         return out
 
     def analyze(self, text: str, manual_rules: Sequence[ManualRule], vault: SessionVault,
-                threshold: Optional[float] = None, skip_ner: bool = False) -> List[Finding]:
+                threshold: Optional[float] = None, skip_ner: bool = False,
+                progress: Optional[Callable[[str], None]] = None) -> List[Finding]:
+        """progress, when given, gets short status texts during a long analysis (a long text is
+        analyzed in parts, and the copies of each value are then found in the whole text)."""
         with self.lock:
             analyzer, rs = self.analyzer, self.ruleset
         ecfg, bcfg = self.config["engine"], self.config["behavior"]
@@ -2321,8 +2516,8 @@ class DetectionEngine:
             # The Hebrew gap merge must know the threshold of this call (HEBREW_MERGE_CUTOFF).
             cutoff = HEBREW_MERGE_CUTOFF.set(threshold)
             try:
-                results = analyzer.analyze(text=text, language="en", entities=entities or None,
-                                           score_threshold=threshold)
+                results = analyze_in_parts(analyzer, text, progress=progress, language="en",
+                                           entities=entities or None, score_threshold=threshold)
             finally:
                 HEBREW_MERGE_CUTOFF.reset(cutoff)
             # The English spaCy model reads Hebrew as junk and gives long spans ("אברהמי מחברת
@@ -2330,8 +2525,8 @@ class DetectionEngine:
             # and leave part of the name unmasked. With the Hebrew model on, a spaCy finding with
             # Hebrew letters keeps only the Hebrew words that no Hebrew NER finding overlaps: the
             # Hebrew model misses some surnames in long text ("משפחת אזולאי").
-            hebrew_spans = [(r.start, r.end) for r in results
-                            if (r.recognition_metadata or {}).get("recognizer_name") == HEBREW_RECOGNIZER]
+            hebrew_spans = _Coverage((r.start, r.end) for r in results
+                                     if (r.recognition_metadata or {}).get("recognizer_name") == HEBREW_RECOGNIZER)
             for r in results:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
                 if skip_ner and (rname in NER_RECOGNIZERS or rname == HEBREW_RECOGNIZER):
@@ -2399,7 +2594,12 @@ class DetectionEngine:
             # Hebrew prefix letters (find_propagated) only with the Hebrew model on: the small
             # build and the setting off keep the plain literal match.
             find = find_propagated if hebrew_on else find_literal
-            for k, (v, ent, score) in values.items():
+            # On a long text this loop scans the whole text once for each value, so it reports.
+            report = progress if progress is not None and len(text) > ANALYZE_PART_CHARS else None
+            step = max(1, len(values) // 20)
+            for n, (k, (v, ent, score)) in enumerate(values.items()):
+                if report is not None and n % step == 0:
+                    report(f"Finding repeated values: {n} of {len(values)}")
                 for s, e in find(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], ent, score, "propagated", "value-propagation"))
             for tok, v in vault.active_tokens.items():
@@ -3836,6 +4036,26 @@ class HebrewSpan:
     parts: List[Tuple[int, int]] = field(default_factory=list, compare=False)
 
 
+# Hebrew groups are joined into batches of about this many characters for one model call.
+HEBREW_BATCH_CHARS = 4000
+
+
+def _batch_groups(groups: List[Tuple[int, int]], max_chars: int) -> List[List[Tuple[int, int]]]:
+    """Collect consecutive groups into batches of at most max_chars characters (a longer group
+    is a batch alone; the model windows split it)."""
+    batches: List[List[Tuple[int, int]]] = []
+    size = 0
+    for g in groups:
+        length = g[1] - g[0]
+        if batches and size + length + 1 <= max_chars:
+            batches[-1].append(g)
+            size += length + 1
+        else:
+            batches.append([g])
+            size = length
+    return batches
+
+
 def _hebrew_groups(text: str) -> List[Tuple[int, int]]:
     """(start, end) of runs of consecutive lines that contain a Hebrew letter."""
     groups: List[Tuple[int, int]] = []
@@ -3913,10 +4133,37 @@ class HebrewNerModel:
         unwanted best part cannot drop the wanted part with it."""
         wanted = None if wanted is None else set(wanted)
         spans: List[HebrewSpan] = []
-        for g_start, g_end in _hebrew_groups(text):
-            spans.extend(self._predict_group(text[g_start:g_end], g_start))
+        for batch in _batch_groups(_hebrew_groups(text), HEBREW_BATCH_CHARS):
+            spans.extend(self._predict_batch(text, batch))
         out = self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans), wanted), wanted)
         return out if wanted is None else [sp for sp in out if sp.entity in wanted]
+
+    def _predict_batch(self, text: str, groups: List[Tuple[int, int]]) -> List[HebrewSpan]:
+        """Run several Hebrew groups as one text, joined by line breaks, and map each span back
+        to its group. One model call per short group is slow: mixed Hebrew and English text has
+        one group per Hebrew line. A span that reaches over a joint is cut at the joint, so a
+        span never covers text between two groups."""
+        if len(groups) == 1:
+            g_start, g_end = groups[0]
+            return self._predict_group(text[g_start:g_end], g_start)
+        joined, starts = [], []
+        pos = 0
+        for g_start, g_end in groups:
+            starts.append(pos)
+            joined.append(text[g_start:g_end])
+            pos += g_end - g_start + 1          # + 1 for the joining line break
+        out: List[HebrewSpan] = []
+        for sp in self._predict_group("\n".join(joined), 0):
+            k = bisect.bisect_right(starts, sp.start) - 1
+            while k < len(groups) and starts[k] < sp.end:
+                g_start, g_end = groups[k]
+                a = max(sp.start, starts[k])
+                b = min(sp.end, starts[k] + (g_end - g_start))
+                if b > a:
+                    out.append(HebrewSpan(g_start + a - starts[k], g_start + b - starts[k],
+                                          sp.entity, sp.score))
+                k += 1
+        return out
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
         enc = self.tokenizer.encode(group, add_special_tokens=False)
@@ -5359,8 +5606,118 @@ if QT_OK:
             l.addLayout(row)
             l.addWidget(self.lbl_leak)
             l.addWidget(self.output, 1)
+            l.addLayout(self._build_split_row())
+            self._parts: List[str] = []
+            self.output.textChanged.connect(self._on_output_changed)
+            self._on_output_changed()
             lay.addWidget(g)
             return page
+
+        def _build_split_row(self):
+            """Split the sanitized output into parts, copy them one by one, export to .txt."""
+            b = self.config["behavior"]
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel("Split into parts of"))
+            self.spin_split = QtWidgets.QSpinBox()
+            self.spin_split.setRange(1000, 1_000_000)
+            self.spin_split.setSingleStep(5000)
+            self.spin_split.setGroupSeparatorShown(True)
+            self.spin_split.setValue(int(b.get("split_chars", 50000)))
+            row.addWidget(self.spin_split)
+            row.addWidget(QtWidgets.QLabel("characters"))
+            self.chk_split_headers = QtWidgets.QCheckBox("Part headers")
+            self.chk_split_headers.setChecked(bool(b.get("split_headers", True)))
+            self.chk_split_headers.setToolTip('Start each part with a line such as "--- Part 2 of 7 ---"')
+            row.addWidget(self.chk_split_headers)
+            self.btn_split = _button("Split")
+            self.btn_split.clicked.connect(self.split_now)
+            row.addWidget(self.btn_split)
+            row.addWidget(QtWidgets.QLabel("Part:"))
+            self.cmb_parts = QtWidgets.QComboBox()
+            self.cmb_parts.setMinimumContentsLength(8)
+            row.addWidget(self.cmb_parts)
+            self.btn_copy_part = _button("Copy Part")
+            self.btn_copy_part.setToolTip("Copy the selected part, then select the next part")
+            self.btn_copy_part.clicked.connect(self.copy_part)
+            row.addWidget(self.btn_copy_part)
+            row.addStretch(1)
+            self.btn_export_full = _button("Export Full Text…")
+            self.btn_export_full.clicked.connect(self.export_full)
+            self.btn_export_parts = _button("Export Parts…")
+            self.btn_export_parts.clicked.connect(self.export_parts)
+            row.addWidget(self.btn_export_full)
+            row.addWidget(self.btn_export_parts)
+            return row
+
+        def _on_output_changed(self):
+            """A new sanitized output makes old parts wrong, so they are cleared."""
+            self._parts = []
+            self.cmb_parts.clear()
+            has_text = bool(self.output.toPlainText())
+            self.btn_split.setEnabled(has_text)
+            self.btn_export_full.setEnabled(has_text)
+            self.btn_copy_part.setEnabled(False)
+            self.btn_export_parts.setEnabled(False)
+
+        def split_now(self):
+            text = self.output.toPlainText()
+            if not text:
+                return
+            size, headers = self.spin_split.value(), self.chk_split_headers.isChecked()
+            self.config["behavior"]["split_chars"] = size
+            self.config["behavior"]["split_headers"] = headers
+            self.config.save()
+            # leave room for the header line, so a part with its header stays near the size
+            parts = split_output(text, max(500, size - 32) if headers else size)
+            self._parts = with_part_headers(parts) if headers else parts
+            self.cmb_parts.clear()
+            self.cmb_parts.addItems([f"{i} of {len(self._parts)}" for i in range(1, len(self._parts) + 1)])
+            self.btn_copy_part.setEnabled(True)
+            self.btn_export_parts.setEnabled(True)
+            self.statusBar().showMessage(f"Split into {len(self._parts)} part(s)", 5000)
+
+        def copy_part(self):
+            i = self.cmb_parts.currentIndex()
+            if not 0 <= i < len(self._parts):
+                return
+            self.copy_text(self._parts[i])
+            if i + 1 < len(self._parts):
+                self.cmb_parts.setCurrentIndex(i + 1)
+
+        def export_full(self):
+            text = self.output.toPlainText()
+            if not text:
+                return
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Export Full Text", "sanitized.txt",
+                                                            "Text (*.txt);;All (*)")
+            if not path:
+                return
+            try:
+                Path(path).write_text(text, "utf-8")
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(self, "Export Full Text", str(exc))
+                return
+            self.statusBar().showMessage(f"Exported the sanitized text to {Path(path).name}", 6000)
+
+        def export_parts(self):
+            if not self._parts:
+                return
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Export Parts: select a folder")
+            if not folder:
+                return
+            targets = [Path(folder) / n for n in part_file_names(len(self._parts))]
+            existing = [t for t in targets if t.exists()]
+            if existing and QtWidgets.QMessageBox.question(
+                    self, "Export Parts", f"{len(existing)} part file(s) already exist in this folder. "
+                    "Overwrite them?") != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            try:
+                for target, part in zip(targets, self._parts):
+                    target.write_text(part, "utf-8")
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(self, "Export Parts", str(exc))
+                return
+            self.statusBar().showMessage(f"Exported {len(targets)} part(s) to {folder}", 6000)
 
         def _build_restore_tab(self):
             page = QtWidgets.QWidget()
@@ -5444,10 +5801,15 @@ if QT_OK:
 
         # ================= engine / rules
         def _run(self, fn, done, *args, error=None, progress=False):
-            t = Task(fn, *args, wants_progress=progress)
+            """progress: False (none), True (engine label and log) or a bound method that gets
+            each progress text. A bound method, not a lambda: Qt then drops a queued call when
+            the window is deleted."""
+            t = Task(fn, *args, wants_progress=bool(progress))
             t.signals.done.connect(done)
             t.signals.error.connect(error or self._task_error)
-            if progress:
+            if callable(progress):
+                t.signals.progress.connect(progress)
+            elif progress:
                 t.signals.progress.connect(lambda m: (self.lbl_engine.setText(m), log.info(m)))
             self._tasks = [x for x in self._tasks if x is not None][-10:] + [t]
             QtCore.QThreadPool.globalInstance().start(t)
@@ -5720,6 +6082,7 @@ if QT_OK:
             def done(findings):
                 self.setCursor(Qt.CursorShape.ArrowCursor)
                 self.btn_analyze.setEnabled(True)
+                self.statusBar().clearMessage()
                 self.findings = findings
                 self.analyzed_text = text
                 set_note(self.lbl_stale, "", "stale")
@@ -5730,7 +6093,14 @@ if QT_OK:
                          len({self.vault.key(f.text) for f in findings}))
                 if self.engine.last_ner_skipped:
                     self.statusBar().showMessage("Input looks like log lines - spaCy NER findings skipped", 8000)
-            self._run(self.engine.analyze, done, text, list(self.manual_rules), self.vault, thr)
+            self._run(self.engine.analyze, done, text, list(self.manual_rules), self.vault, thr,
+                      progress=self._on_analyze_progress)
+
+        def _on_analyze_progress(self, msg: str):
+            """Progress of a long analysis: in the count label (where "Analyzing..." shows) and
+            in the status bar."""
+            self.lbl_counts.setText(msg)
+            self.statusBar().showMessage(msg)
 
         def populate_table(self):
             self._updating = True
