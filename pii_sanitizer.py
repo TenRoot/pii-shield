@@ -112,21 +112,66 @@ def bundled_model_dir() -> Path:
     return bundle_dir() / "models" / HEBREW_MODEL_DIRNAME
 
 
+def _model_dir_error(d: Path) -> Optional[str]:
+    """The OSError text when the model folder cannot be read (no permission), else None."""
+    try:
+        for name in HEBREW_MODEL_FILES:
+            (d / name).is_file()
+    except OSError as exc:
+        return f"{d}: {exc}"
+    return None
+
+
 def _model_dir_valid(d: Path) -> bool:
-    return all((d / name).is_file() for name in HEBREW_MODEL_FILES)
+    """True when d holds all model files. A folder that cannot be read is not valid."""
+    try:
+        return all((d / name).is_file() for name in HEBREW_MODEL_FILES)
+    except OSError:
+        return False
+
+
+def _hebrew_model_dirs() -> Tuple[Path, Path]:
+    return bundled_model_dir(), APP_DIR / "models" / HEBREW_MODEL_DIRNAME
 
 
 def find_hebrew_model() -> Optional[Path]:
     """First valid Hebrew model folder: the bundled one, then APP_DIR/models/."""
-    for d in (bundled_model_dir(), APP_DIR / "models" / HEBREW_MODEL_DIRNAME):
+    for d in _hebrew_model_dirs():
         if _model_dir_valid(d):
             return d
     return None
 
 
+def hebrew_model_read_error() -> Optional[str]:
+    """The error of the first model folder that cannot be read, else None."""
+    for d in _hebrew_model_dirs():
+        err = _model_dir_error(d)
+        if err:
+            return err
+    return None
+
+
+def hebrew_runtime_ok() -> bool:
+    """True when the onnxruntime and tokenizers packages are present."""
+    return ort is not None and HfTokenizer is not None
+
+
 def is_full_build() -> bool:
     """True only when the model ships inside the build. Loads nothing."""
     return _model_dir_valid(bundled_model_dir())
+
+
+def hebrew_status_suffix(status: str, model_present: bool) -> str:
+    """Text for the end of the engine status label. A Hebrew model that is installed (or a
+    folder that cannot be read) but did not load must show, else the user trusts a detection
+    that does not run."""
+    if status == "loaded":
+        return "  \u00b7  Hebrew NER"
+    if status == "off":
+        return ""
+    if model_present or status.startswith("failed"):
+        return "  \u00b7  Hebrew NER: failed (see Log)"
+    return ""
 RULES_DIR = APP_DIR / "rules"
 LOCAL_RULES_DIR = RULES_DIR / "local"
 REMOTE_RULES_DIR = RULES_DIR / "remote"
@@ -2158,7 +2203,15 @@ class DetectionEngine:
         if not ecfg.get("hebrew_ner"):
             self.hebrew_status = "off"
             return
-        folder = find_hebrew_model()
+        try:
+            folder = find_hebrew_model()
+            err = hebrew_model_read_error() if folder is None else None
+        except Exception as exc:  # discovery must never stop the engine
+            folder, err = None, str(exc)
+        if err:
+            log.warning("Hebrew NER model folder cannot be read: %s", err)
+            self.hebrew_status = f"failed: {err}"
+            return
         if folder is None:
             self.hebrew_status = "not installed"
             return
@@ -4657,10 +4710,15 @@ if QT_OK:
             self.skip_ner_logs = QtWidgets.QCheckBox("Turn off spaCy NER (names, organizations, places) "
                                                      "when the input looks like log lines")
             self.skip_ner_logs.setChecked(bool(e.get("skip_ner_on_logs")))
-            self.has_hebrew_model = find_hebrew_model() is not None
+            # The model folder without onnxruntime or tokenizers cannot load: not installed.
+            model_found = find_hebrew_model() is not None
+            self.has_hebrew_model = model_found and hebrew_runtime_ok()
             label = "Hebrew name detection (DictaBERT NER)"
-            self.chk_hebrew = QtWidgets.QCheckBox(
-                label if self.has_hebrew_model else f"{label} \u2014 Hebrew model not installed")
+            if model_found and not self.has_hebrew_model:
+                label += " \u2014 Hebrew model not installed (onnxruntime or tokenizers is missing)"
+            elif not model_found:
+                label += " \u2014 Hebrew model not installed"
+            self.chk_hebrew = QtWidgets.QCheckBox(label)
             self.chk_hebrew.setToolTip("Model: DictaBERT NER by Dicta, CC BY 4.0.")
             self.chk_hebrew.setChecked(bool(e.get("hebrew_ner")))
             self.chk_hebrew.setEnabled(self.has_hebrew_model)
@@ -5370,7 +5428,9 @@ if QT_OK:
                 desc = {"presidio+spacy": f"Presidio + spaCy {self.engine.model_name}",
                         "presidio-regex-only": "Presidio (regex only - no spaCy model installed)",
                         "lite": "Lite regex engine (Presidio not installed)"}.get(mode, mode)
-                self.lbl_engine.setText(f"Engine: {desc}  ·  offline")
+                present = find_hebrew_model() is not None or is_full_build()
+                self.lbl_engine.setText(f"Engine: {desc}  ·  offline"
+                                        + hebrew_status_suffix(self.engine.hebrew_status, present))
                 self.btn_analyze.setEnabled(True)
                 self.btn_git_scan.setEnabled(True)
                 self._update_rules_badge(self.engine.ruleset)

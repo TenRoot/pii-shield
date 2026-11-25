@@ -1284,7 +1284,9 @@ class HebrewSettingsTests(unittest.TestCase):
         self.cfg = ps.AppConfig(self.tmp / "config.json")
 
     def dialog(self, model):
-        with mock.patch.object(ps, "find_hebrew_model", return_value=model):
+        # the small CI build has no runtime; these tests are about the model folder only
+        with mock.patch.object(ps, "find_hebrew_model", return_value=model), \
+             mock.patch.object(ps, "hebrew_runtime_ok", return_value=True):
             dlg = ps.SettingsDialog(None, self.cfg, mock.Mock(builtin_supported=[]))
         self.addCleanup(dlg.deleteLater)
         return dlg
@@ -1805,3 +1807,129 @@ class WantedTypesUnionTests(unittest.TestCase):
             res = rec.analyze(self.T, ["LOCATION", "ORGANIZATION"])
         self.assertEqual([(self.T[r.start:r.end], r.entity_type) for r in res],
                          [("ז'אן-פייר לוי", "LOCATION")])
+
+
+# ---- unreadable model folder (final review I-1) ----
+class UnreadableModelFolderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.bundle = self.tmp / "bundle"
+        self.model = make_model(self.bundle)
+        real = Path.is_file
+        model = self.model
+
+        def is_file(p):
+            if model in Path(p).parents or Path(p) == model:
+                raise PermissionError(13, "Permission denied", str(p))
+            return real(p)
+        self.patches = [mock.patch.object(ps, "bundle_dir", return_value=self.bundle),
+                        mock.patch.object(ps, "APP_DIR", self.tmp / "app"),
+                        mock.patch.object(Path, "is_file", is_file)]
+
+    def run_patched(self, fn):
+        for p in self.patches:
+            p.start()
+        try:
+            return fn()
+        finally:
+            for p in reversed(self.patches):
+                p.stop()
+
+    def test_discovery_returns_none(self):
+        self.assertIsNone(self.run_patched(ps.find_hebrew_model))
+        self.assertFalse(self.run_patched(ps.is_full_build))
+
+    def test_initialize_succeeds_and_reports_failure(self):
+        rules = self.tmp / "rules"
+        shutil.copytree(TEMPLATE_RULES, rules / "remote")
+        (rules / "local").mkdir()
+        eng = ps.DetectionEngine(ps.AppConfig(self.tmp / "config.json"), rules)
+        self.run_patched(eng.initialize)
+        self.assertNotEqual(eng.hebrew_status, "loaded")
+        self.assertTrue(eng.hebrew_status.startswith("failed"), eng.hebrew_status)
+        self.assertIsNone(eng.hebrew_model)
+        fs = eng.analyze("John Smith logged in from 10.20.30.40", [], ps.SessionVault())
+        self.assertIn("INTERNAL_IP", {f.entity for f in fs})
+
+    def test_find_error_never_stops_initialize(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        rules = tmp / "rules"
+        shutil.copytree(TEMPLATE_RULES, rules / "remote")
+        (rules / "local").mkdir()
+        eng = ps.DetectionEngine(ps.AppConfig(tmp / "config.json"), rules)
+        with mock.patch.object(ps, "find_hebrew_model", side_effect=OSError("disk gone")):
+            eng.initialize()
+        self.assertTrue(eng.hebrew_status.startswith("failed"))
+
+    @unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+    def test_settings_dialog_opens(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        self.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+        cfg = ps.AppConfig(self.tmp / "config.json")
+        dlg = self.run_patched(lambda: ps.SettingsDialog(None, cfg, mock.Mock(builtin_supported=[])))
+        self.addCleanup(dlg.deleteLater)
+        self.assertFalse(dlg.chk_hebrew.isEnabled())
+
+
+# ---- Hebrew NER state in the engine status label (final review I-3) ----
+class EngineStatusLabelTests(unittest.TestCase):
+    def test_suffix(self):
+        f = ps.hebrew_status_suffix
+        self.assertEqual(f("loaded", True), "  ·  Hebrew NER")
+        self.assertEqual(f("off", True), "")
+        self.assertEqual(f("not installed", False), "")
+        self.assertEqual(f("failed: boom", True), "  ·  Hebrew NER: failed (see Log)")
+        self.assertEqual(f("failed: denied", False), "  ·  Hebrew NER: failed (see Log)")
+        self.assertEqual(f("not installed", True), "  ·  Hebrew NER: failed (see Log)")
+
+    @unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+    def test_main_window_label(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        self.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.object(ps.MainWindow, "_start_engine"):
+            win = ps.MainWindow(ps.AppConfig(tmp / "config.json"))
+        self.addCleanup(win.deleteLater)
+        cases = [("failed: boom", tmp, "Hebrew NER: failed (see Log)"),
+                 ("loaded", tmp, "  ·  Hebrew NER"),
+                 ("not installed", None, None)]
+        for status, folder, want in cases:
+            with self.subTest(status=status):
+                win.engine.hebrew_status = status
+                win.engine.model_name = "en_core_web_lg"
+                win._startup_checked = True
+                with mock.patch.object(win, "_run", lambda fn, done, *a, **k: done("presidio+spacy")), \
+                     mock.patch.object(ps, "find_hebrew_model", return_value=folder), \
+                     mock.patch.object(ps, "is_full_build", return_value=False):
+                    win._start_engine()
+                text = win.lbl_engine.text()
+                self.assertTrue(text.startswith("Engine: Presidio + spaCy en_core_web_lg  ·  offline"))
+                if want:
+                    self.assertTrue(text.endswith(want), text)
+                else:
+                    self.assertEqual(text, "Engine: Presidio + spaCy en_core_web_lg  ·  offline")
+
+
+# ---- Settings checkbox without the runtime (final review M-5) ----
+@unittest.skipUnless(ps.QT_OK, "PyQt6 not installed")
+class HebrewSettingsRuntimeTests(unittest.TestCase):
+    def test_checkbox_disabled_when_runtime_missing(self):
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        self.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = ps.AppConfig(tmp / "config.json")
+        cfg["engine"]["hebrew_ner"] = True
+        for attr in ("ort", "HfTokenizer"):
+            with self.subTest(missing=attr), \
+                 mock.patch.object(ps, "find_hebrew_model", return_value=tmp), \
+                 mock.patch.object(ps, attr, None):
+                dlg = ps.SettingsDialog(None, cfg, mock.Mock(builtin_supported=[]))
+                self.addCleanup(dlg.deleteLater)
+                self.assertFalse(dlg.chk_hebrew.isEnabled())
+                self.assertIn("Hebrew model not installed", dlg.chk_hebrew.text())
+                dlg._accept()
+                self.assertTrue(cfg.data["engine"]["hebrew_ner"])
