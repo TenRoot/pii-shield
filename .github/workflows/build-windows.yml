@@ -63,14 +63,6 @@ jobs:
         if: matrix.flavor == 'full'
         run: python packaging/fetch_full_assets.py --dest build-assets --install-dev
 
-      # Temporary diagnostic: F1 of each pinned DictaBERT NER model file on this CPU.
-      - name: "Diagnostic: Hebrew model files on this CPU"
-        if: matrix.flavor == 'full'
-        continue-on-error: true
-        run: |
-          Get-CimInstance Win32_Processor | ForEach-Object { "CPU: $($_.Name)" }
-          python packaging/diag_model_variants.py --dest build-assets/diag
-
       - name: Unit tests
         run: python -m unittest discover -s tests -v
 

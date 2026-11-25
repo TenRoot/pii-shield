@@ -4051,26 +4051,6 @@ class HebrewSpan:
     parts: List[Tuple[int, int]] = field(default_factory=list, compare=False)
 
 
-# Hebrew groups are joined into batches of about this many characters for one model call.
-HEBREW_BATCH_CHARS = 4000
-
-
-def _batch_groups(groups: List[Tuple[int, int]], max_chars: int) -> List[List[Tuple[int, int]]]:
-    """Collect consecutive groups into batches of at most max_chars characters (a longer group
-    is a batch alone; the model windows split it)."""
-    batches: List[List[Tuple[int, int]]] = []
-    size = 0
-    for g in groups:
-        length = g[1] - g[0]
-        if batches and size + length + 1 <= max_chars:
-            batches[-1].append(g)
-            size += length + 1
-        else:
-            batches.append([g])
-            size = length
-    return batches
-
-
 def _hebrew_groups(text: str) -> List[Tuple[int, int]]:
     """(start, end) of runs of consecutive lines that contain a Hebrew letter."""
     groups: List[Tuple[int, int]] = []
@@ -4148,37 +4128,12 @@ class HebrewNerModel:
         unwanted best part cannot drop the wanted part with it."""
         wanted = None if wanted is None else set(wanted)
         spans: List[HebrewSpan] = []
-        for batch in _batch_groups(_hebrew_groups(text), HEBREW_BATCH_CHARS):
-            spans.extend(self._predict_batch(text, batch))
+        # One model call per group, so that each group keeps only its own context and the 8-bit
+        # scores do not depend on other lines (batching lines shifted scores by up to 0.12).
+        for g_start, g_end in _hebrew_groups(text):
+            spans.extend(self._predict_group(text[g_start:g_end], g_start))
         out = self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans), wanted), wanted)
         return out if wanted is None else [sp for sp in out if sp.entity in wanted]
-
-    def _predict_batch(self, text: str, groups: List[Tuple[int, int]]) -> List[HebrewSpan]:
-        """Run several Hebrew groups as one text, joined by line breaks, and map each span back
-        to its group. One model call per short group is slow: mixed Hebrew and English text has
-        one group per Hebrew line. A span that reaches over a joint is cut at the joint, so a
-        span never covers text between two groups."""
-        if len(groups) == 1:
-            g_start, g_end = groups[0]
-            return self._predict_group(text[g_start:g_end], g_start)
-        joined, starts = [], []
-        pos = 0
-        for g_start, g_end in groups:
-            starts.append(pos)
-            joined.append(text[g_start:g_end])
-            pos += g_end - g_start + 1          # + 1 for the joining line break
-        out: List[HebrewSpan] = []
-        for sp in self._predict_group("\n".join(joined), 0):
-            k = bisect.bisect_right(starts, sp.start) - 1
-            while k < len(groups) and starts[k] < sp.end:
-                g_start, g_end = groups[k]
-                a = max(sp.start, starts[k])
-                b = min(sp.end, starts[k] + (g_end - g_start))
-                if b > a:
-                    out.append(HebrewSpan(g_start + a - starts[k], g_start + b - starts[k],
-                                          sp.entity, sp.score))
-                k += 1
-        return out
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
         enc = self.tokenizer.encode(group, add_special_tokens=False)

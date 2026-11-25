@@ -117,9 +117,11 @@ class FakeSession:
     def run(self, _outputs, feeds):
         self.calls.append(feeds)
         inv = {v: k for k, v in self.tok.vocab.items()}
-        out = np.zeros((1, feeds["input_ids"].shape[1], len(self.LABELS)))
-        for i, tid in enumerate(feeds["input_ids"][0]):
-            out[0, i, self.LABELS.index(self.table.get(inv.get(int(tid)), "O"))] = 10.0
+        rows, width = feeds["input_ids"].shape
+        out = np.zeros((rows, width, len(self.LABELS)))
+        for b in range(rows):
+            for i, tid in enumerate(feeds["input_ids"][b]):
+                out[b, i, self.LABELS.index(self.table.get(inv.get(int(tid)), "O"))] = 10.0
         return [out]
 
 
@@ -130,10 +132,11 @@ def build(table, with_type_ids=False, **kw):
     return ps.HebrewNerModel(tok, sess, id2label, **kw), sess
 
 
-class HebrewBatchingTests(unittest.TestCase):
-    """Short Hebrew groups between English lines go to the model in batches, not one by one."""
+class HebrewGroupCallTests(unittest.TestCase):
+    """Each Hebrew line group goes to the model alone: its context and scores do not depend on
+    other lines. Joining lines into one text lost the surname in "פנינו אל מר אבו-סאלח"."""
 
-    def test_many_groups_few_calls_same_spans(self):
+    def test_one_call_per_group_same_spans(self):
         model, sess = build(HE_TABLE)
         text = "\n".join(f"English line {i}\nדנה כהן נפגשה בחיפה" for i in range(50))
         got = [(sp.start, sp.end, sp.entity) for sp in model.predict(text)]
@@ -143,7 +146,8 @@ class HebrewBatchingTests(unittest.TestCase):
             at = m.start() + len("דנה כהן נפגשה ")
             want.append((at, at + len("בחיפה"), "LOCATION"))
         self.assertEqual(got, want)
-        self.assertLessEqual(len(sess.calls), 5, "50 groups, few model calls")
+        self.assertEqual(len(sess.calls), 50)
+        self.assertTrue(all(c["input_ids"].shape[0] == 1 for c in sess.calls), "one row per call")
 
     def test_span_never_crosses_groups(self):
         model, _ = build({"דנה": "B-PER", "כהן": "I-PER"})
@@ -1772,6 +1776,12 @@ class ShuffledLongTextTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, True)
+
+    def test_lone_surname_after_mr_found(self):
+        """Seed 20 line: the model finds the surname when the line is alone in its call."""
+        line = "פנינו אל מר אבו-סאלח בנושא החוזה."
+        got = [(line[sp.start:sp.end], sp.entity) for sp in self.model.predict(line)]
+        self.assertIn(("אבו-סאלח", "PERSON"), got)
 
     def test_engine_uses_hebrew_model(self):
         self.assertIsNotNone(getattr(self.engine, "hebrew_status", None))

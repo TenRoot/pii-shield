@@ -67,7 +67,13 @@ Both builds come from the same code. All processing stays on the local machine.
 
 Model choice: **DictaBERT NER** (`dicta-il/dictabert-ner`, CC BY 4.0). The ONNX file comes from
 `onnx-community/dictabert-ner-ONNX`, revision `4f0aabf58566526df6f3fb548e0fd2619fbf2b1d`, file
-`onnx/model_quantized.onnx`. HeBERT NER was rejected because it has no license.
+`onnx/model_quantized.onnx` (the same bytes as `model_int8.onnx`). Checked 2026-11-25:
+`model_uint8` gives F1 0.958 on the 20-sentence fixture (`model_quantized` 0.930), on an Intel
+(VNNI) CPU and on the AMD CI CPU alike. But end to end on 100 varied texts both files leave 80
+name parts unmasked, and `model_quantized` masks every name in more texts (51 against 47), so
+the pin stays on `model_quantized`. The Hebrew model runs one call per line group: batching
+lines changed the 8-bit scores by up to 0.12, and joining lines into one text lost a name.
+HeBERT NER was rejected because it has no license.
 
 ### Test result (2026-11-24, 20 invented sentences, 35 correct answers)
 
