@@ -3806,7 +3806,7 @@ def _extend_to_words(text: str, spans: List[HebrewSpan]) -> List[HebrewSpan]:
 # Window size. The plan said 400, but with the real int8 model a 400-token window missed 4 of 48
 # person names that 128, 200, 256 and 300-token windows all found. Smaller windows cost no speed.
 HEBREW_WINDOW_TOKENS = 256
-# One of these characters between two same-type spans joins them (HebrewNerModel._merge_gaps).
+# One of these characters between two spans can join them (HebrewNerModel._merge_gaps).
 HEBREW_SPAN_GAPS = frozenset(" -\u05be'\u05f3")
 # The gap merge joins two spans only when one of them scores under the score threshold of the
 # analyze call: a weak half would be dropped. Two strong spans are two whole names.
@@ -3837,7 +3837,7 @@ class HebrewNerModel:
         spans: List[HebrewSpan] = []
         for g_start, g_end in _hebrew_groups(text):
             spans.extend(self._predict_group(text[g_start:g_end], g_start))
-        out = self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans), wanted))
+        out = self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans), wanted), wanted)
         return out if wanted is None else [sp for sp in out if sp.entity in wanted]
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
@@ -3935,25 +3935,30 @@ class HebrewNerModel:
 
 
     @staticmethod
-    def _merge_gaps(text: str, spans: List[HebrewSpan]) -> List[HebrewSpan]:
-        """Join spans of the same type that one gap character (space, '-', maqaf, geresh)
-        separates.
+    def _merge_gaps(text: str, spans: List[HebrewSpan],
+                    wanted: Optional[Set[str]] = None) -> List[HebrewSpan]:
+        """Join two spans that one gap character (space, '-', maqaf, geresh) separates when one
+        of them scores under the cutoff (HEBREW_MERGE_CUTOFF).
 
         The model often splits a name into two spans: PERSON "ז'אן-פייר" at 0.52 and PERSON
-        "לוי" at 0.92. The engine threshold applies per span, so it would drop the weak half and
-        leave part of the name unmasked. One span with the best score keeps the name whole.
-        Spans of different types stay separate: PERSON "משה לוי" + LOCATION "בחיפה" must stay
-        two findings, so that propagation copies the bare name. Two spans that both score at or
-        over the cutoff (HEBREW_MERGE_CUTOFF) also stay separate ("נועה גולן" + "ויעל רוזן"): both pass the
-        threshold, and each name must propagate alone. Score: the highest part score.
-        Input spans do not overlap (_dedupe runs first)."""
+        "לוי" at 0.92, or ORGANIZATION "ז'אן-פייר" at 0.94 and PERSON "לוי" at 0.6. The engine
+        threshold applies per span, so it would drop the weak half and leave part of the name
+        unmasked. One span with the best score keeps the name whole. The types of the two
+        spans can differ. Type: PERSON if a part is PERSON, else the type of the higher-scoring
+        part (with a wanted set, only wanted parts choose, when there is one).
+        Two spans that both score at or over the cutoff stay separate ("נועה גולן" + "ויעל רוזן",
+        "משה לוי" + "בחיפה"): both pass the threshold, and each must propagate alone.
+        Score: the highest part score. Input spans do not overlap (_dedupe runs first)."""
         below = HEBREW_MERGE_CUTOFF.get()
         merged: List[HebrewSpan] = []
         for sp in sorted(spans, key=lambda x: (x.start, x.end)):
             last = merged[-1] if merged else None
-            if (last is not None and last.entity == sp.entity and sp.start - last.end == 1
+            if (last is not None and sp.start - last.end == 1
                     and text[last.end] in HEBREW_SPAN_GAPS
                     and min(last.score, sp.score) < below):
+                parts = [p for p in (last, sp) if wanted is None or p.entity in wanted] or [last, sp]
+                last.entity = ("PERSON" if any(p.entity == "PERSON" for p in parts)
+                               else max(parts, key=lambda x: x.score).entity)
                 last.end = sp.end
                 last.score = max(last.score, sp.score)
             else:

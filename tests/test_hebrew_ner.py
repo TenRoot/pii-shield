@@ -148,10 +148,10 @@ class HebrewNerCoreTests(unittest.TestCase):
         model, _ = build({"דנה": "B-PER", "כהן": "I-PER", "לוי": "I-PER", "משה": "I-ORG"})
         text = "דנה כהן נפגשה לוי משה"
         # the BIO decode, before the gap merge
-        with mock.patch.object(ps.HebrewNerModel, "_merge_gaps", staticmethod(lambda t, sp: sp)):
+        with mock.patch.object(ps.HebrewNerModel, "_merge_gaps", staticmethod(lambda t, sp, w=None: sp)):
             self.assertEqual(self.spans(model, text),
                              [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
-        # the gap merge joins only spans of the same type, so these two stay separate
+        # both spans score over the merge cutoff, so the gap merge keeps them separate
         self.assertEqual(self.spans(model, text),
                          [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
 
@@ -285,9 +285,9 @@ class UnionMergeTests(unittest.TestCase):
 
 
 class GapMergeTests(unittest.TestCase):
-    """Same-type spans split by one gap character (space, '-', maqaf, geresh) become one span,
-    so the engine threshold sees the whole name and cannot drop a weak half. Spans of different
-    types stay separate (fake spans)."""
+    """Spans split by one gap character (space, '-', maqaf, geresh) become one span when one of
+    them is weak, so the engine threshold sees the whole name and cannot drop a weak half. Two
+    strong spans stay separate (fake spans)."""
 
     def merged(self, text, spans):
         return [(text[s.start:s.end], s.entity, s.score)
@@ -302,11 +302,35 @@ class GapMergeTests(unittest.TestCase):
         spans = [self.span(t, "ז'אן-פייר", "PERSON", 0.52), self.span(t, "לוי", "PERSON", 0.92)]
         self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.92)])
 
-    def test_cross_type_neighbours_stay_separate(self):
+    def test_weak_person_joins_strong_other_type(self):
+        # final review I-4b: the weak PERSON half would be dropped; the joined span is PERSON
         t = "ואת ז'אן-פייר לוי."
-        spans = [self.span(t, "ז'אן-פייר", "ORGANIZATION", 0.99), self.span(t, "לוי", "PERSON", 0.77)]
-        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר", "ORGANIZATION", 0.99),
-                                                 ("לוי", "PERSON", 0.77)])
+        spans = [self.span(t, "ז'אן-פייר", "ORGANIZATION", 0.94), self.span(t, "לוי", "PERSON", 0.6)]
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.94)])
+
+    def test_weak_other_type_joins_strong_person(self):
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "ז'אן-פייר", "LOCATION", 0.5), self.span(t, "לוי", "PERSON", 0.9)]
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.9)])
+
+    def test_cross_type_without_person_takes_higher_score_type(self):
+        t = "בבנק הדקל בירושלים."
+        spans = [self.span(t, "בבנק הדקל", "ORGANIZATION", 0.7),
+                 self.span(t, "בירושלים", "LOCATION", 0.95)]
+        self.assertEqual(self.merged(t, spans), [("בבנק הדקל בירושלים", "LOCATION", 0.95)])
+
+    def test_two_strong_cross_type_spans_stay_separate(self):
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "ז'אן-פייר", "ORGANIZATION", 0.99), self.span(t, "לוי", "PERSON", 0.9)]
+        self.assertEqual(len(self.merged(t, spans)), 2)
+
+    def test_cross_type_merge_types_by_wanted_part(self):
+        t = "בבנק הדקל בירושלים."
+        spans = [self.span(t, "בבנק הדקל", "ORGANIZATION", 0.95),
+                 self.span(t, "בירושלים", "LOCATION", 0.7)]
+        got = ps.HebrewNerModel._merge_gaps(t, spans, {"LOCATION", "PERSON"})
+        self.assertEqual([(t[s.start:s.end], s.entity) for s in got],
+                         [("בבנק הדקל בירושלים", "LOCATION")])
 
     def test_person_and_city_stay_separate(self):
         t = "דנה כהן נפגשה עם משה לוי בחיפה."
@@ -368,12 +392,11 @@ class GapMergeTests(unittest.TestCase):
                  self.span(t, "סאלח", "PERSON", 0.95)]
         self.assertEqual(self.merged(t, spans), [("מוחמד אבו-סאלח", "PERSON", 0.95)])
 
-    def test_other_type_breaks_chain(self):
+    def test_weak_other_type_in_chain_joins(self):
         t = "את מוחמד אבו-סאלח היום"
         spans = [self.span(t, "מוחמד", "PERSON", 0.7), self.span(t, "אבו", "LOCATION", 0.5),
                  self.span(t, "סאלח", "PERSON", 0.95)]
-        self.assertEqual(self.merged(t, spans), [("מוחמד", "PERSON", 0.7), ("אבו", "LOCATION", 0.5),
-                                                 ("סאלח", "PERSON", 0.95)])
+        self.assertEqual(self.merged(t, spans), [("מוחמד אבו-סאלח", "PERSON", 0.95)])
 
     def test_input_order_does_not_matter(self):
         t = "ואת ז'אן-פייר לוי."
