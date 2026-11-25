@@ -2700,18 +2700,10 @@ def sanitize(text: str, findings: Sequence[Finding], vault: SessionVault) -> Tup
     # 2) commit
     for f in enabled:
         vault.commit(f.text, f.token, f.entity)
-    # 3) replace
-    if ANONYMIZER_OK and enabled:
-        # one synthetic entity type per finding: prevents Presidio from merging adjacent spans
-        results, ops = [], {}
-        for i, f in enumerate(enabled):
-            et = f"F{i}"
-            results.append(AnonResult(entity_type=et, start=f.start, end=f.end, score=1.0))
-            ops[et] = OperatorConfig("replace", {"new_value": f.token})
-        out = AnonymizerEngine().anonymize(text=text, analyzer_results=results, operators=ops).text
-    else:
-        out = splice(text, enabled)
-    return out, enabled
+    # 3) replace: the findings do not overlap (resolve_overlaps), so one pass builds the output.
+    # Presidio's anonymizer gave the same text, but its time grew with the square of the
+    # number of findings and froze the window on a large PDF.
+    return splice(text, enabled), enabled
 
 
 def splice(text: str, findings: Sequence[Finding]) -> str:
@@ -2724,6 +2716,18 @@ def splice(text: str, findings: Sequence[Finding]) -> str:
     return "".join(parts)
 
 
+# Send to Sanitize runs in the background above these sizes, so the window does not freeze.
+SANITIZE_BACKGROUND_FINDINGS = 5000
+SANITIZE_BACKGROUND_CHARS = 200_000
+
+
+def sanitize_with_leak_check(text: str, findings: Sequence[Finding],
+                             vault: SessionVault) -> Tuple[str, List[Finding], List[str]]:
+    """sanitize, then leak_check on its output: (output, findings used, leaked values)."""
+    out, used = sanitize(text, findings, vault)
+    return out, used, leak_check(out, vault)
+
+
 def leak_check(output: str, vault: SessionVault, extra_values: Iterable[str] = ()) -> List[str]:
     """Return raw values (len>=3) from the session that still appear in the sanitized output."""
     values = {v for v in list(vault.token_to_value.values()) + list(extra_values) if len(v.strip()) >= 3}
@@ -2732,9 +2736,14 @@ def leak_check(output: str, vault: SessionVault, extra_values: Iterable[str] = (
     # header is not a leak. Blank the header lines (same length) before the search.
     if page_header_spans(output):
         output = PAGE_HEADER_RE.sub(lambda m: " " * len(m.group()), output)
+    # A plain search in the casefolded output rejects most values fast. Only a value found
+    # there gets the exact word-boundary regex. casefold(output) contains casefold(v) whenever
+    # the case-insensitive regex matches, so the fast step never hides a leak. A regex scan
+    # of the whole output for each value took minutes on a large PDF.
+    folded = output.casefold()
     leaks = []
     for v in sorted(values, key=len, reverse=True):
-        if v in tokens:
+        if v in tokens or v.casefold() not in folded:
             continue
         if find_literal(output, v, True):
             leaks.append(v)
@@ -6633,6 +6642,8 @@ if QT_OK:
 
         # ================= Step 3
         def generate(self):
+            if not self.btn_generate.isEnabled():     # a background run is going (Ctrl+G)
+                return
             if self.analyzed_text is None:
                 QtWidgets.QMessageBox.information(self, APP_NAME, "Analyze some text first (Step 1).")
                 self.tabs.setCurrentIndex(0)
@@ -6642,14 +6653,49 @@ if QT_OK:
                                               "so that every span is reviewed.")
                 self.tabs.setCurrentIndex(0)
                 return
-            try:
-                out, used = sanitize(self.analyzed_text, self.findings, self.vault)
-            except TokenCollision as exc:
-                QtWidgets.QMessageBox.warning(self, "Token conflict", str(exc))
+            findings = list(self.findings)
+            if len(findings) <= SANITIZE_BACKGROUND_FINDINGS and len(self.analyzed_text) <= SANITIZE_BACKGROUND_CHARS:
+                try:
+                    result = sanitize_with_leak_check(self.analyzed_text, findings, self.vault)
+                except TokenCollision as exc:
+                    QtWidgets.QMessageBox.warning(self, "Token conflict", str(exc))
+                    return
+                self._show_sanitized(result)
                 return
+            # A large review: the replacement and the leak check take seconds, so they run in the
+            # background. Send, Generate and Restore stay off, so nothing else uses the session map.
+            self._set_generating(True)
+            self.statusBar().showMessage(f"Sanitizing {len(findings):,} findings...")
+            self._run(sanitize_with_leak_check, self._on_sanitized, self.analyzed_text, findings, self.vault,
+                      error=self._on_sanitize_error)
+
+        def _set_generating(self, on: bool):
+            self.btn_generate.setEnabled(not on)
+            self.btn_restore.setEnabled(not on)
+            self.setCursor(Qt.CursorShape.BusyCursor if on else Qt.CursorShape.ArrowCursor)
+            if on:
+                self.btn_send.setEnabled(False)
+            else:
+                self._update_send_button()
+
+        def _on_sanitized(self, result):
+            if self._closing:
+                return
+            self._set_generating(False)
+            self.statusBar().clearMessage()
+            self._show_sanitized(result)
+
+        def _on_sanitize_error(self, msg: str):
+            if self._closing:
+                return
+            self._set_generating(False)
+            self.statusBar().clearMessage()
+            QtWidgets.QMessageBox.warning(self, "Token conflict" if "token" in msg.lower() else "Sanitize", msg)
+
+        def _show_sanitized(self, result):
+            out, used, leaks = result
             self.output.setPlainText(out)
             self.last_sanitized = out
-            leaks = leak_check(out, self.vault)
             if leaks:
                 set_note(self.lbl_leak, f"Leak check: {len(leaks)} known sensitive value(s) still appear in the output "
                          f"(e.g. disabled rows). Review before sending.", "leak")

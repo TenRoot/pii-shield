@@ -1,5 +1,6 @@
 """Speed fixes for long text: same results as the simple code, without square-time loops."""
 import random
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -99,6 +100,53 @@ class QtIndexTests(unittest.TestCase):
         self.assertEqual(ps.py_to_qt_index(a, 5), 10)
         self.assertEqual(ps.py_to_qt_index(b, 5), 5)
         self.assertEqual(ps.py_to_qt_index(a, 6), 11)
+
+
+class SanitizeSpeedTests(unittest.TestCase):
+    """sanitize uses splice (one pass) and leak_check rejects most values with a plain search:
+    the results must be the same as with Presidio's anonymizer and a full regex scan."""
+
+    def random_case(self, rng):
+        words = ["John", "Smith", "SRV-DC01", "10.20.30.40", "דנה", "כהן", "ok", "the", "a-b", "x"]
+        text = " ".join(rng.choice(words) for _ in range(rng.randrange(5, 120)))
+        fs = []
+        for i, m in enumerate(re.finditer(r"\S+", text)):
+            if rng.random() < 0.4:
+                fs.append(ps.Finding(m.start(), m.end(), m.group(), "CUSTOM", 0.9, "custom", "", rng.random() < 0.8,
+                                     f"<T_{abs(hash(m.group().casefold())) % 997}>"))
+        return text, fs
+
+    def test_sanitize_matches_presidio_anonymizer(self):
+        if not ps.ANONYMIZER_OK:
+            self.skipTest("presidio-anonymizer not installed")
+        rng = random.Random(9)
+        for _ in range(150):
+            text, fs = self.random_case(rng)
+            out, used = ps.sanitize(text, fs, ps.SessionVault())
+            if not used:
+                self.assertEqual(out, text)
+                continue
+            results, ops = [], {}
+            for i, f in enumerate(used):
+                results.append(ps.AnonResult(entity_type=f"F{i}", start=f.start, end=f.end, score=1.0))
+                ops[f"F{i}"] = ps.OperatorConfig("replace", {"new_value": f.token})
+            old = ps.AnonymizerEngine().anonymize(text=text, analyzer_results=results, operators=ops).text
+            self.assertEqual(out, old)
+
+    def test_leak_check_matches_full_scan(self):
+        def full(output, vault):
+            values = {v for v in vault.token_to_value.values() if len(v.strip()) >= 3}
+            return [v for v in sorted(values, key=len, reverse=True)
+                    if v not in vault.token_to_value and ps.find_literal(output, v, True)]
+        rng = random.Random(13)
+        pool = ["John Smith", "SRV-DC01", "srv-dc01x", "contoso", "דנה כהן", "a-b-c", "Straße", "STRASSE", "ok1"]
+        for _ in range(200):
+            v = ps.SessionVault()
+            for i, val in enumerate(rng.sample(pool, rng.randrange(1, len(pool)))):
+                v.commit(val, f"<C_{i}>", "CUSTOM")
+            output = " ".join(rng.choice(pool + ["word", "<C_1>", "xSRV-DC01", "john smith", "JOHN SMITH!"])
+                              for _ in range(rng.randrange(0, 30)))
+            self.assertEqual(ps.leak_check(output, v), full(output, v), output)
 
 
 if __name__ == "__main__":
