@@ -1,7 +1,7 @@
 {
-  "version": "1.7.0",
+  "version": "1.7.1",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "36d49341c7c02eb2ba6456fb4b44ba3243d9231639f34d9d05a7f439eb808af5",
-  "notes": "Rules manager (edit, disable and override rules from the Rules chip); PDF files (text pages, and scanned pages with Tesseract OCR); full Windows build with Hebrew name detection and bundled Tesseract; long text analyzed in parts with progress; much faster analysis of large files; split and export the sanitized output; Group same values in the review table; Save Review / Load Review; Windows fix for rule file paths",
+  "sha256": "7f6cce22515d40c5abcf977ef4979a03657196103ede5cd0461fa612158edb72",
+  "notes": "Enable selected / Disable selected buttons and the Space key in the review table; fix: Send to Sanitize no longer freezes on a large file (faster replacement and leak check, large reviews run in the background)",
   "published": "2026-11-25"
 }
