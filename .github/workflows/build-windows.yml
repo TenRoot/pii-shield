@@ -1,6 +1,9 @@
 name: Build Windows release
-# Builds the portable PII-Shield-<version>-win64.zip (PII-Shield.exe + _internal/, no Python needed).
-# A v* tag publishes a GitHub Release; a manual run only uploads the zip as a workflow artifact.
+# Builds two portable zips (PII-Shield.exe + _internal/, no Python needed):
+#   small: PII-Shield-<version>-win64.zip
+#   full:  PII-Shield-<version>-win64-full.zip (adds the Hebrew NER model and Tesseract)
+# The publish job runs only when both builds succeed. A v* tag publishes one GitHub Release with
+# both zips; a manual run only uploads the files as a workflow artifact.
 on:
   push:
     tags: ["v*"]
@@ -12,6 +15,12 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [small, full]
+    env:
+      PII_SHIELD_FLAVOR: ${{ matrix.flavor }}
     defaults:
       run:
         shell: pwsh
@@ -22,12 +31,35 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-build.txt
+          cache-dependency-path: |
+            requirements-build.txt
+            requirements-full.txt
 
       - name: Install pinned build requirements
         run: |
           python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
           python -m pip install -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw 'pip install -r requirements-build.txt failed' }
+
+      - name: Install pinned full-build requirements
+        if: matrix.flavor == 'full'
+        run: python -m pip install -r requirements-full.txt
+
+      - name: Cache full-build assets
+        if: matrix.flavor == 'full'
+        uses: actions/cache@v6
+        with:
+          path: build-assets
+          key: full-assets-${{ runner.os }}-${{ hashFiles('packaging/fetch_full_assets.py') }}
+
+      # One run fetches into build-assets/ and copies the model to models/ (--install-dev), so
+      # the real-model tests run. The script checks the size and SHA-256 of every file, also of
+      # cached files. Do not add a second --model-only run: it rewrites THIRD_PARTY_NOTICES.txt
+      # without the Tesseract part.
+      - name: Fetch full-build assets (model and Tesseract)
+        if: matrix.flavor == 'full'
+        run: python packaging/fetch_full_assets.py --dest build-assets --install-dev
 
       - name: Unit tests
         run: python -m unittest discover -s tests -v
@@ -47,23 +79,56 @@ jobs:
       - name: Smoke test the built exe
         run: |
           $exe = Resolve-Path dist\PII-Shield\PII-Shield.exe
+          $selfTest = @('--self-test')
+          if ($env:PII_SHIELD_FLAVOR -eq 'full') { $selfTest += '--require-hebrew' }
           $checks = @(
             @{ name = 'version';        args = @('--version') },
             @{ name = 'validate-rules'; args = @('--validate-rules', "$PWD\github-repo-template\rules") },
-            @{ name = 'self-test';      args = @('--self-test') }
+            @{ name = 'self-test';      args = $selfTest }
           )
           foreach ($c in $checks) {
             $log = "$PWD\smoke-$($c.name).log"
             # GUI-subsystem exe: wait for it explicitly and read the exit code from the process object
             $p = Start-Process -FilePath $exe -ArgumentList ($c.args + @('--log-file', "`"$log`"")) -Wait -PassThru
-            Write-Host "== $($c.name): exit $($p.ExitCode)"
+            Write-Host "== $($c.name) ($($c.args -join ' ')): exit $($p.ExitCode)"
             if (Test-Path $log) { Get-Content $log | Where-Object { $_ -notmatch 'Recognizer not added' } }
             if ($p.ExitCode -ne 0) { throw "smoke test '$($c.name)' failed" }
           }
+          # top-level entries only; _internal\ may hold models\, tesseract\ and the notices file
           $extra = Get-ChildItem dist\PII-Shield | Where-Object { $_.Name -notin @('PII-Shield.exe', '_internal') }
           if ($extra) { throw "unexpected files in the build folder: $($extra.Name -join ', ')" }
 
+      - name: Check small build content
+        if: matrix.flavor == 'small'
+        run: |
+          $internal = 'dist\PII-Shield\_internal'
+          $bad = @(Get-ChildItem $internal -Filter 'onnxruntime*') + @(Get-ChildItem $internal -Filter 'tokenizers*')
+          foreach ($name in @('models', 'tesseract', 'THIRD_PARTY_NOTICES.txt')) {
+            if (Test-Path (Join-Path $internal $name)) { $bad += Get-Item (Join-Path $internal $name) }
+          }
+          if ($bad) { throw "the small build holds full-build files: $($bad.Name -join ', ')" }
+          Write-Host 'small build holds no onnxruntime, tokenizers, models, tesseract or notices'
+
+      - name: Check full build content
+        if: matrix.flavor == 'full'
+        run: |
+          $internal = 'dist\PII-Shield\_internal'
+          $need = @('models\dictabert-ner\config.json', 'models\dictabert-ner\tokenizer.json',
+                    'models\dictabert-ner\model_quantized.onnx', 'models\dictabert-ner\LICENSE.txt',
+                    'tesseract\tesseract.exe', 'tesseract\tessdata\heb.traineddata',
+                    'tesseract\tessdata\eng.traineddata', 'THIRD_PARTY_NOTICES.txt')
+          $missing = $need | Where-Object { -not (Test-Path (Join-Path $internal $_)) }
+          if ($missing) { throw "the full build misses: $($missing -join ', ')" }
+          # The bundled Tesseract must start with only its copied DLLs and list both languages.
+          $langs = & (Join-Path $internal 'tesseract\tesseract.exe') --list-langs 2>&1 | ForEach-Object { "$_".Trim() }
+          if ($LASTEXITCODE -ne 0) { throw "bundled tesseract.exe failed (exit $LASTEXITCODE): $langs" }
+          Write-Host ($langs -join "`n")
+          foreach ($l in @('heb', 'eng')) {
+            if ($l -notin $langs) { throw "bundled Tesseract has no '$l' data" }
+          }
+
       - name: Parse-check the generated updater script
+        if: matrix.flavor == 'small'
         run: |
           $dir = Join-Path $env:RUNNER_TEMP "upd test"
           New-Item -ItemType Directory -Force (Join-Path $dir 'updates\9.9.9\PII-Shield') | Out-Null
@@ -73,28 +138,74 @@ jobs:
           if ($errs) { $errs | ForEach-Object { Write-Host $_ }; throw 'updater script has PowerShell syntax errors' }
           Write-Host "updater script parses: $script"
 
-      - name: Package zip, checksum and version.json
-        id: pkg
+      - name: Package zip and checksum
         run: |
           $v = '${{ steps.ver.outputs.version }}'
-          $zip = "PII-Shield-$v-win64.zip"
+          $zip = if ($env:PII_SHIELD_FLAVOR -eq 'full') { "PII-Shield-$v-win64-full.zip" } else { "PII-Shield-$v-win64.zip" }
           New-Item -ItemType Directory -Force out | Out-Null
+          7z a -tzip -mx=5 "out\$zip" .\dist\PII-Shield | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z failed (exit $LASTEXITCODE)" }
+          $zipSha = (Get-FileHash "out\$zip" -Algorithm SHA256).Hash.ToLower()
+          "$zipSha  $zip" | Set-Content "out\$zip.sha256" -Encoding ascii
+          Get-Content "out\$zip.sha256"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zip-${{ matrix.flavor }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # checkout first: it cleans the workspace
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: zip-*
+          merge-multiple: true
+          path: out
+
+      - name: Check zips, write version.json
+        id: pkg
+        run: |
+          $m = Select-String -Path pii_sanitizer.py -Pattern '^__version__\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $m) { throw 'no __version__ in pii_sanitizer.py' }
+          $v = $m.Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "Tag $env:GITHUB_REF_NAME does not match __version__ $v"
+          }
           $stamped = Get-Content github-repo-template\app\version.json -Raw | ConvertFrom-Json
           $scriptSha = (Get-FileHash pii_sanitizer.py -Algorithm SHA256).Hash.ToLower()
           if ($stamped.version -ne $v -or $stamped.sha256 -ne $scriptSha) {
             throw "github-repo-template/app/version.json is not stamped for v$v ($scriptSha)"
           }
-          7z a -tzip -mx=5 "out\$zip" .\dist\PII-Shield | Out-Null
-          $zipSha = (Get-FileHash "out\$zip" -Algorithm SHA256).Hash.ToLower()
-          "$zipSha  $zip" | Set-Content "out\$zip.sha256" -Encoding ascii
+          $zip = "PII-Shield-$v-win64.zip"
+          $fullZip = "PII-Shield-$v-win64-full.zip"
+          $sha = @{}
+          foreach ($z in @($zip, $fullZip)) {
+            if (-not (Test-Path "out\$z")) { throw "artifact misses $z" }
+            $sha[$z] = (Get-FileHash "out\$z" -Algorithm SHA256).Hash.ToLower()
+            $listed = ((Get-Content "out\$z.sha256" -Raw).Trim() -split '\s+')[0]
+            if ($listed -ne $sha[$z]) { throw "$z.sha256 says $listed, the zip hashes to $($sha[$z])" }
+          }
+          $base = "https://github.com/${{ github.repository }}/releases/download/v$v"
           $info = [ordered]@{
-            version            = $v
-            script_path        = 'app/pii_sanitizer.py'
-            sha256             = $scriptSha
-            windows_zip_url    = "https://github.com/${{ github.repository }}/releases/download/v$v/$zip"
-            windows_zip_sha256 = $zipSha
-            notes              = $stamped.notes
-            published          = (Get-Date).ToString('yyyy-MM-dd')
+            version                 = $v
+            script_path             = 'app/pii_sanitizer.py'
+            sha256                  = $scriptSha
+            windows_zip_url         = "$base/$zip"
+            windows_zip_sha256      = $sha[$zip]
+            windows_full_zip_url    = "$base/$fullZip"
+            windows_full_zip_sha256 = $sha[$fullZip]
+            notes                   = $stamped.notes
+            published               = (Get-Date).ToString('yyyy-MM-dd')
           }
           # release asset: for a separate rules repo (app/pii_sanitizer.py + app/version.json)
           $info | ConvertTo-Json | Set-Content out\version.json -Encoding utf8
@@ -102,11 +213,13 @@ jobs:
           $info.script_path = 'pii_sanitizer.py'
           $info | ConvertTo-Json | Set-Content out\root-version.json -Encoding utf8
           Get-Content out\root-version.json
+          "version=$v" >> $env:GITHUB_OUTPUT
           "zip=$zip" >> $env:GITHUB_OUTPUT
+          "full_zip=$fullZip" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v7
         with:
-          name: PII-Shield-${{ steps.ver.outputs.version }}-win64
+          name: PII-Shield-${{ steps.pkg.outputs.version }}-win64
           path: out/
           retention-days: 14
 
@@ -115,25 +228,33 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $v = '${{ steps.ver.outputs.version }}'
+          $v = '${{ steps.pkg.outputs.version }}'
           $zip = '${{ steps.pkg.outputs.zip }}'
+          $fullZip = '${{ steps.pkg.outputs.full_zip }}'
           $notes = @"
-          Portable Windows build of PII Shield $v. No Python or other install needed.
+          Portable Windows builds of PII Shield $v. No Python or other install needed.
 
-          1. Download ``$zip`` and unzip it to a folder you can write to (not Program Files).
+          - ``$zip``: the standard build.
+          - ``$fullZip``: the full build. It adds Hebrew name detection (persons, organizations
+            and places, with the DictaBERT NER model by Dicta, CC BY 4.0) and a bundled Tesseract
+            with Hebrew and English data for scanned PDF pages. It is larger.
+
+          1. Download one zip and unzip it to a folder you can write to (not Program Files).
           2. Run ``PII-Shield\PII-Shield.exe``. Settings and rules are stored next to the exe.
 
-          ``$zip.sha256`` holds the SHA-256 of the zip. Installs with the default settings find this
-          release through ``version.json`` at the root of this repo. If you use your own rules repo,
-          publish the attached ``version.json`` there as ``app/version.json``.
+          Each ``.sha256`` file holds the SHA-256 of its zip. The in-app update keeps each install
+          on its build: a full install updates only to the full zip. Installs with the default
+          settings find this release through ``version.json`` at the root of this repo. If you use
+          your own rules repo, publish the attached ``version.json`` there as ``app/version.json``.
           The exe is not code-signed, so Windows SmartScreen may warn on first start.
           "@
-          gh release create "v$v" "out\$zip" "out\$zip.sha256" out\version.json --title "PII Shield $v" --notes $notes
+          gh release create "v$v" "out\$zip" "out\$zip.sha256" "out\$fullZip" "out\$fullZip.sha256" out\version.json --title "PII Shield $v" --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit $LASTEXITCODE)" }
 
       - name: Point installs at the new release (version.json on main)
         if: github.ref_type == 'tag'
         run: |
-          $v = '${{ steps.ver.outputs.version }}'
+          $v = '${{ steps.pkg.outputs.version }}'
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main

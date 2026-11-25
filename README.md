@@ -4,7 +4,8 @@ PII Shield removes personal and sensitive data from text before you send the tex
 It replaces each sensitive value with a token, for example `<HOSTNAME_1>`. When the LLM
 replies, PII Shield puts the original values back.
 
-All processing is local. PII Shield uses Microsoft Presidio and a local spaCy model. The app
+All processing is local. PII Shield uses Microsoft Presidio and a local spaCy model. The full
+Windows build also uses a local Hebrew name model. The app
 makes only two kinds of network requests: GitHub requests (the rules sync and the app version
 check) and a Presidio version check on PyPI. All of them run at startup, and you can also
 start the rules sync manually. PII Shield never sends prompt text. Offline mode turns off all
@@ -51,8 +52,12 @@ credential store. Without `keyring`, PII Shield stores the token in plain text i
 
 ## Windows build
 
-Each release on GitHub has a portable Windows build, `PII-Shield-<version>-win64.zip`. It needs
-no Python and no other install:
+Each release on GitHub has two portable Windows builds. Neither needs Python or another install:
+
+- `PII-Shield-<version>-win64.zip`: the standard (small) build.
+- `PII-Shield-<version>-win64-full.zip`: the full build. See [Full build](#full-build).
+
+To install a build:
 
 1. Download the zip from the **Releases** page and unzip it to a folder you can write to. Do not
    use `Program Files`.
@@ -67,17 +72,65 @@ The exe has no console. To see the output of a command-line option, add `--log-f
 .\PII-Shield.exe --self-test --log-file self-test.log
 ```
 
-To update the Windows build, the app downloads the new release zip and checks its SHA-256. It
-then closes, replaces `PII-Shield.exe` and `_internal\`, and starts again. Your settings and
-rules stay.
+To update the Windows build, the app downloads the new release zip of the same build and checks
+its SHA-256. It then closes, replaces `PII-Shield.exe` and `_internal\`, and starts again. Your
+settings and rules stay.
 
-To build the zip, push a `v<version>` tag. The workflow in `.github/workflows/build-windows.yml`
-runs the tests, builds with `packaging/pii_shield.spec`, smoke-tests the exe and publishes the
-release. It then commits `version.json` at the root of this repo. That file names the new
-version, the zip URL and both SHA-256 values, so every install finds the update.
+To build the zips, push a `v<version>` tag. The workflow in `.github/workflows/build-windows.yml`
+builds the small and the full build in two parallel jobs. Each job runs the tests, builds with
+`packaging/pii_shield.spec`, smoke-tests the exe and uploads its zip. When both jobs succeed, a
+publish job creates the release with both zips. If one job fails, the workflow publishes
+nothing. The publish job then commits `version.json` at the root of this repo. That file names
+the new version, the script SHA-256, and the URL and SHA-256 of each zip, so every install finds
+the update.
 
 Before you push the tag, set `__version__` and stamp `github-repo-template/app/version.json`
 with the SHA-256 of `pii_sanitizer.py`. The workflow stops if they do not match.
+
+### Full build
+
+The full build is the small build with two additions:
+
+- **Hebrew name detection.** A Hebrew model finds person names, organizations and places in
+  Hebrew text. PII Shield masks them the same way as English findings. The review table shows
+  `Hebrew NER` as their source. To turn the model off, clear **Settings > Detection > Hebrew
+  name detection (DictaBERT NER)**.
+- **Bundled Tesseract.** The full build reads scanned PDF pages with no separate Tesseract
+  install. The bundled Tesseract has Hebrew and English data.
+
+The full zip is approximately 750 MB. The small zip is approximately 490 MB. Both builds run
+locally. The Hebrew model and Tesseract make no network calls.
+
+A full install updates only to the full zip of the new version. If a release has no full zip,
+the app does not update and shows `No full build is available for this version.` A small
+install updates to the small zip.
+
+The Hebrew model is DictaBERT NER (`dicta-il/dictabert-ner`) by Dicta, under the
+[CC BY 4.0 license](https://creativecommons.org/licenses/by/4.0/). The full build uses the
+8-bit ONNX copy from `onnx-community/dictabert-ner-ONNX` with no changes.
+`_internal\models\dictabert-ner\LICENSE.txt` has the credit.
+`_internal\THIRD_PARTY_NOTICES.txt` lists the licenses of the model, onnxruntime, tokenizers,
+Tesseract and the Tesseract libraries.
+
+To use the Hebrew model from source:
+
+```bash
+pip install -r requirements-full.txt
+python packaging/fetch_full_assets.py --model-only --install-dev
+```
+
+The script downloads the three model files from a fixed revision and checks the SHA-256 of
+each file. `--install-dev` copies the model to `models/dictabert-ner/` next to
+`pii_sanitizer.py`. From source, OCR uses the Tesseract installed on your computer.
+
+To build the full zip on Windows, run the script without `--model-only`. The script then also
+downloads Tesseract into `build-assets/`. Then build with `PII_SHIELD_FLAVOR=full`:
+
+```powershell
+python packaging/fetch_full_assets.py --dest build-assets
+$env:PII_SHIELD_FLAVOR = 'full'
+pyinstaller --noconfirm packaging/pii_shield.spec
+```
 
 ## Running the app
 
@@ -120,7 +173,7 @@ so.
 The app looks for Tesseract in this order:
 
 1. the path in **Settings → PDF**;
-2. a `tesseract/` folder next to the app (only a full build has it);
+2. the bundled copy in `_internal\tesseract\` (only the full build has it);
 3. `tesseract` on PATH;
 4. on Windows, `C:\Program Files\Tesseract-OCR\tesseract.exe`.
 
@@ -137,8 +190,9 @@ writes no temporary image files. To turn OCR off, clear **OCR scanned pages (Tes
 
 Limits:
 
-- The app finds names and organizations with an English model. In Hebrew text, only rules and
-  word lists find PII.
+- The small build finds names and organizations with an English model only. In Hebrew text,
+  only rules and word lists find PII. The full build also finds Hebrew names, organizations and
+  places (see [Full build](#full-build)).
 - The app cannot open password-protected PDFs.
 
 ### Scan a Git branch
