@@ -1708,6 +1708,26 @@ def find_literal(text: str, value: str, case_insensitive: bool) -> Iterable[Tupl
     return [(m.start(), m.end()) for m in rx.finditer(text)]
 
 
+# Hebrew attaches the letters ו ב כ ל מ ש ה to the next word: "ישראל ישראלי" also occurs as
+# "לישראל ישראלי" or "וכשישראל ישראלי". Python lookbehinds have a fixed width, so there is one
+# lookbehind for each count of prefix letters (0 to 3), each with a word start before the letters.
+_HEBREW_PREFIX_LETTERS = "[ובכלמשה]"
+_HEBREW_PREFIX_START = "(?:(?<!\\w)|" + "|".join(
+    f"(?<=(?<!\\w){_HEBREW_PREFIX_LETTERS}{{{k}}})" for k in (1, 2, 3)) + ")"
+
+
+def find_propagated(text: str, value: str, case_insensitive: bool) -> Iterable[Tuple[int, int]]:
+    """find_literal for value propagation. A value that starts with a Hebrew letter also matches
+    after 1 to 3 Hebrew prefix letters; the match covers the value only, not the prefix. Other
+    values match exactly as find_literal."""
+    if not value.strip() or not _HEBREW_LETTER_RE.match(value):
+        return find_literal(text, value, case_insensitive)
+    post = r"(?!\w)" if value[-1:].isalnum() or value[-1:] == "_" else ""
+    rx = re.compile(_HEBREW_PREFIX_START + re.escape(value) + post,
+                    re.IGNORECASE if case_insensitive else 0)
+    return [(m.start(), m.end()) for m in rx.finditer(text)]
+
+
 # A line is a log line when it starts with a timestamp, a syslog priority or a log level, holds a
 # JSON object, or has two key=value pairs. spaCy NER reads such lines as prose and tags field
 # names and values ("arn", "COMMAND=/bin/ls") as PERSON or ORGANIZATION.
@@ -2304,12 +2324,12 @@ class DetectionEngine:
                     values[k] = (prev[0], prev[1], f.score)
             extra: List[Finding] = []
             for k, (v, ent, score) in values.items():
-                for s, e in find_literal(text, v, ci):
+                for s, e in find_propagated(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], ent, score, "propagated", "value-propagation"))
             for tok, v in vault.active_tokens.items():
                 if v.casefold() in allow:
                     continue
-                for s, e in find_literal(text, v, ci):
+                for s, e in find_propagated(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], vault.token_entity.get(tok, "CUSTOM"), 0.99,
                                          "session", "session-map"))
             found = resolve_keep_hebrew_coverage(_outside_spans(found + extra, headers), text,

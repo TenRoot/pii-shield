@@ -1678,3 +1678,47 @@ class ShuffledLongTextTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- propagation over Hebrew prefix letters (final review I-4a) ----
+# "ישראל ישראלי" found once must also mask "לישראל ישראלי": Hebrew attaches the letters
+# ו ב כ ל מ ש ה to the next word. Only the name is masked, not the prefix.
+class HebrewPrefixPropagationTests(unittest.TestCase):
+    def spans(self, text, value, ci=True):
+        return [text[s:e] for s, e in ps.find_propagated(text, value, ci)]
+
+    def test_prefixed_hebrew_occurrence_found(self):
+        t = "שלחתי לישראל ישראלי ואחר כך וכשישראל ישראלי חזר. ישראל ישראלי."
+        got = list(ps.find_propagated(t, "ישראל ישראלי", True))
+        self.assertEqual(len(got), 3)
+        self.assertEqual({t[s:e] for s, e in got}, {"ישראל ישראלי"})
+        self.assertEqual(got[0][0], t.index("לישראל") + 1)
+
+    def test_at_most_three_prefix_letters(self):
+        self.assertEqual(self.spans("ולכשישראל ישראלי", "ישראל ישראלי"), [])
+
+    def test_other_letters_do_not_count_as_prefix(self):
+        self.assertEqual(self.spans("אישראל ישראלי", "ישראל ישראלי"), [])
+        self.assertEqual(self.spans("לוי ובלוינשטיין", "לוי"), ["לוי"])
+
+    def test_english_propagation_unchanged(self):
+        for t, v in (("blJohn Carter and lJohn Carter, John Carter.", "John Carter"),
+                     ("ל-John Carter וJohn Carter", "John Carter"),
+                     ("x10.1.2.3 10.1.2.3", "10.1.2.3")):
+            self.assertEqual(list(ps.find_propagated(t, v, True)), list(ps.find_literal(t, v, True)))
+
+    def test_engine_masks_prefixed_copy(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        eng, _ = make_engine(tmp)
+        # a manual exact rule finds the bare name only; NER is off, so only propagation can
+        # find the prefixed copy
+        text = "דנה כהן נפגשה בחיפה. אחר כך שלחנו לדנה כהן מסמך."
+        v = ps.SessionVault()
+        fs = eng.analyze(text, [ps.ManualRule("exact", "דנה כהן", "PERSON")], v, skip_ner=True)
+        out, _ = ps.sanitize(text, fs, v)
+        self.assertNotIn("דנה", out)
+        self.assertNotIn("כהן", out)
+        s = text.index("לדנה") + 1
+        self.assertIn((s, s + len("דנה כהן"), "propagated"),
+                      [(f.start, f.end, f.source) for f in fs])
