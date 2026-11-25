@@ -94,7 +94,8 @@ The full build is the small build with two additions:
 - **Hebrew name detection.** A Hebrew model finds person names, organizations and places in
   Hebrew text. PII Shield masks them the same way as English findings. The review table shows
   `Hebrew NER` as their source. To turn the model off, clear **Settings > Detection > Hebrew
-  name detection (DictaBERT NER)**.
+  name detection (DictaBERT NER)**. The Hebrew model does not find all names. It misses some
+  names, mostly a surname alone. Always check the review table before you send the text.
 - **Bundled Tesseract.** The full build reads scanned PDF pages with no separate Tesseract
   install. The bundled Tesseract has Hebrew and English data.
 
@@ -110,7 +111,7 @@ The Hebrew model is DictaBERT NER (`dicta-il/dictabert-ner`) by Dicta, under the
 8-bit ONNX copy from `onnx-community/dictabert-ner-ONNX` with no changes.
 `_internal\models\dictabert-ner\LICENSE.txt` has the credit.
 `_internal\THIRD_PARTY_NOTICES.txt` lists the licenses of the model, onnxruntime, tokenizers,
-Tesseract and the Tesseract libraries.
+Tesseract and the Tesseract libraries, and holds their full license texts.
 
 To use the Hebrew model from source:
 
