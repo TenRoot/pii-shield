@@ -1,7 +1,7 @@
 {
-  "version": "1.6.0",
+  "version": "1.7.0",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "1c4a03bea0b1c2f48deb2500adef8777cc6d54475ad38412d05a25adfef50def",
-  "notes": "New Scan Git Repo button: scan the commits a branch would push, plus uncommitted and untracked files, for PII and secrets (nothing in the repo changes); right-click a Git scan finding to add its value to the allow list, which removes it and its duplicates from the results",
-  "published": "2026-11-20"
+  "sha256": "36d49341c7c02eb2ba6456fb4b44ba3243d9231639f34d9d05a7f439eb808af5",
+  "notes": "Rules manager (edit, disable and override rules from the Rules chip); PDF files (text pages, and scanned pages with Tesseract OCR); full Windows build with Hebrew name detection and bundled Tesseract; long text analyzed in parts with progress; much faster analysis of large files; split and export the sanitized output; Group same values in the review table; Save Review / Load Review; Windows fix for rule file paths",
+  "published": "2026-11-25"
 }
