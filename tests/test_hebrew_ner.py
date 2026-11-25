@@ -1839,6 +1839,19 @@ class HebrewPrefixPropagationTests(unittest.TestCase):
         self.assertIn((s, s + len("דנה כהן"), "propagated"),
                       [(f.start, f.end, f.source) for f in fs])
 
+    def test_without_hebrew_model_propagation_unchanged(self):
+        # small build, or the setting off: the plain literal match, as before
+        for kw in ({"model": "none"}, {"hebrew": False}):
+            with self.subTest(**kw):
+                tmp = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, tmp, True)
+                eng, _ = make_engine(tmp, **kw)
+                text = "דנה כהן נפגשה בחיפה. אחר כך שלחנו לדנה כהן מסמך."
+                fs = eng.analyze(text, [ps.ManualRule("exact", "דנה כהן", "PERSON")],
+                                 ps.SessionVault(), skip_ner=True)
+                self.assertEqual([(f.start, f.end) for f in fs],
+                                 list(ps.find_literal(text, "דנה כהן", True)))
+
 
 # ---- wanted entity types reach the union (final review M-1) ----
 # The union of overlapping spans takes the type of its best part. When that type is not wanted

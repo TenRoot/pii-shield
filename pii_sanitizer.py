@@ -2376,13 +2376,16 @@ class DetectionEngine:
                 elif f.score > prev[2]:
                     values[k] = (prev[0], prev[1], f.score)
             extra: List[Finding] = []
+            # Hebrew prefix letters (find_propagated) only with the Hebrew model on: the small
+            # build and the setting off keep the plain literal match.
+            find = find_propagated if hebrew_on else find_literal
             for k, (v, ent, score) in values.items():
-                for s, e in find_propagated(text, v, ci):
+                for s, e in find(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], ent, score, "propagated", "value-propagation"))
             for tok, v in vault.active_tokens.items():
                 if v.casefold() in allow:
                     continue
-                for s, e in find_propagated(text, v, ci):
+                for s, e in find(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], vault.token_entity.get(tok, "CUSTOM"), 0.99,
                                          "session", "session-map"))
             found = resolve_keep_hebrew_coverage(_outside_spans(found + extra, headers), text,
