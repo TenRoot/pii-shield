@@ -21,6 +21,10 @@ class GenerateBackgroundTests(unittest.TestCase):
         cls.app = ps.QtWidgets.QApplication.instance() or ps.QtWidgets.QApplication([])
 
     def setUp(self):
+        # Earlier test files leave queued calls that point at deleted windows. Drop them before
+        # these tests call processEvents (as in tests/test_pdf.py _qapp).
+        ps.QtCore.QThreadPool.globalInstance().waitForDone(10000)
+        ps.QtCore.QCoreApplication.removePostedEvents(None)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
         with mock.patch.object(ps.MainWindow, "_start_engine"):

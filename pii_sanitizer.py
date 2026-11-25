@@ -5959,8 +5959,12 @@ if QT_OK:
                       error=lambda m: log.warning("Presidio update check failed: %s", m))
 
         def reload_rules(self):
-            self._run(self.engine.reload_rules, lambda rs: (self._update_rules_badge(rs),
-                                                            self.statusBar().showMessage("Rules reloaded", 4000)))
+            # A bound method, not a lambda: Qt drops the queued call when the window is deleted.
+            self._run(self.engine.reload_rules, self._on_rules_reloaded)
+
+        def _on_rules_reloaded(self, rs: RuleSet):
+            self._update_rules_badge(rs)
+            self.statusBar().showMessage("Rules reloaded", 4000)
 
         def _update_rules_badge(self, rs: RuleSet, prefix: str = "Rules"):
             if rs.errors:
