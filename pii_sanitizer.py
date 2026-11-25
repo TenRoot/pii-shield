@@ -3606,9 +3606,24 @@ def mask_value(v: str) -> str:
     return v[0] + "•" * min(len(v) - 2, 12) + v[-1]
 
 
+_ASTRAL_RE = re.compile("[\U00010000-\U0010FFFF]")
+_qt_index_cache: Tuple[Optional[str], List[int]] = (None, [])
+_qt_index_lock = threading.Lock()
+
+
 def py_to_qt_index(text: str, idx: int) -> int:
-    """Qt positions count UTF-16 code units; Python counts code points."""
-    return idx + sum(1 for c in text[:idx] if ord(c) > 0xFFFF)
+    """Qt positions count UTF-16 code units; Python counts code points. A character above
+    U+FFFF (an emoji) is two UTF-16 units. The positions of such characters are found once per
+    text and then looked up with a binary search: the review highlights call this twice for
+    each finding, and a scan of text[:idx] for each call froze the window for hours on a large
+    PDF (findings x text length)."""
+    global _qt_index_cache
+    with _qt_index_lock:
+        cached_text, astral = _qt_index_cache
+        if cached_text is not text:
+            astral = [m.start() for m in _ASTRAL_RE.finditer(text)]
+            _qt_index_cache = (text, astral)
+    return idx + bisect.bisect_left(astral, idx)
 
 
 # ---- PDF ingest ----
@@ -6083,6 +6098,9 @@ if QT_OK:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
                 self.btn_analyze.setEnabled(True)
                 self.statusBar().clearMessage()
+                if len(findings) > 5000:   # the table and highlights take some seconds for a large text
+                    self._on_analyze_progress(f"Showing {len(findings):,} findings...")
+                    QtWidgets.QApplication.processEvents()
                 self.findings = findings
                 self.analyzed_text = text
                 set_note(self.lbl_stale, "", "stale")

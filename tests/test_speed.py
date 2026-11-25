@@ -81,5 +81,25 @@ class FastContextEnhancerTests(unittest.TestCase):
             self.assertEqual(fast._find_index_of_match_token("w", start, tokens, idx), want, start)
 
 
+class QtIndexTests(unittest.TestCase):
+    def slow(self, text, idx):
+        return idx + sum(1 for c in text[:idx] if ord(c) > 0xFFFF)
+
+    def test_same_as_simple_count(self):
+        rng = random.Random(5)
+        alphabet = "ab שלום \n" + "\U0001F600\U0001F4A9"
+        for _ in range(50):
+            text = "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 300)))
+            for idx in range(len(text) + 1):
+                self.assertEqual(ps.py_to_qt_index(text, idx), self.slow(text, idx))
+
+    def test_new_text_is_not_mixed_with_cached_text(self):
+        a = "\U0001F600" * 5 + "x"
+        b = "y" * 6
+        self.assertEqual(ps.py_to_qt_index(a, 5), 10)
+        self.assertEqual(ps.py_to_qt_index(b, 5), 5)
+        self.assertEqual(ps.py_to_qt_index(a, 6), 11)
+
+
 if __name__ == "__main__":
     unittest.main()
