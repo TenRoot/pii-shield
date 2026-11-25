@@ -1,9 +1,11 @@
 {
-  "version": "1.6.0",
+  "version": "1.7.0",
   "script_path": "pii_sanitizer.py",
-  "sha256": "1c4a03bea0b1c2f48deb2500adef8777cc6d54475ad38412d05a25adfef50def",
-  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.6.0/PII-Shield-1.6.0-win64.zip",
-  "windows_zip_sha256": "be58cc0fb27e1373e414bea74571650da7001b1a084e4d7eb6486bde1369facd",
-  "notes": "New Scan Git Repo button: scan the commits a branch would push, plus uncommitted and untracked files, for PII and secrets (nothing in the repo changes); right-click a Git scan finding to add its value to the allow list, which removes it and its duplicates from the results",
-  "published": "2026-11-20"
+  "sha256": "36d49341c7c02eb2ba6456fb4b44ba3243d9231639f34d9d05a7f439eb808af5",
+  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.0/PII-Shield-1.7.0-win64.zip",
+  "windows_zip_sha256": "6475fcec6ac36e81ff78bce929bcdeeb463ccf0bcf854279d47a403ba95d2130",
+  "windows_full_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.0/PII-Shield-1.7.0-win64-full.zip",
+  "windows_full_zip_sha256": "b0e469baadb8d244587bd0a7a6df7156b7ee9d888dfb565f3d8e676e6a3aa09f",
+  "notes": "Rules manager (edit, disable and override rules from the Rules chip); PDF files (text pages, and scanned pages with Tesseract OCR); full Windows build with Hebrew name detection and bundled Tesseract; long text analyzed in parts with progress; much faster analysis of large files; split and export the sanitized output; Group same values in the review table; Save Review / Load Review; Windows fix for rule file paths",
+  "published": "2026-11-25"
 }
