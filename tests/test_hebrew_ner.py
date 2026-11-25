@@ -1031,8 +1031,18 @@ class PropagatedCoverageTests(unittest.TestCase):
         s = self.T.index(sub)
         return ps.Finding(s, s + len(sub), sub, entity, score, source, source)
 
-    def got(self, findings):
-        return [(f.text, f.entity, f.source) for f in ps.resolve_keep_hebrew_coverage(findings, self.T)]
+    def got(self, findings, hebrew_copies=True):
+        return [(f.text, f.entity, f.source)
+                for f in ps.resolve_keep_hebrew_coverage(findings, self.T, hebrew_copies)]
+
+    def test_no_give_back_without_hebrew_model(self):
+        # small build or setting off: propagated copies behave as before
+        got = self.got([self.f("ז'אן-פייר", "ORGANIZATION", "custom"),
+                        self.f("ז'אן-פייר לוי", "PERSON", "propagated")], hebrew_copies=False)
+        self.assertEqual(got, [("ז'אן-פייר", "ORGANIZATION", "custom")])
+        self.assertEqual(self.got([self.f("ז'אן-פייר", "ORGANIZATION", "custom"),
+                                   self.f("ז'אן-פייר לוי", "PERSON", "propagated")]),
+                         [("ז'אן-פייר", "ORGANIZATION", "custom"), ("לוי", "PERSON", "propagated")])
 
     def test_dropped_hebrew_copy_keeps_uncovered_words(self):
         got = self.got([self.f("ז'אן-פייר", "ORGANIZATION", "hebrew_ner"),
@@ -1045,7 +1055,7 @@ class PropagatedCoverageTests(unittest.TestCase):
         s = t.index("fs01")
         fs = [ps.Finding(s, s + 4, "fs01", "HOSTNAME", 0.9, "presidio", "x"),
               ps.Finding(s, s + 15, "fs01.corp.local", "HOSTNAME", 0.9, "propagated", "p")]
-        self.assertEqual([f.text for f in ps.resolve_keep_hebrew_coverage(fs, t)], ["fs01"])
+        self.assertEqual([f.text for f in ps.resolve_keep_hebrew_coverage(fs, t, True)], ["fs01"])
 
 
 # ---- a Hebrew NER span that loses to a rule finding keeps its other words (task 4b) ----

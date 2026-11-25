@@ -1632,7 +1632,8 @@ def resolve_overlaps(findings: List[Finding]) -> List[Finding]:
     return sorted(keep, key=lambda f: f.start)
 
 
-def resolve_keep_hebrew_coverage(findings: List[Finding], text: str) -> List[Finding]:
+def resolve_keep_hebrew_coverage(findings: List[Finding], text: str,
+                                 hebrew_copies: bool = False) -> List[Finding]:
     """resolve_overlaps, then give back the words of a dropped Hebrew NER span that no kept
     finding covers.
 
@@ -1642,17 +1643,19 @@ def resolve_keep_hebrew_coverage(findings: List[Finding], text: str) -> List[Fin
     unmasked. Each uncovered piece (edges trimmed to word characters) becomes a finding with
     the dropped span's type and score.
 
-    A propagated copy with Hebrew letters gets the same treatment: ORGANIZATION "ז'אן-פייר"
-    (kept) + PERSON "לוי" (under the threshold) beat the propagated copy "ז'אן-פייר לוי" of
-    the same name found elsewhere, and "לוי" stayed unmasked. Findings of other sources, and
-    propagated copies without Hebrew letters, are not changed."""
+    With hebrew_copies (the Hebrew model is loaded and on), a propagated copy with Hebrew
+    letters gets the same treatment: ORGANIZATION "ז'אן-פייר" (kept) + PERSON "לוי" (under the
+    threshold) beat the propagated copy "ז'אן-פייר לוי" of the same name found elsewhere, and
+    "לוי" stayed unmasked. Findings of other sources, and propagated copies without Hebrew
+    letters, are not changed."""
     kept = resolve_overlaps(findings)
     taken = [(f.start, f.end) for f in kept]
     extra: List[Finding] = []
     for f in findings:
         if (f.start, f.end) in taken or not (
                 f.source == "hebrew_ner"
-                or (f.source == "propagated" and _HEBREW_LETTER_RE.search(f.text))):
+                or (hebrew_copies and f.source == "propagated"
+                    and _HEBREW_LETTER_RE.search(f.text))):
             continue
         cuts = sorted((s, e) for s, e in taken if s < f.end and f.start < e)
         if not cuts:
@@ -2226,6 +2229,7 @@ class DetectionEngine:
             analyzer, rs = self.analyzer, self.ruleset
         ecfg, bcfg = self.config["engine"], self.config["behavior"]
         threshold = ecfg.get("score_threshold", 0.85) if threshold is None else threshold
+        hebrew_on = self.hebrew_model is not None and bool(ecfg.get("hebrew_ner"))
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
 
@@ -2241,14 +2245,13 @@ class DetectionEngine:
             # and leave part of the name unmasked. With the Hebrew model on, a spaCy finding with
             # Hebrew letters keeps only the Hebrew words that no Hebrew NER finding overlaps: the
             # Hebrew model misses some surnames in long text ("משפחת אזולאי").
-            cut_spacy_hebrew = self.hebrew_model is not None and bool(ecfg.get("hebrew_ner"))
             hebrew_spans = [(r.start, r.end) for r in results
                             if (r.recognition_metadata or {}).get("recognizer_name") == HEBREW_RECOGNIZER]
             for r in results:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
                 if skip_ner and (rname in NER_RECOGNIZERS or rname == HEBREW_RECOGNIZER):
                     continue
-                if (cut_spacy_hebrew and rname in NER_RECOGNIZERS
+                if (hebrew_on and rname in NER_RECOGNIZERS
                         and _HEBREW_LETTER_RE.search(text, r.start, r.end)):
                     for a, b in _uncovered_hebrew_pieces(text, r.start, r.end, hebrew_spans):
                         found.append(Finding(a, b, text[a:b], r.entity_type, float(r.score),
@@ -2304,7 +2307,8 @@ class DetectionEngine:
                 for s, e in find_literal(text, v, ci):
                     extra.append(Finding(s, e, text[s:e], vault.token_entity.get(tok, "CUSTOM"), 0.99,
                                          "session", "session-map"))
-            found = resolve_keep_hebrew_coverage(_outside_spans(found + extra, headers), text)
+            found = resolve_keep_hebrew_coverage(_outside_spans(found + extra, headers), text,
+                                                 hebrew_on)
 
         # entity consistency for identical values, then token proposals
         entity_for: Dict[str, str] = {}
