@@ -424,8 +424,8 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         "",
         "tokenizers (Hugging Face)",
         "  License: Apache License 2.0, https://github.com/huggingface/tokenizers",
-        "  Copyright: the tokenizers authors (Anthony Moi, Nicolas Patry, Hugging Face, Inc.)",
-        "  and contributors. The license text is at the end of this file.",
+        "  Copyright: the tokenizers authors (Anthony Moi, Nicolas Patry; Cargo.toml) and",
+        "  contributors. The license text is at the end of this file.",
     ]
     users: Dict[str, List[str]] = {}
     _use(users, ["onnxruntime.txt"], "onnxruntime")
@@ -440,11 +440,13 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         "",
         "Tesseract OCR (UB Mannheim Windows build %s)" % TESSERACT_VERSION,
         "  License: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0",
-        "  Copyright: Hewlett-Packard Company, Google Inc. and the Tesseract contributors.",
+        "  Copyright (C) Hewlett-Packard Ltd. and Google Inc. (source file headers), and the",
+        "  authors in the AUTHORS file of the Tesseract source.",
         "  Source: https://github.com/tesseract-ocr/tesseract",
         "",
         "tessdata_best (heb, eng, osd trained data)",
         "  License: Apache License 2.0",
+        "  Copyright: the Tesseract authors. The repository names no copyright holder.",
         f"  Source: https://github.com/tesseract-ocr/tessdata_best (commit {TESSDATA_COMMIT})",
         "",
         "Libraries copied from the Tesseract installer (folder tesseract/)",

@@ -8,13 +8,18 @@ package holds no license file, from the upstream release of that version. A vers
 DLL does not show is the newest MSYS2 package before the installer date (2026-07-24).
 Retrieved 2026-11-25.
 
+Copyright lines that no license file holds (they are in THIRD_PARTY_NOTICES.txt): Tesseract,
+from the source file headers and AUTHORS at tag 5.5.3; tokenizers, the authors in Cargo.toml at
+tag v0.23.3; LERC ("Copyright 2015-2026 Esri"), the Licensing section of README.md at
+tag v4.1.1 of https://github.com/Esri/lerc; GIFLIB, the SPDX-FileCopyrightText lines in the
+6.1.3 source.
+
 File                          Used for                                Source
 Apache-2.0.txt                Tesseract OCR, tessdata_best,           doc/LICENSE in the pinned Tesseract installer
                               libtesseract-5.dll, libLerc.dll,        (same text as https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-tesseract-ocr-5.5.3-1-any.pkg.tar.zst,
                                                                       tessdata_best LICENSE at commit e12c65a9, tokenizers v0.23.3 LICENSE and
-                                                                      share/licenses/lerc/LICENSE in mingw-w64-x86_64-lerc-4.1.1-1, except
-                                                                      white space, line breaks and the appendix)
-                              tokenizers
+                              tokenizers                              share/licenses/lerc/LICENSE in mingw-w64-x86_64-lerc-4.1.1-1, except
+                                                                      white space, line breaks, list numbering and the appendix)
 leptonica.txt                 libleptonica-6.dll                      https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-leptonica-1.87.0-1-any.pkg.tar.zst
 libarchive.txt                libarchive-13.dll (3.8.8)               https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libarchive-3.8.8-2-any.pkg.tar.zst
 curl.txt                      libcurl-4.dll (8.21.0)                  https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-curl-8.21.0-2-any.pkg.tar.zst
@@ -33,7 +38,6 @@ expat.txt                     libexpat-1.dll (2.8.2)                  https://re
 libtiff.txt                   libtiff-6.dll (4.7.2)                   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libtiff-4.7.2-1-any.pkg.tar.zst (LICENSE.md)
 libjpeg-turbo.txt,            libjpeg-8.dll (3.2.0)                   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libjpeg-turbo-3.2.0-1-any.pkg.tar.zst
 libjpeg-turbo-README.ijg.txt                                          (LICENSE.md, README.ijg)
-(LERC copyright line: Licensing section of README.md at tag v4.1.1 of https://github.com/Esri/lerc)
 libpng.txt                    libpng16-16.dll (1.6.58)                https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libpng-1.6.58-1-any.pkg.tar.zst
 openjpeg.txt                  libopenjp2-7.dll (2.5.4)                https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-openjpeg2-2.5.4-2-any.pkg.tar.zst
 giflib.txt                    libgif-7.dll                            COPYING in https://sourceforge.net/projects/giflib/files/giflib-6.x/giflib-6.1.3.tar.gz
