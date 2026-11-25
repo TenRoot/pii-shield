@@ -123,12 +123,35 @@ A new Presidio recognizer, `HebrewNerRecognizer(EntityRecognizer)`, joins the ex
   It runs on all input, but it does work only on lines that contain Hebrew letters
   (U+05D0 to U+05EA).
 - **Long text:** the model takes at most 512 tokens. The recognizer joins Hebrew lines into
-  chunks of up to 400 tokens, with an overlap of 50 tokens between chunks. A finding in the
-  overlap is kept once.
+  chunks of up to 256 tokens, with an overlap of 50 tokens between chunks. A finding in the
+  overlap is kept once. (The first draft said 400. With the real 8-bit model, a 400-token window
+  missed 4 of 48 person names that 128, 200, 256 and 300-token windows all found. A smaller
+  window is not slower.)
 - **Offsets:** `tokenizers` gives character offsets for each token. The recognizer maps them back
   to offsets in the full input text.
 - **Spans:** consecutive B- and I- tokens of the same type form one span. A span that starts with
   an I- token also starts a new span.
+
+The builder added four steps after testing with the real model:
+
+- **Word extension:** the model labels sub-word tokens, so a span can stop inside a word. The
+  recognizer grows each span edge to the full word. Same-type spans that overlap after this
+  step become one span.
+- **Overlap union-merge:** the chunk overlap and the word extension can make spans that overlap,
+  also of different types. The recognizer merges each group of overlapping spans into one union
+  span. The type is `PERSON` if one part is `PERSON`, else the type of the best part. The score
+  is the best part score. Without this step, the overlap resolution keeps only one span and can
+  leave a part of a name unmasked.
+- **spaCy-on-Hebrew cut with coverage give-back:** the English spaCy model reads Hebrew as noise
+  and makes long, wrong spans. When the Hebrew model is on, the engine keeps only the parts of a
+  spaCy span on Hebrew text that no Hebrew NER span covers. When a rule finding covers only a
+  part of a Hebrew NER span (or of a propagated copy with Hebrew letters), the engine gives back
+  the uncovered words as separate findings. The given-back pieces never overlap.
+- **Per-call merge cutoff:** the recognizer joins two same-type spans that one gap character
+  (space, `-`, maqaf, geresh) separates, but only when one of them scores under the score
+  threshold of the current analyze call. Two strong spans stay two names. The engine sets the
+  cutoff for each call in a context variable, so two threads with different thresholds do not
+  mix.
 - **Score:** the mean of the winning label's softmax value over the span's tokens. The existing
   score threshold (`engine.score_threshold`, the slider) applies, the same as for other findings.
 - **Threads:** `intra_op_num_threads = 1`. The test showed that one thread is fastest.

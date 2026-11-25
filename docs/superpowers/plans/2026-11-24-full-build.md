@@ -22,7 +22,7 @@
 - Model folder name: `models/dictabert-ner/`. Valid when it holds `config.json`, `tokenizer.json`, `model_quantized.onnx`.
 - Label map (exact): `PER`→`PERSON`, `ORG`→`ORGANIZATION`, `GPE`/`LOC`/`FAC`→`LOCATION`; every other label is ignored.
 - Hebrew line test: the line contains a character in U+05D0–U+05EA.
-- Chunking: at most `400` tokens per chunk, `50` tokens overlap.
+- Chunking: at most `256` tokens per chunk, `50` tokens overlap. (First `400`; changed to `256` after the real-model test, ruling R3.)
 - `intra_op_num_threads = 1`.
 - Finding source for Hebrew findings: `"hebrew_ner"`; `SOURCE_LABEL["hebrew_ner"] = "Hebrew NER"`; recognizer name `"HebrewNerRecognizer"`.
 - Config key: `engine.hebrew_ner` (default `True`).
