@@ -1211,9 +1211,11 @@ class SpacyOnHebrewTests(unittest.TestCase):
 
 
 # ---- a propagated copy of a Hebrew name keeps the words that no kept finding covers ----
-# After R7 (no cross-type gap merge), "ז'אן-פייר לוי" can come back as ORGANIZATION "ז'אן-פייר"
-# 0.99 + PERSON "לוי" 0.77 (under the threshold). The propagated copy of the full name from
-# another occurrence loses to the ORGANIZATION (priority), and "לוי" stayed unmasked.
+# The gap merge joins two spans of the same type, or of different types, only when one part
+# scores under the per-call cutoff. The joined span is PERSON if one part is PERSON, and each
+# PERSON part also propagates (R15). A finding with a higher priority (for example a custom
+# ORGANIZATION on "ז'אן-פייר") beats the propagated copy of the full name "ז'אן-פייר לוי", which
+# left "לוי" unmasked. The engine now gives back "לוי" as a separate propagated finding.
 class PropagatedCoverageTests(unittest.TestCase):
     T = "פגשתי את ז'אן-פייר לוי היום."
 
@@ -2037,3 +2039,67 @@ class HebrewSettingsRuntimeTests(unittest.TestCase):
                 self.assertIn("Hebrew model not installed", dlg.chk_hebrew.text())
                 dlg._accept()
                 self.assertTrue(cfg.data["engine"]["hebrew_ner"])
+
+
+# ---- PERSON parts of a cross-type gap merge propagate (controller ruling R15) ----
+# The gap merge joins PERSON "דוד שמעוני" 0.95 and the weak ORGANIZATION "מחברת ארזים" 0.5 into
+# one PERSON span. Propagation searched only for the long text, so a later bare "דוד שמעוני"
+# that the model does not tag stayed unmasked. Each PERSON part now propagates too.
+class MergedPersonPartsPropagationTests(unittest.TestCase):
+    NAME = "דוד שמעוני"
+
+    def run_engine(self, eng, other, other_entity):
+        text = f"{self.NAME} {other} התקשר אתמול. אחר כך {self.NAME} אישר את ההזמנה."
+        p0, o0 = text.index(self.NAME), text.index(other)
+        spans = [ps.HebrewSpan(p0, p0 + len(self.NAME), "PERSON", 0.95),
+                 ps.HebrewSpan(o0, o0 + len(other), other_entity, 0.5)]
+
+        def fake(group, base):
+            return [ps.HebrewSpan(s.start, s.end, s.entity, s.score) for s in spans
+                    if base <= s.start < base + len(group)]
+        with mock.patch.object(eng.hebrew_model, "_predict_group", side_effect=fake):
+            fs = eng.analyze(text, [], ps.SessionVault())
+        second = text.rindex(self.NAME)
+        return text, fs, second
+
+    def test_bare_second_copy_masked(self):
+        for orgs in (False, True):
+            tmp = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, tmp, True)
+            eng, _ = make_engine(tmp, orgs=orgs)
+            for other, ent in (("מחברת ארזים", "ORGANIZATION"), ("בירושלים", "LOCATION")):
+                with self.subTest(other=other, orgs=orgs):
+                    text, fs, second = self.run_engine(eng, other, ent)
+                    self.assertTrue(any(f.enabled and f.start <= second
+                                        and second + len(self.NAME) <= f.end for f in fs),
+                                    [(f.text, f.entity, f.source) for f in fs])
+
+    def test_merge_keeps_person_parts(self):
+        t = "דוד שמעוני מחברת ארזים"
+        spans = [ps.HebrewSpan(0, 10, "PERSON", 0.95), ps.HebrewSpan(11, 22, "ORGANIZATION", 0.5)]
+        got = ps.HebrewNerModel._merge_gaps(t, spans)
+        self.assertEqual([(t[s.start:s.end], s.entity) for s in got], [(t, "PERSON")])
+        self.assertEqual([t[a:b] for a, b in got[0].parts], ["דוד שמעוני"])
+
+    def test_unmerged_span_has_no_parts(self):
+        t = "דוד שמעוני ויעל רוזן"
+        spans = [ps.HebrewSpan(0, 10, "PERSON", 0.95), ps.HebrewSpan(11, 20, "PERSON", 0.95)]
+        got = ps.HebrewNerModel._merge_gaps(t, spans)
+        self.assertEqual([s.parts for s in got], [[], []])
+
+
+# ---- find_propagated keeps every plain match (R15 minor) ----
+# A prefix match could take text from a plain match when the words of the value repeat:
+# "ודן דן דן" / "דן דן" gave (1, 6), while find_literal gives (4, 9).
+class FindPropagatedRepeatTests(unittest.TestCase):
+    def test_plain_matches_kept(self):
+        for t, v in (("ודן דן דן", "דן דן"), ("ואבי אבי אבי.", "אבי אבי")):
+            with self.subTest(t=t):
+                lit = list(ps.find_literal(t, v, True))
+                got = list(ps.find_propagated(t, v, True))
+                for m in lit:
+                    self.assertIn(m, got)
+                for a, b in got:
+                    self.assertEqual(t[a:b], v)
+                    self.assertTrue((a, b) in lit or not any(a < e and s < b for s, e in lit))
+        self.assertEqual(list(ps.find_propagated("ודן דן דן", "דן דן", True)), [(4, 9)])

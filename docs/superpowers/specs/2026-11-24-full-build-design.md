@@ -147,11 +147,15 @@ The builder added four steps after testing with the real model:
   spaCy span on Hebrew text that no Hebrew NER span covers. When a rule finding covers only a
   part of a Hebrew NER span (or of a propagated copy with Hebrew letters), the engine gives back
   the uncovered words as separate findings. The given-back pieces never overlap.
-- **Per-call merge cutoff:** the recognizer joins two same-type spans that one gap character
-  (space, `-`, maqaf, geresh) separates, but only when one of them scores under the score
-  threshold of the current analyze call. Two strong spans stay two names. The engine sets the
+- **Per-call merge cutoff:** the recognizer joins two spans that one gap character (space, `-`,
+  maqaf, geresh) separates, but only when one of them scores under the score threshold of the
+  current analyze call. Two strong spans stay two names. The two spans can have the same type
+  or different types. The joined span is `PERSON` if one part is `PERSON`. The engine sets the
   cutoff for each call in a context variable, so two threads with different thresholds do not
   mix.
+- **PERSON parts propagate:** each `PERSON` part of a joined span also propagates alone. Example:
+  `PERSON` "יוסי אברהמי" and a weak `ORGANIZATION` "מחברת אורנים" become one span. A later bare
+  "יוסי אברהמי" is still masked.
 - **Score:** the mean of the winning label's softmax value over the span's tokens. The existing
   score threshold (`engine.score_threshold`, the slider) applies, the same as for other findings.
 - **Threads:** `intra_op_num_threads = 1`. The test showed that one thread is fastest.

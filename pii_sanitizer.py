@@ -1770,7 +1770,12 @@ def find_propagated(text: str, value: str, case_insensitive: bool) -> Iterable[T
     post = r"(?!\w)" if value[-1:].isalnum() or value[-1:] == "_" else ""
     rx = re.compile(_HEBREW_PREFIX_START + re.escape(value) + post,
                     re.IGNORECASE if case_insensitive else 0)
-    return [(m.start(), m.end()) for m in rx.finditer(text)]
+    # Every find_literal match stays. A prefix match counts only where it does not overlap one:
+    # in "ודן דן דן" the prefix match "דן דן" at 1 would take text from the plain match at 4.
+    plain = list(find_literal(text, value, case_insensitive))
+    prefixed = [(m.start(), m.end()) for m in rx.finditer(text)]
+    return sorted(plain + [(a, b) for a, b in prefixed
+                           if not any(a < e and s < b for s, e in plain)])
 
 
 # A line is a log line when it starts with a timestamp, a syslog priority or a log level, holds a
@@ -2305,6 +2310,8 @@ class DetectionEngine:
         hebrew_on = self.hebrew_model is not None and bool(ecfg.get("hebrew_ner"))
         custom_names = {r.name for r in rs.rules} | {r.name + "_wordlist" for r in rs.rules}
         found: List[Finding] = []
+        # (text, score) of the PERSON parts of joined Hebrew spans; they propagate as PERSON
+        person_parts: List[Tuple[str, float]] = []
 
         log_skip = analyzer is not None and bool(ecfg.get("skip_ner_on_logs")) and looks_like_log(text)
         self.last_ner_skipped = log_skip
@@ -2329,6 +2336,9 @@ class DetectionEngine:
                 rname = (r.recognition_metadata or {}).get("recognizer_name", "")
                 if skip_ner and (rname in NER_RECOGNIZERS or rname == HEBREW_RECOGNIZER):
                     continue
+                if rname == HEBREW_RECOGNIZER:
+                    person_parts.extend((p, float(r.score)) for p in
+                                        (r.recognition_metadata or {}).get(HEBREW_PERSON_PARTS_KEY, ()))
                 if (hebrew_on and rname in NER_RECOGNIZERS
                         and _HEBREW_LETTER_RE.search(text, r.start, r.end)):
                     for a, b in _uncovered_hebrew_pieces(text, r.start, r.end, hebrew_spans):
@@ -2375,6 +2385,16 @@ class DetectionEngine:
                     values[k] = (f.text, f.entity, f.score)
                 elif f.score > prev[2]:
                     values[k] = (prev[0], prev[1], f.score)
+            # A PERSON part of a joined Hebrew span propagates alone too (HebrewNerModel._merge_gaps).
+            for p, score in person_parts:
+                if p.strip().casefold() in allow:
+                    continue
+                k = vault.key(p)
+                prev = values.get(k)
+                if prev is None:
+                    values[k] = (p, "PERSON", score)
+                elif score > prev[2]:
+                    values[k] = (prev[0], prev[1], score)
             extra: List[Finding] = []
             # Hebrew prefix letters (find_propagated) only with the Hebrew model on: the small
             # build and the setting off keep the plain literal match.
@@ -3812,6 +3832,8 @@ class HebrewSpan:
     end: int
     entity: str
     score: float
+    # (start, end) of each PERSON part that the gap merge joined into this span (_merge_gaps)
+    parts: List[Tuple[int, int]] = field(default_factory=list, compare=False)
 
 
 def _hebrew_groups(text: str) -> List[Tuple[int, int]]:
@@ -4004,7 +4026,10 @@ class HebrewNerModel:
         part (with a wanted set, only wanted parts choose, when there is one).
         Two spans that both score at or over the cutoff stay separate ("נועה גולן" + "ויעל רוזן",
         "משה לוי" + "בחיפה"): both pass the threshold, and each must propagate alone.
-        Score: the highest part score. Input spans do not overlap (_dedupe runs first)."""
+        Score: the highest part score. Input spans do not overlap (_dedupe runs first).
+        parts: the (start, end) of each PERSON part of a joined span. The engine propagates these
+        parts too: "יוסי אברהמי" + "מחברת אורנים" is one span, and a later bare "יוסי אברהמי"
+        must still be masked."""
         below = HEBREW_MERGE_CUTOFF.get()
         merged: List[HebrewSpan] = []
         for sp in sorted(spans, key=lambda x: (x.start, x.end)):
@@ -4012,6 +4037,13 @@ class HebrewNerModel:
             if (last is not None and sp.start - last.end == 1
                     and text[last.end] in HEBREW_SPAN_GAPS
                     and min(last.score, sp.score) < below):
+                if wanted is None or "PERSON" in wanted:
+                    # last.parts is empty only when last is one model span or a join of
+                    # non-PERSON spans (then its type is not PERSON)
+                    if not last.parts and last.entity == "PERSON":
+                        last.parts.append((last.start, last.end))
+                    if sp.entity == "PERSON":
+                        last.parts.append((sp.start, sp.end))
                 parts = [p for p in (last, sp) if wanted is None or p.entity in wanted] or [last, sp]
                 last.entity = ("PERSON" if any(p.entity == "PERSON" for p in parts)
                                else max(parts, key=lambda x: x.score).entity)
@@ -4046,6 +4078,7 @@ def load_hebrew_model(model_dir: Path) -> HebrewNerModel:
 
 
 HEBREW_RECOGNIZER = "HebrewNerRecognizer"
+HEBREW_PERSON_PARTS_KEY = "hebrew_person_parts"   # recognition_metadata: PERSON part texts
 
 if PRESIDIO_OK:
     class HebrewNerRecognizer(EntityRecognizer):
@@ -4066,10 +4099,13 @@ if PRESIDIO_OK:
             for sp in self.model.predict(text, wanted):
                 if sp.entity not in wanted:
                     continue
+                meta = {RecognizerResult.RECOGNIZER_NAME_KEY: self.name,
+                        RecognizerResult.RECOGNIZER_IDENTIFIER_KEY: self.id}
+                if sp.parts:  # DetectionEngine.analyze propagates these texts too
+                    meta[HEBREW_PERSON_PARTS_KEY] = [text[a:b] for a, b in sp.parts]
                 results.append(RecognizerResult(
                     entity_type=sp.entity, start=sp.start, end=sp.end, score=float(sp.score),
-                    recognition_metadata={RecognizerResult.RECOGNIZER_NAME_KEY: self.name,
-                                          RecognizerResult.RECOGNIZER_IDENTIFIER_KEY: self.id}))
+                    recognition_metadata=meta))
             return results
 
 
