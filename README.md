@@ -138,7 +138,7 @@ The full build is the small build with two additions:
 - **Bundled Tesseract.** The full build reads scanned PDF pages with no separate Tesseract
   install. The bundled Tesseract has Hebrew and English data.
 
-The full zip is approximately 750 MB. The small zip is approximately 490 MB. Both builds run
+The full zip is approximately 665 MB. The small zip is approximately 471 MB. Both builds run
 locally. The Hebrew model and Tesseract make no network calls.
 
 A full install updates only to the full zip of the new version. If a release has no full zip,
@@ -182,6 +182,11 @@ The GUI has five tabs:
 
 1. **Input & Review** — paste or load text, then click **Analyze PII & Sensitive Data**.
    Enable or disable each finding. Add manual rules for values the engine did not find.
+   **Group same values** (on by default) shows one row for each value, with a **Count** column
+   in place of **End**. **Start** shows the first copy. A change in a grouped row (enable,
+   entity type, token) applies to every copy of the value. A partly checked box means that only
+   some copies are enabled. Click a selected row again to go to the next copy in the text. To
+   change one copy only, clear **Group same values**.
 2. **Sanitize** — click **Generate Sanitized Prompt**, then copy the clean text into your LLM.
    A text that is too long for the LLM can go in parts:
    - Set **Split into parts of** (default 50,000 characters) and click **Split**. A cut falls

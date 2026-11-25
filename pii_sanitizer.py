@@ -235,6 +235,7 @@ DEFAULT_CONFIG: Dict = {
         "git_scan_last_repo": "",        # last folder used in Scan Git Repo
         "split_chars": 50000,            # part size for Split in the Sanitize tab
         "split_headers": True,           # each part starts with "--- Part i of n ---"
+        "group_values": True,            # review table: one row per value, with a Count column
     },
     "pdf": {
         "ocr_enabled": True,             # read scanned pages with Tesseract
@@ -5472,7 +5473,14 @@ if QT_OK:
             b_none = _button("Disable shown")
             b_all.clicked.connect(lambda: self._set_enabled_visible(True))
             b_none.clicked.connect(lambda: self._set_enabled_visible(False))
+            self.chk_group = QtWidgets.QCheckBox("Group same values")
+            self.chk_group.setToolTip("One row per value, with a Count column. Changes in a row apply "
+                                      "to every copy of the value. Clear it to change one copy only.")
+            self.chk_group.setChecked(bool(self.config["behavior"].get("group_values", True)))
+            self.chk_group.toggled.connect(self._on_group_toggled)
+            self._jump = (None, 0)   # (first finding index of the row, copy number) for click-to-next
             frow.addWidget(self.search, 1)
+            frow.addWidget(self.chk_group)
             frow.addWidget(self.type_filter)
             frow.addWidget(b_all)
             frow.addWidget(b_none)
@@ -5496,6 +5504,7 @@ if QT_OK:
             self.table.sortByColumn(C_START, Qt.SortOrder.AscendingOrder)
             self.table.itemChanged.connect(self._on_item_changed)
             self.table.itemSelectionChanged.connect(self._on_row_selected)
+            self.table.cellClicked.connect(self._on_row_clicked)
             self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.table.customContextMenuRequested.connect(self._table_menu)
             ll.addWidget(self.table, 1)
@@ -6075,17 +6084,43 @@ if QT_OK:
             self.lbl_counts.setText(msg)
             self.statusBar().showMessage(msg)
 
+        def _table_rows(self) -> List[List[int]]:
+            """Finding indices for each table row. Grouped: one row per value (the session-map key,
+            so "SRV-DC01" and "srv-dc01" share a row), in order of the first copy."""
+            if not self.chk_group.isChecked():
+                return [[i] for i in range(len(self.findings))]
+            groups: Dict[str, List[int]] = {}
+            for i, f in enumerate(self.findings):
+                groups.setdefault(self.vault.key(f.text), []).append(i)
+            return sorted(groups.values(), key=lambda idxs: min(self.findings[i].start for i in idxs))
+
+        def _on_group_toggled(self, on: bool):
+            self.config["behavior"]["group_values"] = bool(on)
+            self.config.save()
+            self._jump = (None, 0)
+            self.populate_table()
+
         def populate_table(self):
             self._updating = True
             self.table.setSortingEnabled(False)
-            self.table.setRowCount(len(self.findings))
+            rows = self._table_rows()
+            grouped = self.chk_group.isChecked()
+            self.table.horizontalHeaderItem(C_END).setText("Count" if grouped else "End")
+            self.table.setRowCount(len(rows))
             ents = sorted({f.entity for f in self.findings})
             color = {e: QtGui.QColor(ENTITY_COLORS[i % len(ENTITY_COLORS)]) for i, e in enumerate(ents)}
-            for row, f in enumerate(self.findings):
+            for row, idxs in enumerate(rows):
+                idxs = sorted(idxs, key=lambda i: self.findings[i].start)
+                f = self.findings[idxs[0]]
+                group = [self.findings[i] for i in idxs]
+                n_on = sum(1 for x in group if x.enabled)
+                state = (Qt.CheckState.Checked if n_on == len(group) else
+                         Qt.CheckState.Unchecked if n_on == 0 else Qt.CheckState.PartiallyChecked)
                 en = QtWidgets.QTableWidgetItem()
                 en.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-                en.setCheckState(Qt.CheckState.Checked if f.enabled else Qt.CheckState.Unchecked)
-                en.setData(Qt.ItemDataRole.UserRole, row)
+                en.setCheckState(state)
+                en.setData(Qt.ItemDataRole.UserRole, idxs[0])
+                en.setData(Qt.ItemDataRole.UserRole + 1, idxs)
                 txt = QtWidgets.QTableWidgetItem(f.text.replace("\n", "↵"))
                 txt.setFlags(txt.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 txt.setToolTip(f.text)
@@ -6100,18 +6135,19 @@ if QT_OK:
                     f2.setBold(True)
                     tok.setFont(f2)
                 items = [en, txt, ent, tok]
-                for val in (f.start, f.end):
+                for val in (f.start, len(group) if grouped else f.end):
                     it = QtWidgets.QTableWidgetItem()
                     it.setData(Qt.ItemDataRole.DisplayRole, val)
                     items.append(it)
                 sc = QtWidgets.QTableWidgetItem()
-                sc.setData(Qt.ItemDataRole.DisplayRole, round(f.score, 2))
-                src = QtWidgets.QTableWidgetItem(SOURCE_LABEL.get(f.source, f.source))
-                src.setToolTip(f.recognizer)
+                sc.setData(Qt.ItemDataRole.DisplayRole, round(max(x.score for x in group), 2))
+                sources = sorted({SOURCE_LABEL.get(x.source, x.source) for x in group})
+                src = QtWidgets.QTableWidgetItem(sources[0] if len(sources) == 1 else "Mixed")
+                src.setToolTip(", ".join(sources) if len(sources) > 1 else f.recognizer)
                 items += [sc, src]
                 for c in (C_START, C_END, C_SCORE, C_SRC):
                     items[c].setFlags(items[c].flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if not f.enabled:
+                if n_on == 0:
                     for it in items[1:]:
                         it.setForeground(QtGui.QColor("#9ca3af"))
                 for c, it in enumerate(items):
@@ -6130,8 +6166,17 @@ if QT_OK:
             self._update_counts()
 
         def _row_index(self, row: int) -> Optional[int]:
+            """Index of the row's first finding (all findings of a grouped row share the value)."""
             it = self.table.item(row, C_EN)
             return None if it is None else it.data(Qt.ItemDataRole.UserRole)
+
+        def _row_indices(self, row: int) -> List[int]:
+            """Indices of every finding in the row: one, or all copies of a grouped value."""
+            it = self.table.item(row, C_EN)
+            if it is None:
+                return []
+            idxs = it.data(Qt.ItemDataRole.UserRole + 1)
+            return list(idxs) if idxs else [it.data(Qt.ItemDataRole.UserRole)]
 
         def _update_counts(self):
             n = len(self.findings)
@@ -6156,7 +6201,8 @@ if QT_OK:
         def _set_enabled_visible(self, on: bool):
             for row in range(self.table.rowCount()):
                 if not self.table.isRowHidden(row):
-                    self.findings[self._row_index(row)].enabled = on
+                    for i in self._row_indices(row):
+                        self.findings[i].enabled = on
             self._refresh_after_edit()
 
         def _refresh_after_edit(self):
@@ -6176,9 +6222,14 @@ if QT_OK:
             key = self.vault.key(f.text)
             same = [x for x in self.findings if self.vault.key(x.text) == key]
             if col == C_EN:
-                f.enabled = item.checkState() == Qt.CheckState.Checked
+                # A partly checked group goes to checked: one click turns every copy on.
+                on = item.checkState() != Qt.CheckState.Unchecked
+                for i in self._row_indices(item.row()):
+                    self.findings[i].enabled = on
                 self._updating = True
-                color = QtGui.QColor("#9ca3af") if not f.enabled else self.palette().color(QtGui.QPalette.ColorRole.Text)
+                if item.checkState() == Qt.CheckState.PartiallyChecked:
+                    item.setCheckState(Qt.CheckState.Checked)
+                color = QtGui.QColor("#9ca3af") if not on else self.palette().color(QtGui.QPalette.ColorRole.Text)
                 for c in range(1, len(COLS)):
                     if c != C_ENT:
                         it = self.table.item(item.row(), c)
@@ -6223,13 +6274,34 @@ if QT_OK:
 
         def _selected_indices(self) -> List[int]:
             rows = sorted({i.row() for i in self.table.selectedIndexes()})
-            return [self._row_index(r) for r in rows if self._row_index(r) is not None]
+            return [i for r in rows for i in self._row_indices(r)]
 
         def _on_row_selected(self):
-            idxs = self._selected_indices()
-            if len(idxs) != 1 or self.analyzed_text is None or self.input.toPlainText() != self.analyzed_text:
+            rows = sorted({i.row() for i in self.table.selectedIndexes()})
+            if len(rows) != 1:
                 return
-            f = self.findings[idxs[0]]
+            idxs = self._row_indices(rows[0])
+            if idxs:
+                self._jump = (idxs[0], 0)
+                self._show_finding(idxs[0])
+
+        def _on_row_clicked(self, row: int, _col: int):
+            """A click on the selected row of a grouped value shows its next copy in the text."""
+            idxs = self._row_indices(row)
+            if len(idxs) < 2:
+                return
+            first, n = self._jump
+            if first != idxs[0]:
+                self._jump = (idxs[0], 0)      # the selection change already showed copy 1
+                return
+            n = (n + 1) % len(idxs)
+            self._jump = (first, n)
+            self._show_finding(idxs[n])
+
+        def _show_finding(self, idx: int):
+            if self.analyzed_text is None or self.input.toPlainText() != self.analyzed_text:
+                return
+            f = self.findings[idx]
             cur = self.input.textCursor()
             cur.setPosition(py_to_qt_index(self.analyzed_text, f.start))
             cur.setPosition(py_to_qt_index(self.analyzed_text, f.end), QtGui.QTextCursor.MoveMode.KeepAnchor)
