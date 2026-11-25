@@ -567,7 +567,7 @@ class FetchAssetsTests(unittest.TestCase):
     def test_notices_hold_gpl_texts_source_links_and_offer(self):
         text = fa.thirdparty_notices(["zlib1.dll", "libjbig-0.dll", "libiconv-2.dll"], "Apache")
         self.assertIn("https://www.cl.cam.ac.uk/~mgk25/jbigkit/download/jbigkit-2.1.tar.gz", text)
-        self.assertIn("https://ftp.gnu.org/gnu/libiconv/", text)
+        self.assertIn("https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz", text)
         self.assertIn("The source code of these components is available at the URLs above; on "
                       "request we provide it for at least three years.", text)
         # full texts, each once: GPL-2.0 for JBIG-KIT, LGPL-2.1 for libiconv
@@ -583,6 +583,31 @@ class FetchAssetsTests(unittest.TestCase):
         self.assertIn("GNU LESSER GENERAL PUBLIC LICENSE\n                       Version 3", text)
         self.assertIn("GNU GENERAL PUBLIC LICENSE\n                       Version 3", text)
 
+    def test_source_links_name_exact_versions(self):
+        # versions read from the version resources and strings of the DLLs in the pinned installer
+        self.assertEqual(fa.COPYLEFT_SOURCES["libiconv-2.dll"][0],
+                         "https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz")
+        self.assertEqual(fa.COPYLEFT_SOURCES["libintl-8.dll"][0],
+                         "https://ftp.gnu.org/gnu/gettext/gettext-1.0.tar.gz")
+        self.assertEqual(fa.COPYLEFT_SOURCES["libidn2-0.dll"][0],
+                         "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz")
+        self.assertEqual(fa.COPYLEFT_SOURCES["libunistring-5.dll"][0],
+                         "https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.gz")
+        for url, _ in fa.COPYLEFT_SOURCES.values():
+            self.assertTrue(url.endswith((".tar.gz", ".tar.xz")), url)
+
+    def test_gcc_runtime_ships_gpl3_and_exception_text(self):
+        text = fa.thirdparty_notices(["libgcc_s_seh-1.dll", "libstdc++-6.dll", "zlib1.dll"], "")
+        self.assertEqual(text.count("GCC RUNTIME LIBRARY EXCEPTION\n\nVersion 3.1, 31 March 2009"), 1)
+        self.assertEqual(text.count("GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007"), 1)
+        self.assertIn("libgcc_s_seh-1.dll, libstdc++-6.dll", text)
+        self.assertNotIn("source code of these components", text)  # the exception: no source duty
+
+    def test_gcc_runtime_and_lgpl3_share_one_gpl3_text(self):
+        text = fa.thirdparty_notices(["libstdc++-6.dll", "libidn2-0.dll"], "")
+        self.assertEqual(text.count("GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007"), 1)
+        self.assertEqual(text.count("GCC RUNTIME LIBRARY EXCEPTION\n\nVersion 3.1"), 1)
+
     def test_no_copyleft_section_without_copyleft_dlls(self):
         text = fa.thirdparty_notices(["zlib1.dll"], "")
         self.assertNotIn("source code of these components", text)
@@ -595,6 +620,10 @@ class FetchAssetsTests(unittest.TestCase):
             self.assertTrue(url.startswith("https://"))
             for f in files:
                 self.assertTrue((fa.LICENSES_DIR / f).is_file(), f)
+        gcc = [d for d, (_, _, _, duty) in fa.DLL_LICENSES.items() if duty == fa.GCC_DUTY]
+        self.assertEqual(sorted(gcc), ["libgcc_s_seh-1.dll", "libstdc++-6.dll"])
+        for f in fa.GCC_RUNTIME_TEXTS:
+            self.assertTrue((fa.LICENSES_DIR / f).is_file(), f)
         with mock.patch.dict(fa.COPYLEFT_SOURCES, clear=True):
             with self.assertRaises(fa.AssetError) as cm:
                 fa.thirdparty_notices(["libjbig-0.dll"], "")

@@ -68,7 +68,7 @@ LGPL_DUTY = ("LGPL: the license text and the library source must be available. T
 GPL_DUTY = ("GPL: the license text and the complete source must be available. The full license "
             "text, the source link and the source offer are at the end of this file.")
 GCC_DUTY = ("Covered by the GCC Runtime Library Exception 3.1: no source duty for programs "
-            "that use it.")
+            "that use it. The GPL-3.0 text and the exception text are at the end of this file.")
 DLL_LICENSES: Dict[str, Tuple[str, str, str, str]] = {
     "libtesseract-5.dll": ("Tesseract OCR", "Apache-2.0", "https://github.com/tesseract-ocr/tesseract", ""),
     "libleptonica-6.dll": ("Leptonica", "BSD-2-Clause", "http://www.leptonica.org/", ""),
@@ -117,7 +117,10 @@ DLL_LICENSES: Dict[str, Tuple[str, str, str, str]] = {
                             "https://www.mingw-w64.org/", ""),
 }
 
-# GPL and LGPL DLLs: (source URL, vendored license text files in packaging/licenses/).
+# GPL and LGPL DLLs: (source URL of the exact version, vendored license text files in
+# packaging/licenses/). The versions come from the version resources and embedded strings of the
+# DLLs in the pinned installer (libiconv 1.19, gettext 1.0, libidn2 2.3.8, libunistring 1.4.2);
+# update them when the installer pin changes.
 # The texts are the FSF texts (GPL-3.0 and LGPL-3.0 match gnu.org byte for byte; GPL-2.0 and
 # LGPL-2.1 are the Debian common-licenses copies with the current FSF address). LGPL-3.0 adds
 # permissions to GPL-3.0, so the GPL-3.0 text ships with it. Every DLL with a GPL or LGPL duty
@@ -126,12 +129,16 @@ LICENSES_DIR = Path(__file__).resolve().parent / "licenses"
 COPYLEFT_SOURCES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
     "libjbig-0.dll": ("https://www.cl.cam.ac.uk/~mgk25/jbigkit/download/jbigkit-2.1.tar.gz",
                       ("GPL-2.0.txt",)),
-    "libiconv-2.dll": ("https://ftp.gnu.org/gnu/libiconv/", ("LGPL-2.1.txt",)),
-    "libintl-8.dll": ("https://ftp.gnu.org/gnu/gettext/", ("LGPL-2.1.txt",)),
-    "libidn2-0.dll": ("https://ftp.gnu.org/gnu/libidn/", ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt")),
-    "libunistring-5.dll": ("https://ftp.gnu.org/gnu/libunistring/",
+    "libiconv-2.dll": ("https://ftp.gnu.org/gnu/libiconv/libiconv-1.19.tar.gz", ("LGPL-2.1.txt",)),
+    "libintl-8.dll": ("https://ftp.gnu.org/gnu/gettext/gettext-1.0.tar.gz", ("LGPL-2.1.txt",)),
+    "libidn2-0.dll": ("https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+                      ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt")),
+    "libunistring-5.dll": ("https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.gz",
                            ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt")),
 }
+# The GCC runtime DLLs (GCC_DUTY) ship with these texts. GCC-exception-3.1.txt is COPYING.RUNTIME
+# from the GCC source tree.
+GCC_RUNTIME_TEXTS = ("GPL-3.0.txt", "GCC-exception-3.1.txt")
 SOURCE_OFFER = ("The source code of these components is available at the URLs above; on request "
                 "we provide it for at least three years.")
 
@@ -378,19 +385,29 @@ def check_copyleft_sources() -> None:
 
 def copyleft_section(dlls: List[str]) -> List[str]:
     """Source links, the written source offer and the full license texts for the GPL and LGPL
-    DLLs in dlls. Empty when there are none."""
+    DLLs in dlls, and the GPL-3.0 and exception texts for the GCC runtime DLLs. Empty when
+    there are none."""
     check_copyleft_sources()
     present = sorted((d for d in dlls if d.lower() in COPYLEFT_SOURCES), key=str.lower)
-    if not present:
+    gcc = sorted((d for d in dlls if d.lower() in DLL_LICENSES
+                  and DLL_LICENSES[d.lower()][3] == GCC_DUTY), key=str.lower)
+    if not present and not gcc:
         return []
-    lines = ["", "GPL and LGPL components: source code", "------------------------------------"]
+    lines: List[str] = []
     texts: List[str] = []
-    for d in present:
-        project, spdx, _, _ = DLL_LICENSES[d.lower()]
-        url, files = COPYLEFT_SOURCES[d.lower()]
-        lines += [f"  {d} ({project}, {spdx})", f"    Source: {url}"]
-        texts += [f for f in files if f not in texts]
-    lines += ["", SOURCE_OFFER]
+    if present:
+        lines += ["", "GPL and LGPL components: source code", "------------------------------------"]
+        for d in present:
+            project, spdx, _, _ = DLL_LICENSES[d.lower()]
+            url, files = COPYLEFT_SOURCES[d.lower()]
+            lines += [f"  {d} ({project}, {spdx})", f"    Source: {url}"]
+            texts += [f for f in files if f not in texts]
+        lines += ["", SOURCE_OFFER]
+    if gcc:
+        lines += ["", "GCC runtime libraries", "---------------------",
+                  f"  {', '.join(gcc)}: GPL-3.0-or-later WITH GCC-exception-3.1. The GPL-3.0 "
+                  "text and the GCC Runtime Library Exception 3.1 text follow."]
+        texts += [f for f in GCC_RUNTIME_TEXTS if f not in texts]
     for name in texts:
         title = "License text: " + name[:-len(".txt")]
         lines += ["", title, "-" * len(title),
