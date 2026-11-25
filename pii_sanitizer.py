@@ -5945,18 +5945,19 @@ if QT_OK:
             self._run(auto_check_app_update, app_checked, self.config, self.secrets.get(),
                       error=lambda m: log.warning("Startup app update check failed: %s", m))
 
-            def checked(res):
-                if res is None:
-                    return
-                newer = [r for r in res if r["newer"]]
-                for r in res:
-                    log.info("%s: installed %s, latest %s", r["package"], r["installed"] or "(none)", r["latest"])
-                if newer:
-                    hint = presidio_update_hint(newer, is_frozen())
-                    log.warning("%s", hint)
-                    self.statusBar().showMessage(hint + " (see Log)")
-            self._run(check_package_updates, checked, self.config,
+            self._run(check_package_updates, self._on_presidio_checked, self.config,
                       error=lambda m: log.warning("Presidio update check failed: %s", m))
+
+        def _on_presidio_checked(self, res):
+            """A newer Presidio goes to the Log tab only, not the status bar: the app updates
+            Presidio with a tested release, so the user has nothing to do."""
+            if res is None:
+                return
+            for r in res:
+                log.info("%s: installed %s, latest %s", r["package"], r["installed"] or "(none)", r["latest"])
+            newer = [r for r in res if r["newer"]]
+            if newer:
+                log.info("%s", presidio_update_hint(newer, is_frozen()))
 
         def reload_rules(self):
             # A bound method, not a lambda: Qt drops the queued call when the window is deleted.

@@ -753,6 +753,14 @@ class MainWindowGuiTests(unittest.TestCase):
             self.win = ps.MainWindow(ps.AppConfig(self.tmp / "config.json"))
         self.addCleanup(self.win.deleteLater)
 
+    def test_presidio_update_goes_to_log_only(self):
+        newer = [{"package": "presidio-analyzer", "installed": "2.2.364", "latest": "9.9.9", "newer": True}]
+        self.win.statusBar().clearMessage()
+        with self.assertLogs(ps.log, level="INFO") as logs:
+            self.win._on_presidio_checked(newer)
+        self.assertEqual(self.win.statusBar().currentMessage(), "", "no status bar message")
+        self.assertTrue(any("9.9.9" in line for line in logs.output), logs.output)
+
     def test_analyze_progress_shows_in_label_and_status_bar(self):
         self.win._on_analyze_progress("Analyzing part 2 of 9 · about 3 min left")
         self.assertEqual(self.win.lbl_counts.text(), "Analyzing part 2 of 9 · about 3 min left")

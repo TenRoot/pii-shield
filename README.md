@@ -464,8 +464,9 @@ After the engine loads, PII Shield runs three checks in the background:
   SHA-256 in `version.json`. The script version backs up the current script and needs a
   restart. The Windows build installs the new release zip and restarts by itself.
 - **Presidio check.** PII Shield asks PyPI for the latest `presidio-analyzer` and
-  `presidio-anonymizer` versions. If a newer version exists, the status bar and the **Log** tab
-  show the `pip install -U` command to run. PII Shield never installs packages itself.
+  `presidio-anonymizer` versions. If a newer version exists, only the **Log** tab shows it, with
+  the `pip install -U` command for a script install. The Windows build gets a new Presidio only
+  with a tested app release. PII Shield never installs packages itself.
 
 To turn off the rules sync or the Presidio check, open **Settings → Behavior**. To turn off the
 app version check, clear **Also check for a new application version** in the **Update Rules**
