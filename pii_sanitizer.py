@@ -1980,6 +1980,61 @@ class SessionVault:
         return n
 
 
+# ---- Save review / Load review ----
+
+REVIEW_FORMAT = "pii-shield-review"
+REVIEW_FORMAT_VERSION = 1
+_FINDING_FIELDS = ("start", "end", "text", "entity", "score", "source", "recognizer", "enabled",
+                   "token", "token_edited")
+
+
+def review_to_dict(text: str, findings: Sequence["Finding"], vault: "SessionVault",
+                   threshold: float) -> Dict:
+    """The analyzed text, every finding with the user's choices, the session map and the score
+    limit, so the review can be loaded again without a new analysis. The result contains the
+    original text and values in plain form."""
+    return {"format": REVIEW_FORMAT, "format_version": REVIEW_FORMAT_VERSION, "app": APP_ID,
+            "app_version": __version__, "saved": _dt.datetime.now().isoformat(timespec="seconds"),
+            "threshold": float(threshold), "text": text,
+            "findings": [{k: getattr(f, k) for k in _FINDING_FIELDS} for f in findings],
+            "session_map": vault.export()}
+
+
+def review_from_dict(data: Dict) -> Tuple[str, List["Finding"], Dict, float]:
+    """(text, findings, session map, threshold) from review_to_dict output. Raises ValueError for
+    another kind of file, a newer format, or a finding that does not match the text."""
+    if not isinstance(data, dict) or data.get("format") != REVIEW_FORMAT:
+        raise ValueError("This is not a PII Shield review file.")
+    if int(data.get("format_version", 0)) > REVIEW_FORMAT_VERSION:
+        raise ValueError("This review file comes from a newer PII Shield. Update the app to load it.")
+    text = data.get("text")
+    if not isinstance(text, str):
+        raise ValueError("The review file has no text.")
+    findings: List[Finding] = []
+    for n, d in enumerate(data.get("findings") or [], 1):
+        f = Finding(int(d["start"]), int(d["end"]), str(d["text"]), str(d["entity"]), float(d["score"]),
+                    str(d["source"]), str(d.get("recognizer", "")), bool(d.get("enabled", True)),
+                    str(d.get("token", "")), bool(d.get("token_edited", False)))
+        if not (0 <= f.start < f.end <= len(text)) or text[f.start:f.end] != f.text:
+            raise ValueError(f"Finding {n} does not match the text of the review file.")
+        findings.append(f)
+    session = data.get("session_map") or {"entries": []}
+    return text, findings, session, float(data.get("threshold", 0.85))
+
+
+def write_review_file(path: Path, data: Dict) -> None:
+    """Write the review file in one step (a temporary file, then a rename), readable only by the
+    user where the OS supports it: it holds the original text in plain form."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
 # ===========================================================================
 # 5. Detection engine (Presidio + spaCy, hot-reloadable)
 # ===========================================================================
@@ -5417,6 +5472,12 @@ if QT_OK:
             self.btn_load = _button("Load File...")
             self.btn_load.clicked.connect(self.load_file)
             btn_load = self.btn_load
+            self.btn_save_review = _button("Save Review...", tip="Save the analyzed text, the findings "
+                                           "and your choices, to load them later without a new analysis")
+            self.btn_save_review.clicked.connect(self.save_review)
+            self.btn_save_review.setEnabled(False)
+            self.btn_load_review = _button("Load Review...", tip="Load a saved review: no new analysis")
+            self.btn_load_review.clicked.connect(self.load_review)
             self.btn_git_scan = _button("Scan Git Repo...", tip="Scan the commits this branch would push, plus "
                                         "uncommitted and untracked files, for PII and secrets")
             self.btn_git_scan.clicked.connect(self.open_git_scan)
@@ -5442,6 +5503,8 @@ if QT_OK:
             row.addWidget(self.btn_analyze)
             row.addWidget(self.thr)
             row.addWidget(btn_load)
+            row.addWidget(self.btn_save_review)
+            row.addWidget(self.btn_load_review)
             row.addWidget(self.btn_git_scan)
             row.addWidget(btn_clear)
             row.addWidget(self.btn_send)
@@ -6043,8 +6106,73 @@ if QT_OK:
 
         def _update_send_button(self):
             """On only when the input is exactly the text that was analyzed and reviewed."""
-            self.btn_send.setEnabled(self.analyzed_text is not None
-                                     and self.input.toPlainText() == self.analyzed_text)
+            ready = self.analyzed_text is not None and self.input.toPlainText() == self.analyzed_text
+            self.btn_send.setEnabled(ready)
+            self.btn_save_review.setEnabled(ready and bool(self.findings))
+
+        def save_review(self):
+            if not self.findings or self.analyzed_text is None:
+                return
+            if QtWidgets.QMessageBox.warning(
+                    self, "Save Review",
+                    "The review file contains the ORIGINAL text and all sensitive values in plain form.\n"
+                    "Store it only in a protected location and delete it when you are done.\n\nContinue?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            ) != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save Review", f"pii_review_{_dt.datetime.now():%Y%m%d_%H%M}.json", "JSON (*.json)")
+            if not path:
+                return
+            try:
+                write_review_file(Path(path), review_to_dict(self.analyzed_text, self.findings, self.vault,
+                                                             self.thr.value()))
+            except OSError as exc:
+                QtWidgets.QMessageBox.warning(self, "Save Review", str(exc))
+                return
+            self.statusBar().showMessage(f"Saved the review ({len(self.findings):,} findings) to "
+                                         f"{Path(path).name}", 6000)
+
+        def load_review(self):
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load Review", "", "JSON (*.json)")
+            if not path:
+                return
+            try:
+                text, findings, session, threshold = review_from_dict(json.loads(Path(path).read_text("utf-8")))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                QtWidgets.QMessageBox.warning(self, "Load Review", f"Cannot load this review file: {exc}")
+                return
+            try:   # check every token (session map and findings) before anything changes
+                for e in session.get("entries", []):
+                    if e.get("active", True):
+                        self.vault.check(e["value"], e["token"])
+                for f in findings:
+                    if f.enabled and f.token:
+                        self.vault.check(f.text, f.token)
+            except (TokenCollision, KeyError, TypeError) as exc:
+                QtWidgets.QMessageBox.warning(
+                    self, "Load Review", f"Cannot load this review into the current session: {exc}.\n"
+                    "Click Reset Session first, then load the review again.")
+                return
+            if (self.findings or self.input.toPlainText().strip()) and QtWidgets.QMessageBox.question(
+                    self, "Load Review", "Replace the current input and review?") \
+                    != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            self.vault.import_(session)
+            self.clear_review()
+            self.input.setPlainText(text)
+            self.thr.setValue(threshold)
+            self.findings = findings
+            self.analyzed_text = text
+            set_note(self.lbl_stale, "", "stale")
+            if len(findings) > 5000:
+                self._on_analyze_progress(f"Showing {len(findings):,} findings...")
+                QtWidgets.QApplication.processEvents()
+            self.populate_table()
+            self._highlight()
+            self._update_send_button()
+            self.refresh_map()
+            self.statusBar().showMessage(f"Loaded the review: {len(findings):,} findings, no new analysis", 6000)
 
         def analyze(self):
             if not self.btn_analyze.isEnabled():

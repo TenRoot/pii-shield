@@ -187,6 +187,14 @@ The GUI has five tabs:
    entity type, token) applies to every copy of the value. A partly checked box means that only
    some copies are enabled. Click a selected row again to go to the next copy in the text. To
    change one copy only, clear **Group same values**.
+
+   **Save Review...** stores the analyzed text, all findings with your choices (enabled, entity
+   type, token), the session map and the score limit in one JSON file. **Load Review...** puts
+   them back without a new analysis: use it for a large file that takes a long time to analyze.
+   Load checks the file first. It stops, and changes nothing, if a finding does not match the
+   text or a token is already used for another value in the current session (click **Reset
+   Session** first in that case). The review file contains the original text and all sensitive
+   values in plain form. Keep it in a protected location and delete it when you are done.
 2. **Sanitize** — click **Generate Sanitized Prompt**, then copy the clean text into your LLM.
    A text that is too long for the LLM can go in parts:
    - Set **Split into parts of** (default 50,000 characters) and click **Split**. A cut falls
