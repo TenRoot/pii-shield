@@ -5536,6 +5536,12 @@ if QT_OK:
             b_none = _button("Disable shown")
             b_all.clicked.connect(lambda: self._set_enabled_visible(True))
             b_none.clicked.connect(lambda: self._set_enabled_visible(False))
+            b_sel_on = _button("Enable selected", tip="Select rows with Ctrl+click or Shift+click. "
+                                                       "Space switches the selected rows on or off.")
+            b_sel_off = _button("Disable selected", tip="Select rows with Ctrl+click or Shift+click. "
+                                                         "Space switches the selected rows on or off.")
+            b_sel_on.clicked.connect(lambda: self._set_enabled_selected(True))
+            b_sel_off.clicked.connect(lambda: self._set_enabled_selected(False))
             self.chk_group = QtWidgets.QCheckBox("Group same values")
             self.chk_group.setToolTip("One row per value, with a Count column. Changes in a row apply "
                                       "to every copy of the value. Clear it to change one copy only.")
@@ -5547,11 +5553,17 @@ if QT_OK:
             frow.addWidget(self.type_filter)
             frow.addWidget(b_all)
             frow.addWidget(b_none)
+            frow.addWidget(b_sel_on)
+            frow.addWidget(b_sel_off)
             ll.addLayout(frow)
             self.table = QtWidgets.QTableWidget(0, len(COLS))
             self.table.setHorizontalHeaderLabels(COLS)
             self.table.verticalHeader().setVisible(False)
             self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
+            sc = QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Space), self.table)
+            sc.setContext(Qt.ShortcutContext.WidgetShortcut)
+            sc.activated.connect(self._toggle_selected)
             self.table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.DoubleClicked |
                                        QtWidgets.QAbstractItemView.EditTrigger.EditKeyPressed |
                                        QtWidgets.QAbstractItemView.EditTrigger.SelectedClicked)
@@ -6332,6 +6344,38 @@ if QT_OK:
                     for i in self._row_indices(row):
                         self.findings[i].enabled = on
             self._refresh_after_edit()
+
+        def _set_enabled_selected(self, on: bool):
+            """Enable or disable every finding in the selected rows (all copies of a grouped
+            value). The same rows stay selected after the table refresh."""
+            idxs = self._selected_indices()
+            if not idxs:
+                self.statusBar().showMessage("Select rows first (Ctrl+click or Shift+click)", 4000)
+                return
+            for i in idxs:
+                self.findings[i].enabled = on
+            firsts = {self._row_index(r) for r in {x.row() for x in self.table.selectedIndexes()}}
+            self._refresh_after_edit()
+            self._reselect(firsts)
+            self.statusBar().showMessage(f"{'Enabled' if on else 'Disabled'} {len(idxs):,} finding(s)", 4000)
+
+        def _toggle_selected(self):
+            """Space: all selected findings on -> off; otherwise -> on."""
+            idxs = self._selected_indices()
+            if idxs:
+                self._set_enabled_selected(not all(self.findings[i].enabled for i in idxs))
+
+        def _reselect(self, first_indices):
+            flags = QtCore.QItemSelectionModel.SelectionFlag
+            sm = self.table.selectionModel()
+            sm.blockSignals(True)          # no jump in the text for each reselected row
+            try:
+                for r in range(self.table.rowCount()):
+                    if self._row_index(r) in first_indices:
+                        sm.select(self.table.model().index(r, 0), flags.Select | flags.Rows)
+            finally:
+                sm.blockSignals(False)
+            self.table.viewport().update()
 
         def _refresh_after_edit(self):
             vpos = self.table.verticalScrollBar().value()

@@ -188,6 +188,11 @@ The GUI has five tabs:
    some copies are enabled. Click a selected row again to go to the next copy in the text. To
    change one copy only, clear **Group same values**.
 
+   To change several rows at once, select them with Ctrl+click or Shift+click, then click
+   **Enable selected** or **Disable selected**, or press Space to switch them on or off. A
+   grouped row changes every copy of its value. **Enable shown** and **Disable shown** change
+   all rows that the filter shows.
+
    **Save Review...** stores the analyzed text, all findings with your choices (enabled, entity
    type, token), the session map and the score limit in one JSON file. **Load Review...** puts
    them back without a new analysis: use it for a large file that takes a long time to analyze.
