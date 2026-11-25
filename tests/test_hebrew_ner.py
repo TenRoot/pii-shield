@@ -151,8 +151,9 @@ class HebrewNerCoreTests(unittest.TestCase):
         with mock.patch.object(ps.HebrewNerModel, "_merge_gaps", staticmethod(lambda t, sp: sp)):
             self.assertEqual(self.spans(model, text),
                              [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
-        # the gap merge then joins the two spans that one space separates (PERSON wins)
-        self.assertEqual(self.spans(model, text), [("דנה כהן", "PERSON"), ("לוי משה", "PERSON")])
+        # the gap merge joins only spans of the same type, so these two stay separate
+        self.assertEqual(self.spans(model, text),
+                         [("דנה כהן", "PERSON"), ("לוי", "PERSON"), ("משה", "ORGANIZATION")])
 
     def test_english_only_text_never_calls_session(self):
         model, sess = build({"John": "B-PER"})
@@ -284,8 +285,9 @@ class UnionMergeTests(unittest.TestCase):
 
 
 class GapMergeTests(unittest.TestCase):
-    """Spans split by one gap character (space, '-', maqaf, geresh) become one span, so the
-    engine threshold sees the whole name and cannot drop a weak half (fake spans)."""
+    """Same-type spans split by one gap character (space, '-', maqaf, geresh) become one span,
+    so the engine threshold sees the whole name and cannot drop a weak half. Spans of different
+    types stay separate (fake spans)."""
 
     def merged(self, text, spans):
         return [(text[s.start:s.end], s.entity, s.score)
@@ -300,21 +302,47 @@ class GapMergeTests(unittest.TestCase):
         spans = [self.span(t, "ז'אן-פייר", "PERSON", 0.52), self.span(t, "לוי", "PERSON", 0.92)]
         self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.92)])
 
-    def test_person_wins_over_other_type(self):
+    def test_cross_type_neighbours_stay_separate(self):
         t = "ואת ז'אן-פייר לוי."
         spans = [self.span(t, "ז'אן-פייר", "ORGANIZATION", 0.99), self.span(t, "לוי", "PERSON", 0.77)]
-        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.99)])
+        self.assertEqual(self.merged(t, spans), [("ז'אן-פייר", "ORGANIZATION", 0.99),
+                                                 ("לוי", "PERSON", 0.77)])
 
-    def test_without_person_higher_score_type_wins(self):
+    def test_person_and_city_stay_separate(self):
+        t = "דנה כהן נפגשה עם משה לוי בחיפה."
+        spans = [self.span(t, "דנה כהן", "PERSON", 0.99), self.span(t, "משה לוי", "PERSON", 0.98),
+                 self.span(t, "בחיפה", "LOCATION", 0.97)]
+        self.assertEqual(self.merged(t, spans), [("דנה כהן", "PERSON", 0.99),
+                                                 ("משה לוי", "PERSON", 0.98),
+                                                 ("בחיפה", "LOCATION", 0.97)])
+
+    def test_same_type_without_person_joins(self):
         t = "בבית אבי לוי."
-        spans = [self.span(t, "בבית", "ORGANIZATION", 0.6), self.span(t, "אבי לוי", "LOCATION", 0.8)]
+        spans = [self.span(t, "בבית", "LOCATION", 0.6), self.span(t, "אבי לוי", "LOCATION", 0.8)]
         self.assertEqual(self.merged(t, spans), [("בבית אבי לוי", "LOCATION", 0.8)])
+
+    def test_two_strong_same_type_spans_stay_separate(self):
+        # coordinated names: both halves pass the threshold, so each is a whole name
+        t = "נועה גולן ויעל רוזן טסו."
+        spans = [self.span(t, "נועה גולן", "PERSON", 1.0), self.span(t, "ויעל רוזן", "PERSON", 0.9)]
+        self.assertGreaterEqual(0.9, ps.HEBREW_MERGE_BELOW)
+        self.assertEqual(self.merged(t, spans), [("נועה גולן", "PERSON", 1.0),
+                                                 ("ויעל רוזן", "PERSON", 0.9)])
+
+    def test_weak_half_at_cutoff_edge(self):
+        t = "ואת ז'אן-פייר לוי."
+        below = ps.HEBREW_MERGE_BELOW - 0.01
+        spans = [self.span(t, "ז'אן-פייר", "PERSON", below), self.span(t, "לוי", "PERSON", 0.99)]
+        self.assertEqual(len(self.merged(t, spans)), 1)
+        spans = [self.span(t, "ז'אן-פייר", "PERSON", ps.HEBREW_MERGE_BELOW),
+                 self.span(t, "לוי", "PERSON", 0.99)]
+        self.assertEqual(len(self.merged(t, spans)), 2)
 
     def test_each_gap_character(self):
         for gap in (" ", "-", "\u05be", "'", "\u05f3"):
             with self.subTest(gap=repr(gap)):
                 t = "את אבו" + gap + "סאלח."
-                spans = [self.span(t, "אבו", "LOCATION", 0.6), self.span(t, "סאלח", "PERSON", 0.9)]
+                spans = [self.span(t, "אבו", "PERSON", 0.6), self.span(t, "סאלח", "PERSON", 0.9)]
                 self.assertEqual(self.merged(t, spans), [("אבו" + gap + "סאלח", "PERSON", 0.9)])
 
     def test_other_single_characters_do_not_join(self):
@@ -336,9 +364,16 @@ class GapMergeTests(unittest.TestCase):
 
     def test_chain_becomes_one_span(self):
         t = "את מוחמד אבו-סאלח היום"
-        spans = [self.span(t, "מוחמד", "PERSON", 0.7), self.span(t, "אבו", "LOCATION", 0.5),
-                 self.span(t, "סאלח", "ORGANIZATION", 0.95)]
+        spans = [self.span(t, "מוחמד", "PERSON", 0.7), self.span(t, "אבו", "PERSON", 0.5),
+                 self.span(t, "סאלח", "PERSON", 0.95)]
         self.assertEqual(self.merged(t, spans), [("מוחמד אבו-סאלח", "PERSON", 0.95)])
+
+    def test_other_type_breaks_chain(self):
+        t = "את מוחמד אבו-סאלח היום"
+        spans = [self.span(t, "מוחמד", "PERSON", 0.7), self.span(t, "אבו", "LOCATION", 0.5),
+                 self.span(t, "סאלח", "PERSON", 0.95)]
+        self.assertEqual(self.merged(t, spans), [("מוחמד", "PERSON", 0.7), ("אבו", "LOCATION", 0.5),
+                                                 ("סאלח", "PERSON", 0.95)])
 
     def test_input_order_does_not_matter(self):
         t = "ואת ז'אן-פייר לוי."
@@ -848,10 +883,11 @@ class HebrewEngineVariantTests(unittest.TestCase):
         loader.assert_not_called()
 
 
-# ---- spaCy findings on Hebrew text (task 4b, change A) ----
+# ---- spaCy findings on Hebrew text (task 4b, change A; fix round R8) ----
 # The English spaCy model reads Hebrew as junk and gives long spans such as LOCATION
-# "אברהמי מחברת אורנים". When the Hebrew model is on, such spaCy findings are dropped before
-# overlap resolution, so they cannot beat a Hebrew PERSON span.
+# "אברהמי מחברת אורנים". When the Hebrew model is on, such a spaCy finding is cut before overlap
+# resolution: only its Hebrew words that no Hebrew NER finding overlaps stay, so it cannot beat a
+# Hebrew PERSON span, and a surname that the Hebrew model misses stays masked.
 SPACY_HE_TEXT = "יוסי אברהמי מחברת אורנים met John Smith, ת.ז. 123456782"
 
 
@@ -906,8 +942,81 @@ class SpacyOnHebrewTests(unittest.TestCase):
     def test_no_drop_when_setting_off(self):
         self.assertIn(("אברהמי מחברת אורנים", "presidio"), self.run_engine(setting=False))
 
+    # R8: a spaCy finding on Hebrew text keeps the Hebrew words that no Hebrew NER finding
+    # overlaps (the Hebrew model misses some surnames in long text; spaCy junk can cover them).
+    def run_with(self, text, specs):
+        eng = self.engine
+
+        def res(sub, entity, rname, score):
+            s = text.index(sub)
+            return ps.RecognizerResult(entity_type=entity, start=s, end=s + len(sub), score=score,
+                                       recognition_metadata={"recognizer_name": rname})
+        results = [res(*spec) for spec in specs]
+        with mock.patch.object(eng.analyzer, "analyze", return_value=results):
+            fs = eng.analyze(text, [], ps.SessionVault())
+        return sorted((f.text, f.source) for f in fs)
+
+    def test_spacy_keeps_uncovered_hebrew_words(self):
+        got = self.run_engine()
+        self.assertIn(("מחברת אורנים", "presidio"), got)
+        self.assertIn(("יוסי אברהמי", "hebrew_ner"), got)
+
+    def test_spacy_keeps_missed_surname(self):
+        t = "משפחת אזולאי עברה מנתניה לרחובות."
+        got = self.run_with(t, [("משפחת אזולאי עברה מנתניה לרחובות", "ORGANIZATION", "SpacyRecognizer", 0.85),
+                                ("מנתניה", "LOCATION", ps.HEBREW_RECOGNIZER, 1.0)])
+        self.assertEqual(got, [("לרחובות", "presidio"), ("מנתניה", "hebrew_ner"),
+                               ("משפחת אזולאי עברה", "presidio")])
+
+    def test_spacy_fully_covered_gives_nothing(self):
+        t = "העובד יוסי אברהמי התקשר."
+        got = self.run_with(t, [("יוסי אברהמי התקשר", "PERSON", "SpacyRecognizer", 0.85),
+                                ("יוסי אברהמי", "PERSON", ps.HEBREW_RECOGNIZER, 1.0),
+                                ("התקשר", "LOCATION", ps.HEBREW_RECOGNIZER, 0.9)])
+        self.assertEqual(got, [("התקשר", "hebrew_ner"), ("יוסי אברהמי", "hebrew_ner")])
+
+    def test_partly_overlapped_word_counts_as_covered(self):
+        t = "העובד יוסי אברהמי התקשר."
+        got = self.run_with(t, [("ברהמי התקשר", "PERSON", "SpacyRecognizer", 0.85),
+                                ("יוסי אברהמי", "PERSON", ps.HEBREW_RECOGNIZER, 1.0)])
+        self.assertEqual(got, [("התקשר", "presidio"), ("יוסי אברהמי", "hebrew_ner")])
+
+    def test_piece_without_hebrew_letter_dropped(self):
+        t = "אורנים met John today"
+        got = self.run_with(t, [("אורנים met", "PERSON", "SpacyRecognizer", 0.85),
+                                ("אורנים", "ORGANIZATION", ps.HEBREW_RECOGNIZER, 1.0)])
+        self.assertEqual(got, [("אורנים", "hebrew_ner")])
+
     def test_no_drop_when_model_not_loaded(self):
         self.assertIn(("אברהמי מחברת אורנים", "presidio"), self.run_engine(model_loaded=False))
+
+
+# ---- a propagated copy of a Hebrew name keeps the words that no kept finding covers ----
+# After R7 (no cross-type gap merge), "ז'אן-פייר לוי" can come back as ORGANIZATION "ז'אן-פייר"
+# 0.99 + PERSON "לוי" 0.77 (under the threshold). The propagated copy of the full name from
+# another occurrence loses to the ORGANIZATION (priority), and "לוי" stayed unmasked.
+class PropagatedCoverageTests(unittest.TestCase):
+    T = "פגשתי את ז'אן-פייר לוי היום."
+
+    def f(self, sub, entity, source, score=0.99):
+        s = self.T.index(sub)
+        return ps.Finding(s, s + len(sub), sub, entity, score, source, source)
+
+    def got(self, findings):
+        return [(f.text, f.entity, f.source) for f in ps.resolve_keep_hebrew_coverage(findings, self.T)]
+
+    def test_dropped_hebrew_copy_keeps_uncovered_words(self):
+        got = self.got([self.f("ז'אן-פייר", "ORGANIZATION", "hebrew_ner"),
+                        self.f("ז'אן-פייר לוי", "PERSON", "propagated")])
+        self.assertEqual(got, [("ז'אן-פייר", "ORGANIZATION", "hebrew_ner"),
+                               ("לוי", "PERSON", "propagated")])
+
+    def test_dropped_latin_copy_gives_nothing(self):
+        t = "host fs01.corp.local and corp.local"
+        s = t.index("fs01")
+        fs = [ps.Finding(s, s + 4, "fs01", "HOSTNAME", 0.9, "presidio", "x"),
+              ps.Finding(s, s + 15, "fs01.corp.local", "HOSTNAME", 0.9, "propagated", "p")]
+        self.assertEqual([f.text for f in ps.resolve_keep_hebrew_coverage(fs, t)], ["fs01"])
 
 
 # ---- a Hebrew NER span that loses to a rule finding keeps its other words (task 4b) ----
@@ -1110,7 +1219,8 @@ class RealModelTests(unittest.TestCase):
         print(f"\nF1={f1:.3f} P={precision:.3f} R={recall:.3f} tp={tp} fp={fp} fn={fn}")
         print("missed:", missed)
         print("extra:", extra)
-        self.assertGreaterEqual(f1, 0.85)
+        # 0.930 with the pinned model; 0.862 when the gap merge joined across types (R7)
+        self.assertGreaterEqual(f1, 0.90)
 
     # A bare family name after "משפחת" comes back as ORGANIZATION "משפחת אזולאי". The text is
     # still masked, only the type differs. Known model limit, measured with the pinned model.
@@ -1242,7 +1352,9 @@ E2E_GUARD_SEEDS = (43, 90)
 # spaCy findings on Hebrew text). 54, 77: "לוי" of "ז'אן-פייר לוי" (two spans with one space
 # between, the weak half under the threshold; fixed by the gap merge). 59: "אבי" of "אבי לוי"
 # on e9a72f4; with the gap merge alone, PERSON "רחוב הרצל 12 תל אביב נועה גולן ויעל רוזן" lost
-# to the street rule (fixed by resolve_keep_hebrew_coverage).
+# to the street rule (fixed by resolve_keep_hebrew_coverage). Fix round R7 (no cross-type gap
+# merge) broke 54, 77 and 59 again: ORGANIZATION "ז'אן-פייר" / LOCATION "בבית" beat the
+# propagated copy of the full name; fixed by the coverage give-back for propagated copies.
 E2E_LEAK_SEEDS = (0, 54, 77, 59)
 
 
@@ -1257,6 +1369,79 @@ def shuffled_long_text(items, seed):
 def shuffle_persons(items):
     names = {e[0] for i in items for e in i["entities"] if e[1] == "PER"}
     return sorted(names | set(SHUFFLE_EXTRA_PERSONS))
+
+
+# ---- varied long text (fix round R8): names reappear in other sentences, not verbatim ----
+VARIED_TEMPLATES = [
+    "אתמול בערב {n} התקשר לשאול על החשבונית.",
+    "המסמך נשלח אל {n} לחתימה.",
+    "לדברי {n}, הפגישה תתקיים ביום רביעי.",
+    "{n} אישר את ההזמנה בטלפון.",
+    "בישיבה השתתפו גם {n} ונציג מהספק.",
+    "ההעברה בוצעה על שם {n} בשבוע שעבר.",
+    "צריך לעדכן את {n} לגבי השינוי בלוח הזמנים.",
+    "הכרטיס נפתח לבקשת {n}.",
+]
+VARIED_SURNAME_TEMPLATES = ["פנינו אל מר {n} בנושא החוזה.", "גם משפחת {n} הגיעה לאירוע."]
+VARIED_EN = ["Please send the invoice to John Carter before Friday.",
+             "Sarah Mitchell reviewed the firewall logs on Monday."]
+VARIED_EN_NO_ENTITY = ["The backup job finished without errors last night.",
+                       "Restart the service after you apply the patch."]
+# Seeds of varied_long_text that left part of a person unmasked before fix round R8 ("אזולאי"
+# in all four, with "גולן", "ישראלי", "לוי" or "וקנין") and pass after it.
+VARIED_SEEDS = (3, 12, 15, 20)
+
+
+def varied_long_text(items, seed):
+    """(text, persons, no_entity). The fixture sentences and the two review sentences, 12
+    template sentences with a random person (30% only the surname), and 4 English lines,
+    shuffled. persons: (name, start, end) of every person occurrence; no_entity: (kind, start,
+    end) of the sentences with no entity ("noent-he" or "noent-en")."""
+    rng = random.Random(seed)
+    sents = [(i["text"], [e[0] for e in i["entities"] if e[1] == "PER"],
+              "he" if i["entities"] else "noent-he") for i in items]
+    sents += zip(SHUFFLE_EXTRA, (["אבי לוי"], ["מוחמד אבו-סאלח", "ז'אן-פייר לוי"]), ("he", "he"))
+    pool = sorted({n for _, ns, _ in sents for n in ns})
+    parts = []
+    for s, ns, kind in sents:
+        occ = [(n, m.start()) for n in ns
+               for m in re.finditer(r"(?<!\w)" + re.escape(n) + r"(?!\w)", s)]
+        parts.append((s, occ, kind))
+    for _ in range(12):
+        n = rng.choice(pool)
+        if rng.random() < 0.3:
+            n = re.split(r"\s", n)[-1]
+            t = rng.choice(VARIED_SURNAME_TEMPLATES)
+        else:
+            t = rng.choice(VARIED_TEMPLATES)
+        s = t.format(n=n)
+        parts.append((s, [(n, s.index(n))], "he"))
+    parts += [(s, [], "en") for s in VARIED_EN] + [(s, [], "noent-en") for s in VARIED_EN_NO_ENTITY]
+    rng.shuffle(parts)
+    sep = rng.choice([" ", "\n"])
+    text, persons, no_entity = "", [], []
+    for k, (s, occ, kind) in enumerate(parts):
+        if k:
+            text += sep
+        base = len(text)
+        text += s
+        persons += [(n, base + o, base + o + len(n)) for n, o in occ]
+        if kind.startswith("noent"):
+            no_entity.append((kind, base, base + len(s)))
+    return text, persons, no_entity
+
+
+def varied_problems(engine, text, persons):
+    """Name parts longer than 1 char (whole words) of a person that no applied finding covers,
+    and multi-word person surfaces left in the output."""
+    vault = ps.SessionVault()
+    out, enabled = ps.sanitize(text, engine.analyze(text, [], vault), vault)
+    problems = [("in-output", n) for n in sorted({n for n, _, _ in persons}) if " " in n and n in out]
+    for name, s, e in persons:
+        for p_start, p_end in _name_parts(text, s, e):
+            if not any(f.start <= p_start and p_end <= f.end for f in enabled):
+                problems.append(("part-unmasked", name, text[p_start:p_end], p_start))
+    return problems
 
 
 def _occurrences(text, name):
@@ -1335,6 +1520,15 @@ class ShuffledLongTextTests(unittest.TestCase):
     def test_every_fixture_person_fully_masked_end_to_end(self):
         text = shuffled_long_text(self.items, SHUFFLE_SEED)
         self.assertEqual(engine_problems(self.engine, text, shuffle_persons(self.items)), [])
+
+    def test_varied_text_every_person_fully_masked(self):
+        # R8: names reappear in other sentences; the Hebrew model misses "אזולאי" there and a
+        # cut spaCy finding keeps it masked
+        for seed in VARIED_SEEDS:
+            with self.subTest(seed=seed):
+                text, persons, _ = varied_long_text(self.items, seed)
+                self.assertIn("אזולאי", {n for n, _, _ in persons})
+                self.assertEqual(varied_problems(self.engine, text, persons), [])
 
     def test_every_fixture_person_fully_masked_on_leak_seeds(self):
         # No fixture person surface stays in the output, and every part of a name longer than
