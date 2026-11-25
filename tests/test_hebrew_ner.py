@@ -1722,3 +1722,63 @@ class HebrewPrefixPropagationTests(unittest.TestCase):
         s = text.index("לדנה") + 1
         self.assertIn((s, s + len("דנה כהן"), "propagated"),
                       [(f.start, f.end, f.source) for f in fs])
+
+
+# ---- wanted entity types reach the union (final review M-1) ----
+# The union of overlapping spans takes the type of its best part. When that type is not wanted
+# (organizations off, or LOCATION/PERSON deselected), the recognizer used to drop the whole union,
+# also the wanted part. predict now gets the wanted types and types the union by a wanted part.
+class WantedTypesUnionTests(unittest.TestCase):
+    T = "פגשתי את ז'אן-פייר לוי היום."
+
+    def raw(self, a_entity, b_entity):
+        t = self.T
+        z, l = t.index("ז'אן"), t.index("לוי")
+        return [ps.HebrewSpan(z, l, a_entity, 0.95), ps.HebrewSpan(z + 5, l + 3, b_entity, 0.9)]
+
+    def test_dedupe_types_by_wanted_part(self):
+        spans = self.raw("ORGANIZATION", "PERSON")
+        got = ps.HebrewNerModel._dedupe(spans, {"PERSON", "LOCATION"})
+        self.assertEqual([(s.entity, s.score) for s in got], [("PERSON", 0.95)])
+        spans = self.raw("LOCATION", "PERSON")
+        got = ps.HebrewNerModel._dedupe(spans, {"LOCATION", "ORGANIZATION"})
+        self.assertEqual([s.entity for s in got], ["LOCATION"])
+        # without a wanted set: as before
+        self.assertEqual([s.entity for s in ps.HebrewNerModel._dedupe(self.raw("LOCATION", "PERSON"))],
+                         ["PERSON"])
+
+    def test_predict_drops_only_unions_without_a_wanted_part(self):
+        model, _ = build({})
+        raw = self.raw("ORGANIZATION", "ORGANIZATION")
+        with mock.patch.object(model, "_predict_group", return_value=raw):
+            self.assertEqual(model.predict(self.T, {"PERSON"}), [])
+            self.assertEqual(len(model.predict(self.T, {"ORGANIZATION"})), 1)
+
+    def engine_hebrew(self, raw, **kw):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        eng, _ = make_engine(tmp, orgs=kw.pop("orgs", True))
+        ents = kw.pop("drop", None)
+        if ents:
+            eng.config["engine"]["builtin_entities"] = [
+                e for e in eng.config["engine"]["builtin_entities"] if e != ents]
+        with mock.patch.object(eng.hebrew_model, "_predict_group", return_value=raw):
+            fs = eng.analyze(self.T, [], ps.SessionVault())
+        return [(f.text, f.entity) for f in fs if f.source == "hebrew_ner"]
+
+    def test_engine_organizations_off_keeps_location_union(self):
+        got = self.engine_hebrew(self.raw("ORGANIZATION", "LOCATION"), orgs=False)
+        self.assertEqual(got, [("ז'אן-פייר לוי", "LOCATION")])
+
+    def test_engine_location_deselected_keeps_organization_union(self):
+        got = self.engine_hebrew(self.raw("LOCATION", "ORGANIZATION"), drop="LOCATION")
+        self.assertEqual(got, [("ז'אן-פייר לוי", "ORGANIZATION")])
+
+    def test_recognizer_person_not_requested_keeps_location_union(self):
+        # the bundled rules hold PERSON, so the engine always asks for PERSON; the recognizer
+        # still must not lose the LOCATION part when a caller leaves PERSON out
+        rec = ps.HebrewNerRecognizer(build({})[0])
+        with mock.patch.object(rec.model, "_predict_group", return_value=self.raw("LOCATION", "PERSON")):
+            res = rec.analyze(self.T, ["LOCATION", "ORGANIZATION"])
+        self.assertEqual([(self.T[r.start:r.end], r.entity_type) for r in res],
+                         [("ז'אן-פייר לוי", "LOCATION")])

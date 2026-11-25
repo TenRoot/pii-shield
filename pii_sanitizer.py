@@ -3829,11 +3829,16 @@ class HebrewNerModel:
         self.overlap = min(overlap, max_tokens - 1)
         self._input_names = {i.name for i in session.get_inputs()}
 
-    def predict(self, text: str) -> List[HebrewSpan]:
+    def predict(self, text: str, wanted: Optional[Iterable[str]] = None) -> List[HebrewSpan]:
+        """Entity spans in text. wanted: the entity types the caller keeps (None: all). A union
+        of overlapping spans takes a wanted type when one of its parts has it, so that an
+        unwanted best part cannot drop the wanted part with it."""
+        wanted = None if wanted is None else set(wanted)
         spans: List[HebrewSpan] = []
         for g_start, g_end in _hebrew_groups(text):
             spans.extend(self._predict_group(text[g_start:g_end], g_start))
-        return self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans)))
+        out = self._merge_gaps(text, self._dedupe(_extend_to_words(text, spans), wanted))
+        return out if wanted is None else [sp for sp in out if sp.entity in wanted]
 
     def _predict_group(self, group: str, base: int) -> List[HebrewSpan]:
         enc = self.tokenizer.encode(group, add_special_tokens=False)
@@ -3895,14 +3900,15 @@ class HebrewNerModel:
         return spans
 
     @staticmethod
-    def _dedupe(spans: List[HebrewSpan]) -> List[HebrewSpan]:
+    def _dedupe(spans: List[HebrewSpan], wanted: Optional[Set[str]] = None) -> List[HebrewSpan]:
         """Merge every group of overlapping spans, of any type, into one union span.
 
         Overlaps come from the 50-token window overlap (one window saw less context and gave
         other labels) and from word extension (PERSON "ז'" grows to "ז'אן" and touches an
         ORGANIZATION "אן-פייר"). resolve_overlaps keeps only one of two overlapping findings, so
         a partial overlap would leave part of a name unmasked. The union never loses coverage.
-        Type: PERSON if any part is PERSON, else the type of the highest-scoring part.
+        Type: PERSON if any part is PERSON, else the type of the highest-scoring part. With a
+        wanted set, only the parts of a wanted type choose the type (when there is one).
         Score: the highest part score."""
         merged: List[HebrewSpan] = []
         group: List[HebrewSpan] = []
@@ -3911,7 +3917,9 @@ class HebrewNerModel:
             if not group:
                 return
             best = max(group, key=lambda x: x.score)
-            entity = "PERSON" if any(g.entity == "PERSON" for g in group) else best.entity
+            typed = [g for g in group if wanted is None or g.entity in wanted] or group
+            entity = ("PERSON" if any(g.entity == "PERSON" for g in typed)
+                      else max(typed, key=lambda x: x.score).entity)
             merged.append(HebrewSpan(min(g.start for g in group), max(g.end for g in group),
                                      entity, best.score))
             group.clear()
@@ -3994,7 +4002,7 @@ if PRESIDIO_OK:
         def analyze(self, text, entities, nlp_artifacts=None):
             wanted = set(entities or self.supported_entities) & set(self.supported_entities)
             results = []
-            for sp in self.model.predict(text):
+            for sp in self.model.predict(text, wanted):
                 if sp.entity not in wanted:
                     continue
                 results.append(RecognizerResult(
