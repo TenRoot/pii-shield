@@ -140,7 +140,55 @@ COPYLEFT_SOURCES: Dict[str, Tuple[str, Tuple[str, ...]]] = {
 # from the GCC source tree.
 GCC_RUNTIME_TEXTS = ("GPL-3.0.txt", "GCC-exception-3.1.txt")
 SOURCE_OFFER = ("The source code of these components is available at the URLs above; on request "
-                "we provide it for at least three years.")
+                "we provide it for at least three years. To ask for it, open an issue at "
+                "https://github.com/TenRoot/pii-shield/issues.")
+
+# License texts (files in packaging/licenses/) of every DLL in DLL_LICENSES. The permissive
+# licenses (BSD, MIT, curl, libpng, IJG, ...) require the copyright notice and the license text
+# in a binary distribution, so every text goes into THIRD_PARTY_NOTICES.txt, each text once.
+# packaging/licenses/SOURCES.txt names the source and version of each file. A copied DLL
+# without an entry here, or with a missing file, stops the script (check_dll_texts).
+APACHE_TEXT = "Apache-2.0.txt"
+DLL_TEXTS: Dict[str, Tuple[str, ...]] = {
+    "libtesseract-5.dll": (APACHE_TEXT,),
+    "libleptonica-6.dll": ("leptonica.txt",),
+    "libarchive-13.dll": ("libarchive.txt",),
+    "libcurl-4.dll": ("curl.txt",),
+    "libssh2-1.dll": ("libssh2.txt",),
+    "libpsl-5.dll": ("libpsl.txt",),
+    "libidn2-0.dll": ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt"),
+    "libunistring-5.dll": ("LGPL-3.0.txt", "GPL-3.0.txt", "GPL-2.0.txt"),
+    "libiconv-2.dll": ("LGPL-2.1.txt",),
+    "libintl-8.dll": ("LGPL-2.1.txt",),
+    "libbrotlicommon.dll": ("brotli.txt",),
+    "libbrotlidec.dll": ("brotli.txt",),
+    "libzstd.dll": ("zstd.txt",),
+    "zlib1.dll": ("zlib.txt",),
+    "libdeflate.dll": ("libdeflate.txt",),
+    "liblzma-5.dll": ("xz.txt", "xz-0BSD.txt"),
+    "liblz4.dll": ("lz4.txt",),
+    "libbz2-1.dll": ("bzip2.txt",),
+    "libb2-1.dll": ("libb2-CC0-1.0.txt",),
+    "libexpat-1.dll": ("expat.txt",),
+    "libtiff-6.dll": ("libtiff.txt",),
+    "libjpeg-8.dll": ("libjpeg-turbo.txt", "libjpeg-turbo-README.ijg.txt"),
+    "libjbig-0.dll": ("GPL-2.0.txt",),
+    "liblerc.dll": (APACHE_TEXT,),
+    "libpng16-16.dll": ("libpng.txt",),
+    "libopenjp2-7.dll": ("openjpeg.txt",),
+    "libgif-7.dll": ("giflib.txt",),
+    "libwebp-7.dll": ("libwebp.txt",),
+    "libwebpmux-3.dll": ("libwebp.txt",),
+    "libsharpyuv-0.dll": ("libwebp.txt",),
+    "libgcc_s_seh-1.dll": GCC_RUNTIME_TEXTS,
+    "libstdc++-6.dll": GCC_RUNTIME_TEXTS,
+    "libwinpthread-1.dll": ("winpthreads.txt",),
+}
+# Copyright lines for texts that do not hold one (see SOURCES.txt).
+DLL_COPYRIGHT: Dict[str, str] = {
+    "liblerc.dll": "Copyright 2015-2026 Esri",
+    "libgif-7.dll": "Copyright (C) Eric S. Raymond and the GIFLIB authors",
+}
 
 TIMEOUT = 60
 CHUNK = 1 << 20
@@ -198,7 +246,7 @@ def model_license_text() -> str:
     return (
         "DictaBERT NER model files\n"
         "=========================\n"
-        "Model: dicta-il/dictabert-ner\n"
+        "Model: dicta-il/dictabert-ner, https://huggingface.co/dicta-il/dictabert-ner\n"
         "Author: Dicta (Dicta - The Israel Center for Text Analysis)\n"
         f"ONNX conversion: {MODEL_REPO}, revision {MODEL_REVISION}\n"
         "License: Creative Commons Attribution 4.0 International (CC BY 4.0)\n"
@@ -322,11 +370,40 @@ def needed_dlls(folder: Path, exe: str = "tesseract.exe") -> List[str]:
 
 
 def check_dll_licenses(dlls: Iterable[str]) -> None:
+    dlls = list(dlls)
     missing = sorted(d for d in dlls if d.lower() not in DLL_LICENSES)
     if missing:
         raise AssetError("DLL not in the license table: " + ", ".join(missing) +
                          ". Add each one to DLL_LICENSES in packaging/fetch_full_assets.py "
                          "with its upstream project and license.")
+    check_dll_texts(dlls)
+
+
+def check_dll_texts(dlls: Iterable[str]) -> None:
+    """Every DLL needs its license text files in packaging/licenses/."""
+    bad = sorted(d for d in dlls if not DLL_TEXTS.get(d.lower())
+                 or not all((LICENSES_DIR / f).is_file() for f in DLL_TEXTS[d.lower()]))
+    if bad:
+        raise AssetError("DLL without a license text file: " + ", ".join(bad) +
+                         ". Add its license text to packaging/licenses/ (record the source in "
+                         "SOURCES.txt) and map it in DLL_TEXTS in packaging/fetch_full_assets.py.")
+
+
+def license_texts_section(users: Dict[str, List[str]]) -> List[str]:
+    """The full text of each file in users (file name -> components that use it), each once,
+    in the order of users."""
+    lines: List[str] = []
+    for name, who in users.items():
+        title = "License text: " + name[:-len(".txt")]
+        lines += ["", title, "-" * len(title), "Used by: " + ", ".join(who) + ".", "",
+                  (LICENSES_DIR / name).read_text(encoding="utf-8").strip()]
+    return lines
+
+
+def _use(users: Dict[str, List[str]], files: Iterable[str], who: str) -> None:
+    for f in files:
+        if who not in users.setdefault(f, []):
+            users[f].append(who)
 
 
 def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool = True) -> str:
@@ -343,25 +420,27 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         "",
         "onnxruntime",
         "  License: MIT, https://github.com/microsoft/onnxruntime/blob/main/LICENSE",
+        "  Copyright (c) Microsoft Corporation. The license text is at the end of this file.",
         "",
         "tokenizers (Hugging Face)",
         "  License: Apache License 2.0, https://github.com/huggingface/tokenizers",
+        "  Copyright: the tokenizers authors (Anthony Moi, Nicolas Patry, Hugging Face, Inc.)",
+        "  and contributors. The license text is at the end of this file.",
     ]
+    users: Dict[str, List[str]] = {}
+    _use(users, ["onnxruntime.txt"], "onnxruntime")
+    _use(users, [APACHE_TEXT], "tokenizers")
     if not tesseract:
-        return "\n".join(lines + [""])
+        return "\n".join(lines + license_texts_section(users) + [""])
     check_dll_licenses(dlls)
     copyleft = copyleft_section(dlls)
-    where = ["  of its upstream project, given below as an SPDX identifier. The full license text",
-             "  and copyright notices are at the project URL."]
-    if copyleft:
-        where = ["  of its upstream project, given below as an SPDX identifier. The copyright notices",
-                 "  are at the project URL. The full license texts of the GPL and LGPL libraries and",
-                 "  of the GCC runtime libraries are at the end of this file. The full license texts",
-                 "  of the other libraries are at the project URL."]
+    _use(users, [APACHE_TEXT], "Tesseract OCR")
+    _use(users, [APACHE_TEXT], "tessdata_best")
     lines += [
         "",
         "Tesseract OCR (UB Mannheim Windows build %s)" % TESSERACT_VERSION,
         "  License: Apache License 2.0, https://www.apache.org/licenses/LICENSE-2.0",
+        "  Copyright: Hewlett-Packard Company, Google Inc. and the Tesseract contributors.",
         "  Source: https://github.com/tesseract-ocr/tesseract",
         "",
         "tessdata_best (heb, eng, osd trained data)",
@@ -370,14 +449,25 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         "",
         "Libraries copied from the Tesseract installer (folder tesseract/)",
         "  The installer has no notice file for each library. Each library keeps the license",
-    ] + where
+        "  of its upstream project, given below as an SPDX identifier. The full license texts,",
+        "  with the copyright notices, are at the end of this file.",
+    ]
     for d in sorted(dlls, key=str.lower):
         project, spdx, url, duty = DLL_LICENSES[d.lower()]
+        texts = DLL_TEXTS[d.lower()]
         lines += ["", f"  {d}", f"    Project: {project}", f"    License: {spdx}", f"    URL: {url}"]
+        if d.lower() in DLL_COPYRIGHT:
+            lines.append(f"    {DLL_COPYRIGHT[d.lower()]}")
+        lines.append("    License text: " + ", ".join(t[:-len(".txt")] for t in texts))
         if duty:
             lines.append(f"    Note: {duty}")
-    lines += ["", "Tesseract license text", "----------------------", tesseract_license.strip()]
+        _use(users, texts, d)
+    # The installer's doc/LICENSE is the Apache-2.0 text; print it only if it differs.
+    if tesseract_license.split() != (LICENSES_DIR / APACHE_TEXT).read_text(encoding="utf-8").split():
+        lines += ["", "Tesseract license text (doc/LICENSE in the installer)",
+                  "-----------------------------------------------------", tesseract_license.strip()]
     lines += copyleft
+    lines += ["", "License texts", "============="] + license_texts_section(users)
     return "\n".join(lines + [""])
 
 
@@ -390,9 +480,9 @@ def check_copyleft_sources() -> None:
 
 
 def copyleft_section(dlls: List[str]) -> List[str]:
-    """Source links, the written source offer and the full license texts for the GPL and LGPL
-    DLLs in dlls, and the GPL-3.0 and exception texts for the GCC runtime DLLs. Empty when
-    there are none."""
+    """Source links and the written source offer for the GPL and LGPL DLLs in dlls, and a note
+    for the GCC runtime DLLs. Empty when there are none. The license texts are in the license
+    texts section (DLL_TEXTS)."""
     check_copyleft_sources()
     present = sorted((d for d in dlls if d.lower() in COPYLEFT_SOURCES), key=str.lower)
     gcc = sorted((d for d in dlls if d.lower() in DLL_LICENSES
@@ -400,29 +490,25 @@ def copyleft_section(dlls: List[str]) -> List[str]:
     if not present and not gcc:
         return []
     lines: List[str] = []
-    texts: List[str] = []
     if present:
         lines += ["", "GPL and LGPL components: source code", "------------------------------------"]
         for d in present:
             project, spdx, _, _ = DLL_LICENSES[d.lower()]
             url, files = COPYLEFT_SOURCES[d.lower()]
             lines += [f"  {d} ({project}, {spdx})", f"    Source: {url}"]
-            texts += [f for f in files if f not in texts]
         lines += ["", SOURCE_OFFER]
     if gcc:
         lines += ["", "GCC runtime libraries", "---------------------",
                   f"  {', '.join(gcc)}: GPL-3.0-or-later WITH GCC-exception-3.1. The GPL-3.0 "
-                  "text and the GCC Runtime Library Exception 3.1 text follow."]
-        texts += [f for f in GCC_RUNTIME_TEXTS if f not in texts]
-    for name in texts:
-        title = "License text: " + name[:-len(".txt")]
-        lines += ["", title, "-" * len(title),
-                  (LICENSES_DIR / name).read_text(encoding="utf-8").strip()]
+                  "text and the GCC Runtime Library Exception 3.1 text are at the end of this "
+                  "file."]
     return lines
 
 
 def fetch_tesseract(dest: Path, downloader: Downloader = http_download) -> Path:
     out = dest / "tesseract"
+    if out.exists():  # old files (a DLL of an earlier installer) must not ship
+        shutil.rmtree(out)
     tessdata = out / "tessdata"
     tessdata.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="pii-tess-"))
@@ -440,7 +526,10 @@ def fetch_tesseract(dest: Path, downloader: Downloader = http_download) -> Path:
         for name in dlls:
             shutil.copy2(unpacked / name, out / name)
         licence = unpacked / "doc" / "LICENSE"
-        licence_text = licence.read_text(encoding="utf-8", errors="replace") if licence.is_file() else ""
+        if not licence.is_file():
+            raise AssetError("doc/LICENSE: the Tesseract installer holds no license file. "
+                             "Check the installer pin.")
+        licence_text = licence.read_text(encoding="utf-8", errors="replace")
         (out / "LICENSE").write_text(licence_text, encoding="utf-8")
         osd = unpacked / "tessdata" / "osd.traineddata"
         if osd.is_file():

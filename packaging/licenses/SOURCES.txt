@@ -1,0 +1,49 @@
+Sources of the license texts in this folder
+===========================================
+
+The Tesseract installer (UB Mannheim build 5.5.3.20260724) is built with MSYS2 MINGW64
+packages (the DLLs hold "Built by MSYS2 project" strings). Each text below is copied unchanged
+from the MSYS2 package of the version in the DLL (share/licenses/<package>/), or, when the
+package holds no license file, from the upstream release of that version. A version that the
+DLL does not show is the newest MSYS2 package before the installer date (2026-07-24).
+Retrieved 2026-11-25.
+
+File                          Used for                                Source
+Apache-2.0.txt                Tesseract OCR, tessdata_best,           doc/LICENSE in the pinned Tesseract installer
+                              libtesseract-5.dll, libLerc.dll,        (same text as https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-tesseract-ocr-5.5.3-1-any.pkg.tar.zst,
+                                                                      tessdata_best LICENSE at commit e12c65a9, tokenizers v0.23.3 LICENSE and
+                                                                      share/licenses/lerc/LICENSE in mingw-w64-x86_64-lerc-4.1.1-1, except
+                                                                      white space, line breaks and the appendix)
+                              tokenizers
+leptonica.txt                 libleptonica-6.dll                      https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-leptonica-1.87.0-1-any.pkg.tar.zst
+libarchive.txt                libarchive-13.dll (3.8.8)               https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libarchive-3.8.8-2-any.pkg.tar.zst
+curl.txt                      libcurl-4.dll (8.21.0)                  https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-curl-8.21.0-2-any.pkg.tar.zst
+libssh2.txt                   libssh2-1.dll (1.11.1)                  https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libssh2-1.11.1-2-any.pkg.tar.zst
+libpsl.txt                    libpsl-5.dll                            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libpsl-0.21.5-3-any.pkg.tar.zst
+brotli.txt                    libbrotlicommon.dll, libbrotlidec.dll   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-brotli-1.2.0-1-any.pkg.tar.zst
+zstd.txt                      libzstd.dll (1.5.7)                     https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-zstd-1.5.7-2-any.pkg.tar.zst
+zlib.txt                      zlib1.dll (1.3.2)                       https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-zlib-1.3.2-2-any.pkg.tar.zst
+libdeflate.txt                libdeflate.dll                          https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libdeflate-1.25-1-any.pkg.tar.zst
+xz.txt, xz-0BSD.txt           liblzma-5.dll (5.8.3)                   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-xz-5.8.3-1-any.pkg.tar.zst (COPYING, COPYING.0BSD)
+lz4.txt                       liblz4.dll (1.10.0)                     https://raw.githubusercontent.com/lz4/lz4/v1.10.0/lib/LICENSE
+                                                                      (the MSYS2 package has no license file)
+bzip2.txt                     libbz2-1.dll                            https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-bzip2-1.0.8-3-any.pkg.tar.zst
+libb2-CC0-1.0.txt             libb2-1.dll                             https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libb2-0.98.1-3-any.pkg.tar.zst
+expat.txt                     libexpat-1.dll (2.8.2)                  https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-expat-2.8.2-1-any.pkg.tar.zst
+libtiff.txt                   libtiff-6.dll (4.7.2)                   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libtiff-4.7.2-1-any.pkg.tar.zst (LICENSE.md)
+libjpeg-turbo.txt,            libjpeg-8.dll (3.2.0)                   https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libjpeg-turbo-3.2.0-1-any.pkg.tar.zst
+libjpeg-turbo-README.ijg.txt                                          (LICENSE.md, README.ijg)
+(LERC copyright line: Licensing section of README.md at tag v4.1.1 of https://github.com/Esri/lerc)
+libpng.txt                    libpng16-16.dll (1.6.58)                https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libpng-1.6.58-1-any.pkg.tar.zst
+openjpeg.txt                  libopenjp2-7.dll (2.5.4)                https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-openjpeg2-2.5.4-2-any.pkg.tar.zst
+giflib.txt                    libgif-7.dll                            COPYING in https://sourceforge.net/projects/giflib/files/giflib-6.x/giflib-6.1.3.tar.gz
+                                                                      (the MSYS2 package giflib-6.1.3-1 has no license file; copyright line:
+                                                                      SPDX-FileCopyrightText in the giflib 6.1.3 source)
+libwebp.txt                   libwebp-7.dll, libwebpmux-3.dll,        https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libwebp-1.6.0-1-any.pkg.tar.zst
+                              libsharpyuv-0.dll
+winpthreads.txt               libwinpthread-1.dll                     https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-libwinpthread-14.0.0.r220.gd999af622-1-any.pkg.tar.zst
+onnxruntime.txt               onnxruntime                             onnxruntime/LICENSE in the onnxruntime 1.32.0 wheel (requirements-full.txt)
+
+GPL-2.0.txt, GPL-3.0.txt, LGPL-2.1.txt, LGPL-3.0.txt and GCC-exception-3.1.txt are the FSF texts
+(see COPYLEFT_SOURCES in packaging/fetch_full_assets.py). They cover libjbig-0.dll, libiconv-2.dll,
+libintl-8.dll, libidn2-0.dll, libunistring-5.dll, libgcc_s_seh-1.dll and libstdc++-6.dll.

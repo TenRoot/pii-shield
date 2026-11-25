@@ -648,12 +648,64 @@ class FetchAssetsTests(unittest.TestCase):
             text = fa.thirdparty_notices(dlls, "")
             start = text.index("Libraries copied from the Tesseract installer")
             return " ".join(text[start:text.index("\n\n", start)].split())
-        plain = header(["zlib1.dll"])
-        self.assertIn("at the project URL", plain)
-        self.assertNotIn("end of this file", plain)
-        for dlls in (["zlib1.dll", "libjbig-0.dll"], ["libgcc_s_seh-1.dll"]):
+        # every library's text is in the file now (final review I-2)
+        for dlls in (["zlib1.dll"], ["zlib1.dll", "libjbig-0.dll"], ["libgcc_s_seh-1.dll"]):
             with self.subTest(dlls=dlls):
                 self.assertIn("at the end of this file", header(dlls))
+
+    def test_every_dll_has_vendored_utf8_license_text(self):
+        # final review I-2: the permissive licenses need their text in the binary distribution
+        self.assertEqual(set(fa.DLL_TEXTS), set(fa.DLL_LICENSES))
+        for dll, files in fa.DLL_TEXTS.items():
+            self.assertTrue(files, dll)
+            for f in files:
+                with self.subTest(dll=dll, file=f):
+                    self.assertTrue((fa.LICENSES_DIR / f).read_text(encoding="utf-8").strip())
+        for f in ("onnxruntime.txt", fa.APACHE_TEXT):
+            (fa.LICENSES_DIR / f).read_text(encoding="utf-8")
+        sources = (fa.LICENSES_DIR / "SOURCES.txt").read_text(encoding="utf-8")
+        used = {f for files in fa.DLL_TEXTS.values() for f in files} | {"onnxruntime.txt"}
+        for f in used:
+            self.assertIn(f.split(".")[0], sources, f)
+
+    def test_all_dll_texts_each_once(self):
+        dlls = list(fa.DLL_LICENSES)
+        text = fa.thirdparty_notices(dlls, (fa.LICENSES_DIR / fa.APACHE_TEXT).read_text(encoding="utf-8"))
+        for f in sorted({f for files in fa.DLL_TEXTS.values() for f in files} |
+                        {"onnxruntime.txt", fa.APACHE_TEXT}):
+            with self.subTest(file=f):
+                self.assertEqual(text.count("\nLicense text: " + f[:-4] + "\n"), 1)
+                body = (fa.LICENSES_DIR / f).read_text(encoding="utf-8").strip()
+                self.assertEqual(text.count(body), 1)
+        # the installer's Apache text equals the vendored one, so it is not printed again
+        self.assertNotIn("doc/LICENSE in the installer", text)
+        for needle in ("Copyright (c) Microsoft Corporation", "Copyright 2015-2026 Esri",
+                       "Eric S. Raymond", "Daniel Stenberg", "Copyright (c) 2010, Google Inc.",
+                       "Independent JPEG Group", "Jean-loup Gailly",
+                       "https://github.com/TenRoot/pii-shield/issues"):
+            self.assertIn(needle, text)
+
+    def test_copied_dll_without_text_fails(self):
+        with mock.patch.dict(fa.DLL_TEXTS, {"zlib1.dll": ()}):
+            with self.assertRaises(fa.AssetError) as cm:
+                fa.check_dll_licenses(["zlib1.dll"])
+        self.assertIn("zlib1.dll", str(cm.exception))
+        with mock.patch.dict(fa.DLL_TEXTS, {"zlib1.dll": ("no-such-file.txt",)}):
+            with self.assertRaises(fa.AssetError):
+                fa.check_dll_licenses(["zlib1.dll"])
+
+    def test_source_offer_names_contact(self):
+        self.assertIn("https://github.com/TenRoot/pii-shield/issues", fa.SOURCE_OFFER)
+
+    def test_model_license_names_model_url(self):
+        self.assertIn("https://huggingface.co/dicta-il/dictabert-ner", fa.model_license_text())
+
+    def test_model_only_notices_hold_runtime_texts(self):
+        fa.write_model_only_notices(self.tmp)
+        text = (self.tmp / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
+        self.assertIn("Copyright (c) Microsoft Corporation", text)
+        self.assertEqual(text.count("Apache License\n                           Version 2.0"), 1)
+        self.assertIn("Used by: tokenizers.", text)
 
     def test_no_copyleft_section_without_copyleft_dlls(self):
         text = fa.thirdparty_notices(["zlib1.dll"], "")
@@ -811,6 +863,45 @@ class FetchAssetsTests(unittest.TestCase):
                 fa.fetch_tesseract(self.tmp / "out", lambda url, dest: dest.write_bytes(b"setup"))
         self.assertIn("libnew-9.dll", str(cm.exception))
         self.assertFalse((self.tmp / "out" / "tesseract" / "libnew-9.dll").exists())
+
+    def fake_tesseract(self, licence=True):
+        small = [("heb.traineddata", hashlib.sha256(b"h").hexdigest(), 1),
+                 ("eng.traineddata", hashlib.sha256(b"e").hexdigest(), 1),
+                 ("osd.traineddata", hashlib.sha256(b"o").hexdigest(), 1)]
+        blobs = {"heb.traineddata": b"h", "eng.traineddata": b"e", "osd.traineddata": b"o",
+                 "tesseract-setup.exe": b"setup"}
+
+        def dl(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(blobs[Path(url).name if "tessdata" in url else "tesseract-setup.exe"])
+
+        def unpack(installer, target):
+            (target / "doc").mkdir(parents=True)
+            (target / "tesseract.exe").write_bytes(make_pe(["zlib1.dll"]))
+            (target / "zlib1.dll").write_bytes(make_pe([]))
+            if licence:
+                (target / "doc" / "LICENSE").write_text("Apache License", encoding="utf-8")
+
+        with mock.patch.object(fa, "TESSDATA_FILES", small), \
+             mock.patch.object(fa, "TESSERACT_INSTALLER_SHA256", hashlib.sha256(b"setup").hexdigest()), \
+             mock.patch.object(fa, "TESSERACT_INSTALLER_SIZE", 5), \
+             mock.patch.object(fa, "extract_installer", unpack):
+            return fa.fetch_tesseract(self.tmp / "out", dl)
+
+    def test_tesseract_output_folder_emptied_first(self):
+        # final review M-4: a DLL of an earlier run must not ship
+        stale = self.tmp / "out" / "tesseract" / "libold-1.dll"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"old")
+        out = self.fake_tesseract()
+        self.assertFalse(stale.exists())
+        self.assertTrue((out / "zlib1.dll").is_file())
+
+    def test_missing_tesseract_license_fails(self):
+        # final review M-3
+        with self.assertRaises(fa.AssetError) as cm:
+            self.fake_tesseract(licence=False)
+        self.assertIn("doc/LICENSE", str(cm.exception))
 
     def test_tesseract_path_with_fake_installer(self):
         """Windows path with a fake unpacker and fake downloads (the real run is CI-only)."""
