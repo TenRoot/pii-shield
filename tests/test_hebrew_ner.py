@@ -349,17 +349,17 @@ class GapMergeTests(unittest.TestCase):
         for gap in (",", ".", "\n", "/", ":"):
             with self.subTest(gap=repr(gap)):
                 t = "את דנה" + gap + "כהן."
-                spans = [self.span(t, "דנה", "PERSON", 0.9), self.span(t, "כהן", "PERSON", 0.9)]
+                spans = [self.span(t, "דנה", "PERSON", 0.6), self.span(t, "כהן", "PERSON", 0.9)]
                 self.assertEqual(len(self.merged(t, spans)), 2)
 
     def test_two_character_gap_does_not_join(self):
         t = "את דנה, כהן."
-        spans = [self.span(t, "דנה", "PERSON", 0.9), self.span(t, "כהן", "LOCATION", 0.9)]
+        spans = [self.span(t, "דנה", "PERSON", 0.6), self.span(t, "כהן", "PERSON", 0.9)]
         self.assertEqual(len(self.merged(t, spans)), 2)
 
     def test_touching_spans_do_not_join(self):
         t = "אבגדהו"
-        spans = [ps.HebrewSpan(0, 3, "PERSON", 0.9), ps.HebrewSpan(3, 6, "LOCATION", 0.9)]
+        spans = [ps.HebrewSpan(0, 3, "PERSON", 0.6), ps.HebrewSpan(3, 6, "PERSON", 0.9)]
         self.assertEqual(len(self.merged(t, spans)), 2)
 
     def test_chain_becomes_one_span(self):
@@ -379,6 +379,18 @@ class GapMergeTests(unittest.TestCase):
         t = "ואת ז'אן-פייר לוי."
         spans = [self.span(t, "לוי", "PERSON", 0.92), self.span(t, "ז'אן-פייר", "PERSON", 0.52)]
         self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.92)])
+
+    def test_cutoff_follows_call_threshold(self):
+        # at threshold 0.9 a 0.87 half would be dropped, so it must join its 0.95 neighbour
+        t = "ואת ז'אן-פייר לוי."
+        spans = [self.span(t, "ז'אן-פייר", "PERSON", 0.95), self.span(t, "לוי", "PERSON", 0.87)]
+        self.assertEqual(len(self.merged(t, spans)), 2)
+        token = ps.HEBREW_MERGE_CUTOFF.set(0.9)
+        try:
+            self.assertEqual(self.merged(t, spans), [("ז'אן-פייר לוי", "PERSON", 0.95)])
+        finally:
+            ps.HEBREW_MERGE_CUTOFF.reset(token)
+        self.assertEqual(len(self.merged(t, spans)), 2)
 
     def test_predict_runs_gap_merge(self):
         text = "ואת ז'אן-פייר לוי."
@@ -607,6 +619,18 @@ class FetchAssetsTests(unittest.TestCase):
         text = fa.thirdparty_notices(["libstdc++-6.dll", "libidn2-0.dll"], "")
         self.assertEqual(text.count("GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007"), 1)
         self.assertEqual(text.count("GCC RUNTIME LIBRARY EXCEPTION\n\nVersion 3.1"), 1)
+
+    def test_library_header_says_where_license_texts_are(self):
+        def header(dlls):
+            text = fa.thirdparty_notices(dlls, "")
+            start = text.index("Libraries copied from the Tesseract installer")
+            return " ".join(text[start:text.index("\n\n", start)].split())
+        plain = header(["zlib1.dll"])
+        self.assertIn("at the project URL", plain)
+        self.assertNotIn("end of this file", plain)
+        for dlls in (["zlib1.dll", "libjbig-0.dll"], ["libgcc_s_seh-1.dll"]):
+            with self.subTest(dlls=dlls):
+                self.assertIn("at the end of this file", header(dlls))
 
     def test_no_copyleft_section_without_copyleft_dlls(self):
         text = fa.thirdparty_notices(["zlib1.dll"], "")
@@ -865,6 +889,19 @@ class HebrewEngineTests(unittest.TestCase):
         fs = self.engine.analyze(HE_TEXT, [], ps.SessionVault(), skip_ner=True)
         self.assertFalse([f for f in fs if f.source == "hebrew_ner"])
 
+    def test_merge_cutoff_follows_analyze_threshold(self):
+        text = "פגשתי את ז'אן-פייר לוי היום."
+        raw = [ps.HebrewSpan(text.index("ז'אן"), text.index(" לוי"), "PERSON", 0.95),
+               ps.HebrewSpan(text.index("לוי"), text.index("לוי") + 3, "PERSON", 0.87)]
+
+        def hebrew(threshold):
+            with mock.patch.object(self.engine.hebrew_model, "_predict_group", return_value=raw):
+                fs = self.engine.analyze(text, [], ps.SessionVault(), threshold=threshold)
+            return sorted(f.text for f in fs if f.source == "hebrew_ner")
+        self.assertEqual(hebrew(0.9), ["ז'אן-פייר לוי"])
+        self.assertEqual(hebrew(0.85), ["ז'אן-פייר", "לוי"])
+        self.assertEqual(ps.HEBREW_MERGE_CUTOFF.get(), ps.HEBREW_MERGE_BELOW)
+
     def test_recognizer_filters_requested_entities(self):
         rec = ps.HebrewNerRecognizer(fake_model())
         res = rec.analyze(HE_TEXT, ["LOCATION"])
@@ -1010,11 +1047,50 @@ class SpacyOnHebrewTests(unittest.TestCase):
                                 ("יוסי אברהמי", "PERSON", ps.HEBREW_RECOGNIZER, 1.0)])
         self.assertEqual(got, [("התקשר", "presidio"), ("יוסי אברהמי", "hebrew_ner")])
 
-    def test_piece_without_hebrew_letter_dropped(self):
+    def test_piece_without_hebrew_letter_kept(self):
         t = "אורנים met John today"
         got = self.run_with(t, [("אורנים met", "PERSON", "SpacyRecognizer", 0.85),
                                 ("אורנים", "ORGANIZATION", ps.HEBREW_RECOGNIZER, 1.0)])
-        self.assertEqual(got, [("אורנים", "hebrew_ner")])
+        self.assertEqual(got, [("met", "presidio"), ("אורנים", "hebrew_ner")])
+
+    def sanitized(self, text, specs):
+        eng = self.engine
+        results = []
+        for sub, entity, rname, score, nth in specs:
+            s = -1
+            for _ in range(nth + 1):
+                s = text.index(sub, s + 1)
+            results.append(ps.RecognizerResult(entity_type=entity, start=s, end=s + len(sub),
+                                               score=score,
+                                               recognition_metadata={"recognizer_name": rname}))
+        vault = ps.SessionVault()
+        with mock.patch.object(eng.analyzer, "analyze", return_value=results):
+            fs = eng.analyze(text, [], vault)
+        return ps.sanitize(text, fs, vault)[0]
+
+    def test_latin_name_in_mixed_span_masked(self):
+        out = self.sanitized("Hello John Smith מחיפה, how are you?",
+                             [("John Smith מחיפה", "PERSON", "SpacyRecognizer", 0.85, 0),
+                              ("מחיפה", "LOCATION", ps.HEBREW_RECOGNIZER, 1.0, 0)])
+        self.assertNotIn("John", out)
+        self.assertNotIn("Smith", out)
+
+    # a Hebrew span that stops at a maqaf does not cover the rest of the word
+    def test_word_rest_after_hebrew_span_masked(self):
+        out = self.sanitized("פגשתי את מוחמד אבו-סאלח היום.",
+                             [("מוחמד אבו-סאלח", "PERSON", "SpacyRecognizer", 0.85, 0),
+                              ("מוחמד אבו", "PERSON", ps.HEBREW_RECOGNIZER, 0.9, 0)])
+        self.assertNotIn("סאלח", out)
+
+    # give-back pieces of two dropped copies must not overlap: sanitize would drop one
+    def test_give_back_pieces_do_not_overlap(self):
+        t = "רון דני משה לוי כהן הגיעו. אתמול רון דני משה התקשר. גם משה לוי כהן בא."
+        H = ps.HEBREW_RECOGNIZER
+        out = self.sanitized(t, [("רון", "PERSON", H, 1.0, 0), ("כהן", "PERSON", H, 1.0, 0),
+                                 ("רון דני משה", "PERSON", H, 1.0, 1),
+                                 ("משה לוי כהן", "PERSON", H, 1.0, 1)])
+        for name in ("רון", "דני", "משה", "לוי", "כהן"):
+            self.assertNotIn(name, out)
 
     def test_no_drop_when_model_not_loaded(self):
         self.assertIn(("אברהמי מחברת אורנים", "presidio"), self.run_engine(model_loaded=False))
@@ -1049,6 +1125,28 @@ class PropagatedCoverageTests(unittest.TestCase):
                         self.f("ז'אן-פייר לוי", "PERSON", "propagated")])
         self.assertEqual(got, [("ז'אן-פייר", "ORGANIZATION", "hebrew_ner"),
                                ("לוי", "PERSON", "propagated")])
+
+    def test_give_back_pieces_trimmed_against_each_other(self):
+        t = "קק אא בב גג דד"
+
+        def f(sub, source):
+            s = t.index(sub)
+            return ps.Finding(s, s + len(sub), sub, "PERSON", 0.9, source, source)
+        out = ps.resolve_keep_hebrew_coverage(
+            [f("קק", "hebrew_ner"), f("דד", "hebrew_ner"),
+             f("קק אא בב", "propagated"), f("בב גג דד", "propagated")], t, True)
+        spans = sorted((x.start, x.end) for x in out)
+        for (a, b), (c, d) in zip(spans, spans[1:]):
+            self.assertLessEqual(b, c)
+        self.assertEqual(" ".join(x.text for x in sorted(out, key=lambda x: x.start)),
+                         "קק אא בב גג דד")
+
+    def test_identical_give_back_piece_kept_once(self):
+        # a session finding beats a Hebrew span and its own propagated copy
+        got = self.got([self.f("ז'אן-פייר", "PERSON", "session"),
+                        self.f("ז'אן-פייר לוי", "PERSON", "hebrew_ner"),
+                        self.f("ז'אן-פייר לוי", "PERSON", "propagated")])
+        self.assertEqual(got, [("ז'אן-פייר", "PERSON", "session"), ("לוי", "PERSON", "hebrew_ner")])
 
     def test_dropped_latin_copy_gives_nothing(self):
         t = "host fs01.corp.local and corp.local"

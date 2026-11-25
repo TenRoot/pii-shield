@@ -350,6 +350,14 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
     if not tesseract:
         return "\n".join(lines + [""])
     check_dll_licenses(dlls)
+    copyleft = copyleft_section(dlls)
+    where = ["  of its upstream project, given below as an SPDX identifier. The full license text",
+             "  and copyright notices are at the project URL."]
+    if copyleft:
+        where = ["  of its upstream project, given below as an SPDX identifier. The copyright notices",
+                 "  are at the project URL. The full license texts of the GPL and LGPL libraries and",
+                 "  of the GCC runtime libraries are at the end of this file. The full license texts",
+                 "  of the other libraries are at the project URL."]
     lines += [
         "",
         "Tesseract OCR (UB Mannheim Windows build %s)" % TESSERACT_VERSION,
@@ -362,16 +370,14 @@ def thirdparty_notices(dlls: List[str], tesseract_license: str, tesseract: bool 
         "",
         "Libraries copied from the Tesseract installer (folder tesseract/)",
         "  The installer has no notice file for each library. Each library keeps the license",
-        "  of its upstream project, given below as an SPDX identifier. The full license text",
-        "  and copyright notices are at the project URL.",
-    ]
+    ] + where
     for d in sorted(dlls, key=str.lower):
         project, spdx, url, duty = DLL_LICENSES[d.lower()]
         lines += ["", f"  {d}", f"    Project: {project}", f"    License: {spdx}", f"    URL: {url}"]
         if duty:
             lines.append(f"    Note: {duty}")
     lines += ["", "Tesseract license text", "----------------------", tesseract_license.strip()]
-    lines += copyleft_section(dlls)
+    lines += copyleft
     return "\n".join(lines + [""])
 
 
