@@ -13,6 +13,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlparse, parse_qs, unquote
 
 HERE = Path(__file__).resolve().parent
@@ -145,6 +146,9 @@ recognizers:
 """
 
 
+REAL_IS_FULL_BUILD = ps.is_full_build
+
+
 class SyncTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -179,6 +183,10 @@ class SyncTests(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self):
+        # the download tests model a small install, even when the dev model sits in models/
+        patcher = mock.patch.object(ps, "is_full_build", return_value=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         MockGitHub.repo_files = {
             "rules/rules.yaml": GOOD_RULES,
             "rules/wordlists/customers.txt": b"# customers\nContoso\nFabrikam\n",
@@ -390,6 +398,52 @@ class SyncTests(unittest.TestCase):
         self.assertIn(f"$new = '{new}'", text)
         self.assertEqual(MockDownloads.auth_seen, [None], "the GitHub token must never go to the download host")
 
+    # ---- full build: the updater keeps a full install on the full zip
+    FULL_INFO = {"version": "9.9.9", "newer": True,
+                 "windows_zip_url": "https://example.com/small.zip", "windows_zip_sha256": "a" * 64,
+                 "windows_full_zip_url": "https://example.com/full.zip", "windows_full_zip_sha256": "b" * 64}
+
+    def test_small_build_uses_small_fields(self):
+        self.assertEqual(ps.update_zip_fields(self.FULL_INFO, False),
+                         ("https://example.com/small.zip", "a" * 64))
+
+    def test_full_build_uses_full_fields(self):
+        self.assertEqual(ps.update_zip_fields(self.FULL_INFO, True),
+                         ("https://example.com/full.zip", "b" * 64))
+
+    def test_full_build_without_full_fields_refuses(self):
+        for drop in ("windows_full_zip_url", "windows_full_zip_sha256"):
+            with self.subTest(drop):
+                info = {k: v for k, v in self.FULL_INFO.items() if k != drop}
+                with self.assertRaises(ps.SyncError) as cm:
+                    ps.update_zip_fields(info, True)
+                self.assertEqual(str(cm.exception), "No full build is available for this version.")
+        app = self.root / "nofull"
+        app.mkdir()
+        small_only = {k: v for k, v in self.FULL_INFO.items() if "full" not in k}
+        with mock.patch.object(ps, "is_full_build", return_value=True):
+            with self.assertRaisesRegex(ps.SyncError, "No full build is available"):
+                ps.download_windows_build(small_only, self.cfg, app_dir=app, pid=1)
+
+    def test_full_build_with_broken_runtime_still_uses_full_fields(self):
+        model = self.root / "bundle" / "models" / ps.HEBREW_MODEL_DIRNAME
+        model.mkdir(parents=True)
+        for name in ps.HEBREW_MODEL_FILES:
+            (model / name).write_bytes(b"x")
+        with mock.patch.object(ps, "bundle_dir", return_value=self.root / "bundle"), \
+                mock.patch.object(ps, "ort", None):
+            self.assertTrue(REAL_IS_FULL_BUILD())
+            self.assertEqual(ps.update_zip_fields(self.FULL_INFO, REAL_IS_FULL_BUILD()),
+                             ("https://example.com/full.zip", "b" * 64))
+
+    def test_full_url_must_be_https(self):
+        info = dict(self.FULL_INFO, windows_full_zip_url="http://example.com/full.zip")
+        app = self.root / "fullhttp"
+        app.mkdir()
+        with mock.patch.object(ps, "is_full_build", return_value=True):
+            with self.assertRaisesRegex(ps.SyncError, "https"):
+                ps.download_windows_build(info, self.cfg, app_dir=app, pid=1)
+
     def test_update_script_quotes_paths(self):
         app = self.root / "it's here"
         new = app / "updates" / "9.9.9" / "PII-Shield"
@@ -417,7 +471,6 @@ class SyncTests(unittest.TestCase):
                 self.assertFalse(list(app.rglob("*.exe")), "nothing is left behind on failure")
 
     def test_install_dispatch(self):
-        from unittest import mock
         c = self.client()
         with mock.patch.object(sys, "frozen", False, create=True), \
                 mock.patch.object(ps.GitHubSync, "download_app_update", return_value=Path("s.py")) as m:

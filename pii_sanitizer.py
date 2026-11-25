@@ -3043,19 +3043,31 @@ WINDOWS_EXE = "PII-Shield.exe"
 WINDOWS_ZIP_ROOT = "PII-Shield"     # the release zip holds PII-Shield/PII-Shield.exe and PII-Shield/_internal/
 
 
+def update_zip_fields(info: Dict, full: bool) -> Tuple[str, str]:
+    """(url, sha256) of the release zip for this install: the full zip for a full build, else the small one."""
+    if full:
+        url = str(info.get("windows_full_zip_url") or "")
+        sha = str(info.get("windows_full_zip_sha256") or "").lower()
+        if not url or not sha:
+            raise SyncError("No full build is available for this version.")
+        return url, sha
+    return str(info.get("windows_zip_url") or ""), str(info.get("windows_zip_sha256") or "").lower()
+
+
 def download_windows_build(info: Dict, config, app_dir: Optional[Path] = None, pid: Optional[int] = None,
                            progress: Callable[[str], None] = lambda s: None) -> Path:
     """Download the release zip named in version.json, verify its SHA-256, extract it under
     <app_dir>/updates/<version>/ and write the updater script. Returns the script path.
     The download is unauthenticated: the GitHub token never leaves the API host."""
     app_dir = app_dir or APP_DIR
-    url = str(info.get("windows_zip_url") or "")
-    expected = str(info.get("windows_zip_sha256") or "").lower()
+    full = is_full_build()
+    url, expected = update_zip_fields(info, full)
+    url_field = "windows_full_zip_url" if full else "windows_zip_url"
     if not url or not re.fullmatch(r"[0-9a-f]{64}", expected):
         raise SyncError("version.json has no Windows build (windows_zip_url and windows_zip_sha256) - "
                         "download the new release manually")
     if urlparse(url).scheme != "https":
-        raise SyncError("windows_zip_url must use https")
+        raise SyncError(f"{url_field} must use https")
     version = re.sub(r"[^0-9A-Za-z._-]", "_", str(info.get("version", "new")))
     updates = app_dir / "updates"
     dest = updates / version
