@@ -122,7 +122,9 @@ the new version, the script SHA-256, and the URL and SHA-256 of each zip, so eve
 the update.
 
 Before you push the tag, set `__version__` and stamp `github-repo-template/app/version.json`
-with the SHA-256 of `pii_sanitizer.py`. The workflow stops if they do not match.
+with the SHA-256 of `pii_sanitizer.py`. A tag build stops if they do not match. A manual run
+(**Run workflow**) only shows a warning: it builds both zips and uploads them as artifacts, but
+it publishes no release.
 
 ### Full build
 

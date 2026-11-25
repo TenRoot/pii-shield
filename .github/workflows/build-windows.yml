@@ -188,7 +188,11 @@ jobs:
           $stamped = Get-Content github-repo-template\app\version.json -Raw | ConvertFrom-Json
           $scriptSha = (Get-FileHash pii_sanitizer.py -Algorithm SHA256).Hash.ToLower()
           if ($stamped.version -ne $v -or $stamped.sha256 -ne $scriptSha) {
-            throw "github-repo-template/app/version.json is not stamped for v$v ($scriptSha)"
+            # The stamp matters only for a release. A manual run on a development commit still
+            # builds both zips and writes version.json as an artifact.
+            $msg = "github-repo-template/app/version.json is not stamped for v$v ($scriptSha)"
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { throw $msg }
+            Write-Warning "$msg - not a tag build, so the run continues"
           }
           $zip = "PII-Shield-$v-win64.zip"
           $fullZip = "PII-Shield-$v-win64-full.zip"
