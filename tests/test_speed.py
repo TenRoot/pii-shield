@@ -112,8 +112,10 @@ class SanitizeSpeedTests(unittest.TestCase):
         fs = []
         for i, m in enumerate(re.finditer(r"\S+", text)):
             if rng.random() < 0.4:
+                # a fixed token per word: hash() is random per process and could give two words
+                # the same token, which sanitize correctly refuses
                 fs.append(ps.Finding(m.start(), m.end(), m.group(), "CUSTOM", 0.9, "custom", "", rng.random() < 0.8,
-                                     f"<T_{abs(hash(m.group().casefold())) % 997}>"))
+                                     f"<T_{words.index(m.group())}>"))
         return text, fs
 
     def test_sanitize_matches_presidio_anonymizer(self):
