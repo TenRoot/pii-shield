@@ -1,7 +1,7 @@
 {
-  "version": "1.7.1",
+  "version": "1.7.2",
   "script_path": "app/pii_sanitizer.py",
-  "sha256": "7f6cce22515d40c5abcf977ef4979a03657196103ede5cd0461fa612158edb72",
-  "notes": "Enable selected / Disable selected buttons and the Space key in the review table; fix: Send to Sanitize no longer freezes on a large file (faster replacement and leak check, large reviews run in the background)",
-  "published": "2026-11-25"
+  "sha256": "242d2331263d9d90e4369cb44c14b3ace31901325cd0db11fedab78495ddb87b",
+  "notes": "Show a finding in its context: the Original Text tooltip shows the line and the text around the value, and right-click Show in text (or a double-click on Start or Count) goes to it; the Presidio update notice is in the Log tab only; Presidio 2.2.366",
+  "published": "2026-11-26"
 }
