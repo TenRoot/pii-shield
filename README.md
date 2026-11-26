@@ -188,6 +188,12 @@ The GUI has five tabs:
    some copies are enabled. Click a selected row again to go to the next copy in the text. To
    change one copy only, clear **Group same values**.
 
+   To check a finding in its context, rest the mouse on its **Original Text** cell. The tooltip
+   shows the line number and the text around the value, with the value in [brackets]. A grouped
+   row shows its first 3 copies. To go to the finding, right-click the row and choose **Show in
+   text (line N)**, or double-click its **Start** or **Count** cell. The input box then shows the
+   finding in its middle, marks it for 2 seconds and gets the keyboard focus.
+
    To change several rows at once, select them with Ctrl+click or Shift+click, then click
    **Enable selected** or **Disable selected**, or press Space to switch them on or off. A
    grouped row changes every copy of its value. **Enable shown** and **Disable shown** change

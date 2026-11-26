@@ -3691,6 +3691,27 @@ def py_to_qt_index(text: str, idx: int) -> int:
     return idx + bisect.bisect_left(astral, idx)
 
 
+_line_cache: Tuple[Optional[str], List[int]] = (None, [])
+_line_lock = threading.Lock()
+
+
+def line_and_context(text: str, start: int, end: int, width: int = 60) -> Tuple[int, str]:
+    """(1-based line number, preview) for text[start:end]. The preview has up to width
+    characters on each side, the value in [brackets], line breaks as "↵", and "…" where text
+    was cut. Line starts are found once per text, then looked up with a binary search."""
+    global _line_cache
+    with _line_lock:
+        cached, breaks = _line_cache
+        if cached is not text:
+            breaks = [m.start() for m in re.finditer("\n", text)]
+            _line_cache = (text, breaks)
+    line = bisect.bisect_left(breaks, start) + 1
+    a, b = max(0, start - width), min(len(text), end + width)
+    snippet = (("…" if a > 0 else "") + text[a:start] + "[" + text[start:end] + "]" + text[end:b]
+               + ("…" if b < len(text) else ""))
+    return line, snippet.replace("\r", "").replace("\n", "↵")
+
+
 # ---- PDF ingest ----
 
 BIDI_CONTROLS = "\u200e\u200f\u061c\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
@@ -5589,6 +5610,8 @@ if QT_OK:
             self.table.itemChanged.connect(self._on_item_changed)
             self.table.itemSelectionChanged.connect(self._on_row_selected)
             self.table.cellClicked.connect(self._on_row_clicked)
+            self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+            self.table.viewport().installEventFilter(self)
             self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             self.table.customContextMenuRequested.connect(self._table_menu)
             ll.addWidget(self.table, 1)
@@ -6277,7 +6300,8 @@ if QT_OK:
                 en.setData(Qt.ItemDataRole.UserRole + 1, idxs)
                 txt = QtWidgets.QTableWidgetItem(f.text.replace("\n", "↵"))
                 txt.setFlags(txt.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                txt.setToolTip(f.text)
+                # the context tooltip is built on hover (eventFilter): building it for 100,000
+                # rows added seconds to the table fill
                 ent = QtWidgets.QTableWidgetItem(f.entity)
                 ent.setBackground(color[f.entity])
                 ent.setForeground(QtGui.QColor("#111"))
@@ -6494,11 +6518,82 @@ if QT_OK:
             self.input.setTextCursor(cur)
             self.input.ensureCursorVisible()
 
+        def eventFilter(self, obj, event):
+            """Show the context tooltip of an Original Text cell when the mouse rests on it."""
+            if (event.type() == QtCore.QEvent.Type.ToolTip and hasattr(self, "table")
+                    and obj is self.table.viewport()):
+                item = self.table.itemAt(event.pos())
+                if item is not None and item.column() == C_TEXT:
+                    idxs = self._row_indices(item.row())
+                    if idxs:
+                        QtWidgets.QToolTip.showText(event.globalPos(), self._context_tooltip(idxs), obj)
+                        return True
+            return super().eventFilter(obj, event)
+
+        def _context_tooltip(self, idxs: List[int]) -> str:
+            """Line number and context of the first copies of a row, for its tooltip."""
+            if self.analyzed_text is None:
+                return self.findings[idxs[0]].text
+            lines = []
+            for i in idxs[:3]:
+                f = self.findings[i]
+                line, snippet = line_and_context(self.analyzed_text, f.start, f.end)
+                lines.append(f"Line {line}: {snippet}")
+            if len(idxs) > 3:
+                lines.append(f"… and {len(idxs) - 3:,} more")
+            return "\n".join(lines)
+
+        def _show_in_text_label(self, idx: int) -> str:
+            f = self.findings[idx]
+            return f"Show in text (line {line_and_context(self.analyzed_text or '', f.start, f.end)[0]})"
+
+        def _on_cell_double_clicked(self, row: int, col: int):
+            """Start and Count/End cells cannot be edited, so a double-click there shows the
+            finding in the text."""
+            if col in (C_START, C_END):
+                idxs = self._row_indices(row)
+                if idxs:
+                    self._show_in_text(idxs[0])
+
+        def _show_in_text(self, idx: int):
+            """Put the finding in the middle of the input box, mark it strongly for 2 seconds and
+            move the keyboard focus there."""
+            if self.analyzed_text is None or self.input.toPlainText() != self.analyzed_text:
+                self.statusBar().showMessage("The input changed after the analysis. Re-analyze to show "
+                                             "findings in the text.", 5000)
+                return
+            f = self.findings[idx]
+            cur = self.input.textCursor()
+            cur.setPosition(py_to_qt_index(self.analyzed_text, f.start))
+            cur.setPosition(py_to_qt_index(self.analyzed_text, f.end), QtGui.QTextCursor.MoveMode.KeepAnchor)
+            self.input.setTextCursor(cur)
+            self.input.centerCursor()
+            mark = QtWidgets.QTextEdit.ExtraSelection()
+            mark.cursor = QtGui.QTextCursor(cur)
+            fmt = QtGui.QTextCharFormat()
+            fmt.setBackground(QtGui.QColor("#f59e0b"))
+            fmt.setForeground(QtGui.QColor("#000"))
+            fmt.setFontWeight(QtGui.QFont.Weight.Bold)
+            mark.format = fmt
+            self.input.setExtraSelections(self.input.extraSelections() + [mark])
+            QtCore.QTimer.singleShot(2000, self._highlight)
+            self.input.setFocus()
+            self.statusBar().showMessage(self._show_in_text_label(idx).replace("Show in text", "Shown in the text"),
+                                         4000)
+
         def _table_menu(self, pos):
             idxs = self._selected_indices()
             if not idxs:
                 return
             m = QtWidgets.QMenu(self)
+            rows = sorted({i.row() for i in self.table.selectedIndexes()})
+            a_show = None
+            if len(rows) == 1:
+                first, n = self._jump
+                row_idxs = self._row_indices(rows[0])
+                target = row_idxs[n] if first == row_idxs[0] and n < len(row_idxs) else row_idxs[0]
+                a_show = m.addAction(self._show_in_text_label(target))
+                m.addSeparator()
             a_en = m.addAction("Enable selected")
             a_dis = m.addAction("Disable selected")
             m.addSeparator()
@@ -6511,6 +6606,9 @@ if QT_OK:
             a_copy = m.addAction("Copy original value")
             act = m.exec(self.table.viewport().mapToGlobal(pos))
             if not act:
+                return
+            if act is a_show:
+                self._show_in_text(target)
                 return
             sel = [self.findings[i] for i in idxs]
             keys = {self.vault.key(f.text) for f in sel}
