@@ -1,11 +1,11 @@
 {
-  "version": "1.7.1",
+  "version": "1.7.2",
   "script_path": "pii_sanitizer.py",
-  "sha256": "7f6cce22515d40c5abcf977ef4979a03657196103ede5cd0461fa612158edb72",
-  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.1/PII-Shield-1.7.1-win64.zip",
-  "windows_zip_sha256": "1cf2fa624d0d2ebf0fe0686df7308eb8c0f5672c3afd9e2894fe6677c16e8780",
-  "windows_full_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.1/PII-Shield-1.7.1-win64-full.zip",
-  "windows_full_zip_sha256": "514a619654b39d2a826caab086fd46406c635c2d35a1aa49881dff822a3bd8a9",
-  "notes": "Enable selected / Disable selected buttons and the Space key in the review table; fix: Send to Sanitize no longer freezes on a large file (faster replacement and leak check, large reviews run in the background)",
-  "published": "2026-11-25"
+  "sha256": "242d2331263d9d90e4369cb44c14b3ace31901325cd0db11fedab78495ddb87b",
+  "windows_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.2/PII-Shield-1.7.2-win64.zip",
+  "windows_zip_sha256": "145cf24fc8ae06d42e33f380adcd23d477fe62fc0c8d1ae9fcc25f20c80b364d",
+  "windows_full_zip_url": "https://github.com/TenRoot/pii-shield/releases/download/v1.7.2/PII-Shield-1.7.2-win64-full.zip",
+  "windows_full_zip_sha256": "9c498ea967fbb604bb6cb0f0d6c4f733cf5e3bec845ea866e6ac58cb35e0f124",
+  "notes": "Show a finding in its context: the Original Text tooltip shows the line and the text around the value, and right-click Show in text (or a double-click on Start or Count) goes to it; the Presidio update notice is in the Log tab only; Presidio 2.2.366",
+  "published": "2026-11-26"
 }
